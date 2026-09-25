@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.14"
+    plugin_version = "1.15"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -200,33 +200,9 @@ class EmbyUnwatchedWash(_PluginBase):
     def get_libraries(self) -> List[dict]:
         """
         API 端点：返回所有媒体服务器的库列表，供排除媒体库 UI 选择。
-        返回格式：[{"server": "Emby", "name": "电影", "type": "movie"}, ...]
+        返回格式：[{"title": "电影", "value": "电影"}, ...]
         """
-        result = []
-        try:
-            for stype, name, inst in self._get_server_instances():
-                try:
-                    if stype == 'jellyfin':
-                        libs = inst.get_librarys() or []
-                    else:
-                        libs = inst.get_librarys() or []
-                    for lib in libs:
-                        lib_name = lib.get('Name') or lib.get('CollectionType') or ''
-                        lib_type = lib.get('CollectionType', '')
-                        # 映射类型标签
-                        type_map = {'movies': '电影', 'tvshows': '电视剧', 'boxsets': '合集',
-                                   'homevideos': '家庭视频', 'photos': '照片', 'books': '书籍'}
-                        result.append({
-                            'server': name,
-                            'name': lib_name,
-                            'type': type_map.get(lib_type, lib_type or '未知'),
-                            'id': lib.get('Id'),
-                        })
-                except Exception as e:
-                    logger.error(f"【未看洗版】读取 {name}({stype}) 库列表失败：{e}")
-        except Exception as e:
-            logger.error(f"【未看洗版】获取媒体库列表失败：{e}")
-        return result
+        return self._get_library_list_options()
 
     def clear_cache(self) -> dict:
         """
@@ -1103,14 +1079,20 @@ class EmbyUnwatchedWash(_PluginBase):
         now = _time.time()
         # TTL 缓存 5 分钟
         if self._library_names_cache and (now - self._library_names_cache_time) < 300:
+            logger.info(f"【未看洗版】从缓存返回 {len(self._library_names_cache)} 个库名")
             return [{'title': name, 'value': name} for name in self._library_names_cache]
         library_names = []
         try:
-            for stype, name, inst in self._get_server_instances():
+            # 尝试从已有的媒体服务器实例获取库列表
+            servers = self._get_server_instances()
+            logger.info(f"【未看洗版】获取到 {len(servers)} 个媒体服务器实例")
+            for stype, name, inst in servers:
                 try:
+                    logger.info(f"【未看洗版】处理 {name}({stype}) 获取库列表")
                     if stype == 'emby':
                         # Emby: /emby/Library/VirtualFolders?api_key=...
                         resp = inst.get_data("[HOST]emby/Library/VirtualFolders?api_key=[APIKEY]")
+                        logger.info(f"【未看洗版】Emby VirtualFolders 响应: {resp.status_code if resp else None}")
                         if resp and resp.status_code == 200:
                             try:
                                 data = resp.json()
@@ -1119,8 +1101,9 @@ class EmbyUnwatchedWash(_PluginBase):
                                         lib_name = lib.get('Name')
                                         if lib_name and lib_name not in library_names:
                                             library_names.append(lib_name)
-                            except Exception:
-                                pass
+                                    logger.info(f"【未看洗版】从 {name} 获取到 {len(library_names)} 个库名")
+                            except Exception as e:
+                                logger.error(f"【未看洗版】解析 Emby 库列表失败：{e}")
                     else:
                         # Jellyfin: /jellyfin/Libraries?api_key=...
                         resp = inst.get_data("[HOST]jellyfin/Libraries?api_key=[APIKEY]")
@@ -1135,12 +1118,53 @@ class EmbyUnwatchedWash(_PluginBase):
                             except Exception:
                                 pass
                 except Exception as e:
-                    logger.debug(f"【未看洗版】读取 {name}({stype}) 库列表失败：{e}")
+                    logger.error(f"【未看洗版】读取 {name}({stype}) 库列表失败：{e}")
+            # 如果实例获取失败，尝试直接从数据库读取 Emby 配置并调用 API
+            if not library_names:
+                logger.warning("【未看洗版】无法从实例获取库列表，尝试从数据库读取配置")
+                try:
+                    import psycopg2
+                    from app.sdk.config import settings
+                    # 获取数据库连接参数
+                    db_url = getattr(settings, 'DATABASE_URL', '')
+                    if db_url:
+                        conn = psycopg2.connect(db_url)
+                        cur = conn.cursor()
+                        cur.execute("SELECT value FROM systemconfig WHERE key='MediaServers'")
+                        row = cur.fetchone()
+                        if row:
+                            import json
+                            servers_config = json.loads(row[0])
+                            for srv in servers_config:
+                                if srv.get('type') == 'emby' and srv.get('enabled'):
+                                    config = srv.get('config', {})
+                                    host = config.get('host', '').rstrip('/')
+                                    apikey = config.get('apikey', '')
+                                    if host and apikey:
+                                        try:
+                                            import requests
+                                            url = f"{host}/emby/Library/VirtualFolders?api_key={apikey}"
+                                            r = requests.get(url, timeout=10)
+                                            if r.status_code == 200:
+                                                data = r.json()
+                                                if isinstance(data, list):
+                                                    for lib in data:
+                                                        lib_name = lib.get('Name')
+                                                        if lib_name and lib_name not in library_names:
+                                                            library_names.append(lib_name)
+                                                    logger.info(f"【未看洗版】从数据库配置获取到 {len(library_names)} 个库名")
+                                        except Exception as e:
+                                            logger.error(f"【未看洗版】请求 Emby API 失败：{e}")
+                        cur.close()
+                        conn.close()
+                except Exception as e:
+                    logger.error(f"【未看洗版】从数据库读取配置失败：{e}")
         except Exception as e:
             logger.error(f"【未看洗版】获取媒体库列表失败：{e}")
         # 写缓存
         self._library_names_cache = sorted(library_names)
         self._library_names_cache_time = now
+        logger.info(f"【未看洗版】最终返回 {len(library_names)} 个库名")
         return [{'title': name, 'value': name} for name in self._library_names_cache]
 
     @staticmethod
