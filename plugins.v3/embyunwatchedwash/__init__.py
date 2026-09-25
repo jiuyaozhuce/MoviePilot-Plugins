@@ -41,7 +41,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -562,7 +562,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     logger.info(f"【未看洗版】手动模式：正在处理 tmdbid={tid}")
                     try:
                         _t0 = time.time()
-                        mediainfo: MediaInfo = self._recognize_media(tid)
+                        mediainfo: MediaInfo = self._recognize_auto(tid)
                         logger.info(f"【未看洗版】手动模式：tmdbid={tid} 识别耗时 {time.time() - _t0:.1f}s")
                     except Exception as e:
                         logger.error(f"【未看洗版】手动模式：tmdbid={tid} 识别异常：{e}\n{traceback.format_exc()}")
@@ -636,7 +636,7 @@ class EmbyUnwatchedWash(_PluginBase):
                         logger.info(f"【未看洗版】正在处理：{name} (tmdbid={tmdb_id})")
                         try:
                             _t0 = time.time()
-                            mediainfo: MediaInfo = self._recognize_media(tmdb_id, mtype=mtype)
+                            mediainfo: MediaInfo = self._recognize_auto(tmdb_id, mtype=mtype)
                             logger.info(f"【未看洗版】{name} 识别耗时 {time.time() - _t0:.1f}s")
                         except Exception as e:
                             logger.error(f"【未看洗版】识别异常：{name} (tmdbid={tmdb_id})：{e}\n{traceback.format_exc()}")
@@ -846,6 +846,25 @@ class EmbyUnwatchedWash(_PluginBase):
             )
         # v2 旧签名
         return self.chain.recognize_media(mtype=mtype, tmdbid=int(tmdb_id))
+
+    def _recognize_auto(self, tmdb_id, mtype=None) -> Optional[MediaInfo]:
+        """
+        识别媒体并自动兜底类型：v3 仅凭 media_id 无法判断电影/剧集，必须给 mtype。
+        优先用已知 mtype；未知或识别失败时依次尝试 电影 → 剧集。
+        """
+        if mtype:
+            mediainfo = self._recognize_media(tmdb_id, mtype=mtype)
+            if mediainfo:
+                return mediainfo
+        for _t in (MediaType.MOVIE, MediaType.TV):
+            try:
+                mediainfo = self._recognize_media(tmdb_id, mtype=_t)
+            except Exception as e:
+                logger.debug(f"【未看洗版】tmdbid={tmdb_id} 按 {_t.value} 识别异常：{e}")
+                continue
+            if mediainfo:
+                return mediainfo
+        return None
 
     def _get_server_instances(self) -> List[Tuple[str, str, Any]]:
         """
