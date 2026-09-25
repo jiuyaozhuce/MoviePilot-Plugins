@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.10"
+    plugin_version = "1.11"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -115,6 +115,9 @@ class EmbyUnwatchedWash(_PluginBase):
                 "selected_items": self._selected_items,
                 "series_episode_level": self._series_episode_level,
                 "limit": self._limit,
+                "exclude_libraries": self._exclude_libraries,
+                "exclude_keywords": self._exclude_keywords,
+                "dry_run": self._dry_run,
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(self.sync, 'date',
