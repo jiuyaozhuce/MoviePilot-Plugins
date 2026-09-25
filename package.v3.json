@@ -1,0 +1,17 @@
+{
+  "EmbyUnwatchedWash": {
+    "name": "Emby未看洗版",
+    "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
+    "labels": "媒体库",
+    "version": "1.0",
+    "author": "jiuyaozhuce",
+    "project_url": "https://github.com/jiuyaozhuce/moviepilot-emby-unwatched-wash",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "repo": "https://github.com/jiuyaozhuce/moviepilot-emby-unwatched-wash",
+    "history": {
+      "v1.0": "初始版本：扫描未观看影视，自动创建洗版订阅升级画质"
+    }
+  }
+}

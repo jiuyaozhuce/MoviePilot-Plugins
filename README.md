@@ -20,9 +20,35 @@
 | Webhook 触发 | 有（收藏/评分事件） | 已删除（未观看洗版是扫描型，非事件型） |
 | 其余 | —— | 原样复用 |
 
+## 仓库结构（符合 MoviePilot 官方插件仓库格式）
+
+```
+moviepilot-emby-unwatched-wash/
+├── package.json          # 插件清单（兜底，MP 可能读取此文件）
+├── package.v3.json       # 插件清单（v3 实际读取的文件）
+├── plugins.v3/           # v3 插件源码目录（MP 规定源码须放在此处）
+│   └── embyunwatchedwash/
+│       └── __init__.py   # 插件主类 EmbyUnwatchedWash
+└── README.md
+```
+
+> 说明：MoviePilot 在「插件仓库」里添加仓库时，会去仓库根读 `package.v3.json`（v3）
+> 来枚举插件，并从 `plugins.v3/<插件id>/` 取源码。早期版本把源码直接放仓库根、缺清单，
+> 因此无法被添加进仓库列表。现在的结构与官方 `MoviePilot-Plugins` 及单插件仓库
+> `moviepilot-v2-course-organizer` 一致。
+
 ## 安装
 
-把 `embyunwatchedwash/` 整目录放到 MoviePilot 的 `app/plugins/` 下（与 `bestfilmversion` 同级），
+### 方式一：作为插件仓库添加（推荐，最简单）
+
+1. MoviePilot → **设置 → 插件 → 插件仓库 → 新增**
+2. 仓库地址填：`https://github.com/jiuyaozhuce/moviepilot-emby-unwatched-wash`
+3. 分支填：`main`
+4. 保存后刷新仓库列表，即可看到「Emby未看洗版」，点击安装。
+
+### 方式二：手动放置（开发/调试用）
+
+把 `plugins.v3/embyunwatchedwash/` 整目录复制到 MoviePilot 的 `app/plugins/` 下，
 重启 MoviePilot 或重载插件即可在「插件」页看到「未看洗版」。
 
 ## 配置
