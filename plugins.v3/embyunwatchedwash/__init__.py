@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.8"
+    plugin_version = "1.9"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -56,6 +56,10 @@ class EmbyUnwatchedWash(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     _cache_path: Optional[Path] = None
     subscribechain = None
+    # 媒体库未观看选项的 TTL 缓存（配置页/详情页频繁调用，避免每次全量扫描）
+    _options_cache: List[dict] = []
+    _options_cache_time: float = 0.0
+    _options_cache_ttl: int = 60
 
     # 配置属性
     _enabled: bool = False
@@ -142,6 +146,18 @@ class EmbyUnwatchedWash(_PluginBase):
                 "endpoint": self.get_medias,
                 "methods": ["GET"],
                 "summary": "获取媒体库未观看影视列表（供手动选择洗版）"
+            },
+            {
+                "path": "/clear_cache",
+                "endpoint": self.clear_cache,
+                "methods": ["POST"],
+                "summary": "清除洗版缓存（重置后会重新处理已洗版条目）"
+            },
+            {
+                "path": "/clear_history",
+                "endpoint": self.clear_history,
+                "methods": ["POST"],
+                "summary": "清除洗版历史记录（仅清 UI 列表，不影响已建订阅）"
             }
         ]
 
@@ -156,6 +172,31 @@ class EmbyUnwatchedWash(_PluginBase):
         API 端点：返回媒体库未观看影视可选项（标题 + tmdbid）
         """
         return self._get_library_options()
+
+    def clear_cache(self) -> dict:
+        """
+        API 端点：清除洗版缓存文件（POST）。清除后已处理条目会重新进入洗版队列。
+        """
+        try:
+            if self._cache_path and self._cache_path.exists():
+                self._cache_path.unlink()
+                logger.info("【未看洗版】已清除洗版缓存")
+            return {"success": True, "message": "缓存已清除"}
+        except Exception as e:
+            logger.error(f"【未看洗版】清除缓存失败：{e}")
+            return {"success": False, "message": str(e)}
+
+    def clear_history(self) -> dict:
+        """
+        API 端点：清除洗版历史记录（POST）。仅清 UI 列表，不影响已创建的订阅。
+        """
+        try:
+            self.save_data('history', [])
+            logger.info("【未看洗版】已清除洗版历史")
+            return {"success": True, "message": "历史已清除"}
+        except Exception as e:
+            logger.error(f"【未看洗版】清除历史失败：{e}")
+            return {"success": False, "message": str(e)}
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -189,6 +230,11 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         # 动态拉取媒体库未观看影视，供手动选择洗版
         options = self._get_library_options()
+        options_count = len(options)
+        options_hint = (f'从媒体库未观看列表中手动勾选要洗版的影视'
+                        f'（当前共 {options_count} 部可选项，'
+                        f'{"列表已截断，实际未观看可能更多" if options_count >= 500 else "已全部列出"}）。'
+                        f'不选则对媒体库内所有未观看影视洗版。')
 
         return [
             {
@@ -353,9 +399,7 @@ class EmbyUnwatchedWash(_PluginBase):
                                             'filterable': True,
                                             'hideSelected': True,
                                             'persistent-hint': True,
-                                            'hint': f'从媒体库未观看列表中手动勾选要洗版的影视'
-                                                    f'（当前共 {len(options)} 部可选项）。'
-                                                    f'不选则对媒体库内所有未观看影视洗版。'
+                                            'hint': options_hint,
                                         }
                                     }
                                 ]
@@ -479,12 +523,60 @@ class EmbyUnwatchedWash(_PluginBase):
 
         # 数据按时间降序排序
         historys = sorted(historys, key=lambda x: x.get('time'), reverse=True)
+        # 详情页操作入口：清除缓存 / 清除历史（走插件自定义 API）
+        contents.insert(0, {
+            'component': 'VCard',
+            'props': {'class': 'mb-3'},
+            'content': [
+                {
+                    'component': 'VCardTitle',
+                    'props': {'class': 'text-subtitle-1'},
+                    'text': '维护操作'
+                },
+                {
+                    'component': 'VCardText',
+                    'props': {'class': 'pa-0'},
+                    'text': '清除缓存：重置已处理记录，下次运行会重新洗版（用于想重跑某批影视）。'
+                            '清除历史：仅删本页列表，不影响已建订阅。'
+                },
+                {
+                    'component': 'VCardActions',
+                    'content': [
+                        {
+                            'component': 'VBtn',
+                            'props': {
+                                'color': 'warning',
+                                'variant': 'tonal',
+                                'size': 'small',
+                                'prepend-icon': 'mdi-refresh',
+                                'onclick': 'api_post("/plugins/embyunwatchedwash/clear_cache")',
+                            },
+                            'text': '清除洗版缓存'
+                        },
+                        {
+                            'component': 'VBtn',
+                            'props': {
+                                'color': 'error',
+                                'variant': 'tonal',
+                                'size': 'small',
+                                'prepend-icon': 'mdi-history',
+                                'onclick': 'api_post("/plugins/embyunwatchedwash/clear_history")',
+                            },
+                            'text': '清除历史记录'
+                        }
+                    ]
+                }
+            ]
+        })
         for history in historys[:50]:
             title = history.get("title")
             poster = history.get("poster")
             mtype = history.get("type")
             time_str = history.get("time")
             tmdbid = history.get("tmdbid")
+            # 电影走 /movie/，剧集走 /tv/，避免历史卡片跳错页
+            tmdb_path = "tv" if mtype == "电视剧" else "movie"
+            tmdb_url = f"https://www.themoviedb.org/{tmdb_path}/{tmdbid}" if tmdbid else None
             contents.append(
                 {
                     'component': 'VCard',
@@ -506,7 +598,10 @@ class EmbyUnwatchedWash(_PluginBase):
                                                 'width': 80,
                                                 'aspect-ratio': '2/3',
                                                 'class': 'object-cover shadow ring-gray-500',
-                                                'cover': True
+                                                'cover': True,
+                                                # 海报为空时不渲染图片占位，避免控制台 404
+                                                'srcset': '',
+                                                'alt': title or '',
                                             }
                                         }
                                     ]
@@ -523,9 +618,9 @@ class EmbyUnwatchedWash(_PluginBase):
                                                 {
                                                     'component': 'a',
                                                     'props': {
-                                                        'href': f"https://www.themoviedb.org/movie/{tmdbid}",
-                                                        'target': '_blank'
-                                                    },
+                                                        'href': tmdb_url,
+                                                        'target': '_blank',
+                                                    } if tmdb_url else {},
                                                     'text': title
                                                 }
                                             ]
@@ -619,7 +714,12 @@ class EmbyUnwatchedWash(_PluginBase):
                 plan_by_tmdb: Dict[str, List[dict]] = {}
                 if self._include_series and self._series_episode_level:
                     plan_by_tmdb = self._plan_by_tmdb()
+                # 手动模式同样受 limit 保护（避免一次勾选几百部直接爆订阅）
+                limit = self._limit if isinstance(self._limit, int) and self._limit > 0 else 0
                 for tid in selected:
+                    if limit and (washed_count + failed_count) >= limit:
+                        logger.info(f"【未看洗版】已达到单次处理上限 {limit}，本次停止（剩余选择下次运行继续）")
+                        break
                     tasks = plan_by_tmdb.get(str(tid)) or [{
                         "tmdb_id": tid,
                         "mtype": None,
@@ -628,6 +728,9 @@ class EmbyUnwatchedWash(_PluginBase):
                         "start_episode": None,
                     }]
                     for task in tasks:
+                        if limit and (washed_count + failed_count) >= limit:
+                            logger.info(f"【未看洗版】已达到单次处理上限 {limit}，本次停止（剩余任务下次运行继续）")
+                            break
                         status = self._process_task(task, caches, history)
                         if status == "added":
                             washed_count += 1
@@ -937,7 +1040,7 @@ class EmbyUnwatchedWash(_PluginBase):
         key = cache_key or tid
         if key not in caches:
             caches.append(key)
-        # 存储历史记录
+        # 存储历史记录（带上限，避免无限增长）
         if key not in [h.get("key") for h in history]:
             history.append({
                 "title": mediainfo.title,
@@ -951,6 +1054,10 @@ class EmbyUnwatchedWash(_PluginBase):
                 "key": key,
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
+            # 历史记录上限：超过 500 条时按时间淘汰最旧的，避免 plugindata 无限膨胀
+            if len(history) > 500:
+                history.sort(key=lambda x: x.get("time", ""), reverse=True)
+                del history[500:]
         return "added"
 
     def jellyfin_get_items(self, instance=None) -> List[dict]:
@@ -1103,7 +1210,12 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         构建媒体库未观看影视的可选项（标题 + tmdbid），用于设置页手动选择与 /medias API。
         通过 Items 的 ProviderIds 直接取 Tmdb，避免逐条 get_iteminfo。
+        结果带 TTL 缓存（默认 60 秒）：配置页与详情页都会调用，避免每次全量分页扫描。
         """
+        import time as _time
+        now = _time.time()
+        if self._options_cache and (now - self._options_cache_time) < self._options_cache_ttl:
+            return self._options_cache
         options = []
         try:
             servers = self._get_server_instances()
@@ -1141,9 +1253,12 @@ class EmbyUnwatchedWash(_PluginBase):
                     seen.add(name)
                     if len(options) >= cap:
                         logger.info(f"EmbyUnwatchedWash 媒体库选项已截断至 {cap} 条")
-                        return options
+                        break
         except Exception as e:
             logger.error(f"EmbyUnwatchedWash 构建媒体库选项失败：{e}")
+        # 写缓存（即使为空也写，避免持续打爆媒体服务器）
+        self._options_cache = options
+        self._options_cache_time = now
         return options
 
     @staticmethod
