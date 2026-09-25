@@ -1,3 +1,4 @@
+import inspect
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -26,6 +27,10 @@ except ImportError:
     from app.helper.mediaserver import MediaServerHelper
 from app.plugins import _PluginBase
 from app.schemas.types import MediaType, EventType
+try:
+    from app.schemas.types import MediaSource
+except ImportError:
+    MediaSource = None
 
 lock = RLock()
 
@@ -36,7 +41,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -557,7 +562,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     logger.info(f"【未看洗版】手动模式：正在处理 tmdbid={tid}")
                     try:
                         _t0 = time.time()
-                        mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=int(tid))
+                        mediainfo: MediaInfo = self._recognize_media(tid)
                         logger.info(f"【未看洗版】手动模式：tmdbid={tid} 识别耗时 {time.time() - _t0:.1f}s")
                     except Exception as e:
                         logger.error(f"【未看洗版】手动模式：tmdbid={tid} 识别异常：{e}\n{traceback.format_exc()}")
@@ -631,7 +636,7 @@ class EmbyUnwatchedWash(_PluginBase):
                         logger.info(f"【未看洗版】正在处理：{name} (tmdbid={tmdb_id})")
                         try:
                             _t0 = time.time()
-                            mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=tmdb_id, mtype=mtype)
+                            mediainfo: MediaInfo = self._recognize_media(tmdb_id, mtype=mtype)
                             logger.info(f"【未看洗版】{name} 识别耗时 {time.time() - _t0:.1f}s")
                         except Exception as e:
                             logger.error(f"【未看洗版】识别异常：{name} (tmdbid={tmdb_id})：{e}\n{traceback.format_exc()}")
@@ -686,17 +691,36 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.info(f"EmbyUnwatchedWash 跳过剧集（未开启包含剧集）：{mediainfo.title}")
             return "skipped"
 
-        # 前置校验：创建洗版（best_version=True）订阅
+        tid_num = self._tmdb_of(mediainfo)
+
+        # 创建洗版（best_version=True）订阅，兼容 v3（media_source/media_id）与 v2（tmdbid）
         try:
-            sid, msg = self.subscribechain.add(
-                mtype=mediainfo.type,
-                title=mediainfo.title,
-                year=mediainfo.year,
-                tmdbid=mediainfo.tmdb_id,
-                best_version=True,
-                username="未看洗版",
-                exist_ok=True,
-            )
+            try:
+                params = inspect.signature(self.subscribechain.add).parameters
+            except Exception:
+                params = {}
+            if "media_source" in params and MediaSource is not None and tid_num:
+                # v3：tmdbid 参数已被移除，传了会被 **kwargs 静默吞掉
+                sid, msg = self.subscribechain.add(
+                    mtype=mediainfo.type,
+                    title=mediainfo.title,
+                    year=mediainfo.year,
+                    best_version=True,
+                    username="未看洗版",
+                    exist_ok=True,
+                    media_source=MediaSource.TMDB,
+                    media_id=str(tid_num),
+                )
+            else:
+                sid, msg = self.subscribechain.add(
+                    mtype=mediainfo.type,
+                    title=mediainfo.title,
+                    year=mediainfo.year,
+                    tmdbid=tid_num,
+                    best_version=True,
+                    username="未看洗版",
+                    exist_ok=True,
+                )
         except Exception as e:
             logger.error(f"【未看洗版】创建洗版订阅异常：{mediainfo.title} - {e}\n{traceback.format_exc()}")
             return "failed"
@@ -709,18 +733,18 @@ class EmbyUnwatchedWash(_PluginBase):
         logger.info(f"【未看洗版】已创建洗版订阅：{mediainfo.title} ({mediainfo.year}) [{mediainfo.type.value}]")
 
         # 加入缓存（按 tmdbid 去重，避免同名影视误判）
-        tid = str(mediainfo.tmdb_id)
+        tid = str(tid_num) if tid_num else str(mediainfo.tmdb_id)
         if tid not in caches:
             caches.append(tid)
         # 存储历史记录
-        if mediainfo.tmdb_id not in [h.get("tmdbid") for h in history]:
+        if tid_num not in [h.get("tmdbid") for h in history]:
             history.append({
                 "title": mediainfo.title,
                 "type": mediainfo.type.value,
                 "year": mediainfo.year,
                 "poster": mediainfo.get_poster_image(),
                 "overview": mediainfo.overview,
-                "tmdbid": mediainfo.tmdb_id,
+                "tmdbid": tid_num,
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
         return "added"
@@ -803,6 +827,26 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.error(f"【未看洗版】读取 Emby 未观看列表失败：{e}")
             return []
 
+    def _recognize_media(self, tmdb_id, mtype=None) -> Optional[MediaInfo]:
+        """
+        按 tmdbid 识别媒体信息，自动兼容 MoviePilot v2 / v3 两种签名。
+        - v3：recognize_media(mtype=..., media_source=MediaSource.TMDB, media_id=str(id))
+              （v3 核心已移除 tmdbid 参数，直接传会抛 TypeError）
+        - v2：recognize_media(mtype=..., tmdbid=int(id))
+        """
+        try:
+            params = inspect.signature(self.chain.recognize_media).parameters
+        except Exception:
+            params = {}
+        if "media_source" in params and MediaSource is not None:
+            return self.chain.recognize_media(
+                mtype=mtype,
+                media_source=MediaSource.TMDB,
+                media_id=str(tmdb_id),
+            )
+        # v2 旧签名
+        return self.chain.recognize_media(mtype=mtype, tmdbid=int(tmdb_id))
+
     def _get_server_instances(self) -> List[Tuple[str, str, Any]]:
         """
         通过 MediaServerHelper 获取已配置且已连接的媒体服务器客户端实例。
@@ -878,6 +922,30 @@ class EmbyUnwatchedWash(_PluginBase):
         except Exception as e:
             logger.error(f"EmbyUnwatchedWash 构建媒体库选项失败：{e}")
         return options
+
+    @staticmethod
+    def _tmdb_of(mediainfo) -> Optional[int]:
+        """
+        从 MediaInfo 取 tmdbid：v3 优先 tmdb_id，回退 media_source+media_id。
+        """
+        if mediainfo is None:
+            return None
+        tid = getattr(mediainfo, "tmdb_id", None)
+        if tid:
+            try:
+                return int(tid)
+            except (TypeError, ValueError):
+                pass
+        src = getattr(mediainfo, "media_source", None)
+        mid = getattr(mediainfo, "media_id", None)
+        if mid:
+            src_val = str(getattr(src, "value", src) or "").lower()
+            if src_val in ("themoviedb", "tmdb", "none", ""):
+                try:
+                    return int(str(mid).strip())
+                except (TypeError, ValueError):
+                    return None
+        return None
 
     @staticmethod
     def _tmdbid_of_item(data: dict) -> Optional[int]:
