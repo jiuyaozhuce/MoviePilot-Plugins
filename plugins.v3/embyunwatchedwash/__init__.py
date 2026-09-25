@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.9"
+    plugin_version = "1.10"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -56,6 +56,10 @@ class EmbyUnwatchedWash(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     _cache_path: Optional[Path] = None
     subscribechain = None
+    # 排除与 Dry-run 标记
+    _exclude_libraries: List[str] = []
+    _exclude_keywords: List[str] = []
+    _dry_run: bool = False
     # 媒体库未观看选项的 TTL 缓存（配置页/详情页频繁调用，避免每次全量扫描）
     _options_cache: List[dict] = []
     _options_cache_time: float = 0.0
@@ -95,6 +99,10 @@ class EmbyUnwatchedWash(_PluginBase):
                 self._limit = int(config.get("limit") or 0)
             except (TypeError, ValueError):
                 self._limit = 0
+            # 新增的排除与 Dry-Run 配置
+            self._exclude_libraries = self._normalize_str_list(config.get("exclude_libraries", []))
+            self._exclude_keywords = self._normalize_str_list(config.get("exclude_keywords", []))
+            self._dry_run = bool(config.get("dry_run", False))
 
         if self._only_once:
             self._only_once = False
@@ -416,6 +424,73 @@ class EmbyUnwatchedWash(_PluginBase):
                                 },
                                 'content': [
                                     {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'exclude_libraries',
+                                            'label': '排除媒体库（每行一个库名）',
+                                            'placeholder': '例：Kids\nAdult\nChildren',
+                                            'hint': '按完整库名排除，如「Kids」「Children」这类库将完全跳过',
+                                            'persistent-hint': True,
+                                            'rows': 3,
+                                            'multiline': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'exclude_keywords',
+                                            'label': '排除关键字（每行一个）',
+                                            'placeholder': '例：children\nkids\nbaby',
+                                            'hint': '对库名做子串匹配（不区分大小写），命中即跳过该库',
+                                            'persistent-hint': True,
+                                            'rows': 3,
+                                            'multiline': True
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'dry_run',
+                                            'label': 'Dry-run 预览模式（只列出计划，不创建订阅）',
+                                            'hint': '开启后运行只会打印待洗版条目，不会真正调用 SubscribeChain.add，适合试跑',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
                                         'component': 'VAlert',
                                         'props': {
                                             'type': 'info',
@@ -423,6 +498,7 @@ class EmbyUnwatchedWash(_PluginBase):
                                             'text': '扫描媒体服务器中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。'
                                                     '你也可以在上方「指定洗版影视」中手动选择只洗版部分影视；不选则默认对全部未观看影视洗版。'
                                                     '已处理的条目会写入缓存，不会重复订阅。'
+                                                    '开启 Dry-run 后只打印计划，不会真的创建订阅。'
                                         }
                                     }
                                 ]
@@ -439,7 +515,10 @@ class EmbyUnwatchedWash(_PluginBase):
             "include_series": True,
             "selected_items": [],
             "series_episode_level": True,
-            "limit": 0
+            "limit": 0,
+            "exclude_libraries": [],
+            "exclude_keywords": [],
+            "dry_run": False
         }
 
     def get_page(self) -> List[dict]:
@@ -699,6 +778,31 @@ class EmbyUnwatchedWash(_PluginBase):
             return
         try:
             logger.info("【未看洗版】========== 开始扫描任务 ==========")
+            # ---------- Dry-run 预览模式：只列出计划，不创建订阅 ----------
+            if self._dry_run:
+                logger.info("【未看洗版】Dry-run 模式已开启，仅打印待洗版条目，不会创建订阅")
+                try:
+                    plan_items = self._build_plan()
+                except Exception as e:
+                    logger.error(f"【未看洗版】Dry-run 构建计划失败：{e}\n{traceback.format_exc()}")
+                    plan_items = []
+                if not plan_items:
+                    logger.info("【未看洗版】Dry-run 无待处理条目（可能被排除规则过滤或媒体库无未观看）")
+                else:
+                    logger.info(f"【未看洗版】Dry-run 待处理条目共 {len(plan_items)} 条：")
+                    for idx, itm in enumerate(plan_items, 1):
+                        tmdb = itm.get("tmdb_id")
+                        mtype = itm.get("mtype")
+                        title = itm.get("name") or str(tmdb)
+                        season = itm.get("season")
+                        start = itm.get("start_episode")
+                        label = f"{title} [{mtype}]"
+                        season_str = f" 第{season}季" if season is not None else ""
+                        ep_str = f" 开始集数={start}" if start is not None else ""
+                        logger.info(f"  {idx}. {label}{season_str}{ep_str}")
+                    logger.info("【未看洗版】Dry-run 结束（仅列出以上条目，未实际创建订阅）")
+                return
+            # ---------- 正常模式 ----------
             # 读取缓存
             caches = self._cache_path.read_text().split("\n") if self._cache_path.exists() else []
             caches = [c for c in caches if c]
@@ -845,6 +949,53 @@ class EmbyUnwatchedWash(_PluginBase):
         return self._wash_one(mediainfo, caches, history,
                               season=season, start_episode=start_episode, cache_key=cache_key)
 
+    def _build_plan(self) -> List[dict]:
+        """
+        构建本次运行的完整任务计划（供 Dry-run 预览与全量模式共用）。
+        返回 List[dict]，每项含 tmdb_id / mtype / name / season / start_episode。
+        手动模式会额外按 selected_items 过滤。
+        """
+        try:
+            selected = [str(x) for x in (self._selected_items or [])]
+            if selected:
+                # 手动模式：读取媒体库定位剧集未观看的季/集
+                plan_by_tmdb: Dict[str, List[dict]] = {}
+                if self._include_series and self._series_episode_level:
+                    plan_by_tmdb = self._plan_by_tmdb()
+                plan_items: List[dict] = []
+                for tid in selected:
+                    tasks = plan_by_tmdb.get(str(tid)) or [{
+                        "tmdb_id": tid,
+                        "mtype": None,
+                        "name": None,
+                        "season": None,
+                        "start_episode": None,
+                    }]
+                    for task in tasks:
+                        plan_items.append({
+                            "tmdb_id": task.get("tmdb_id"),
+                            "mtype": task.get("mtype"),
+                            "name": task.get("name"),
+                            "season": task.get("season"),
+                            "start_episode": task.get("start_episode"),
+                        })
+                return plan_items
+            # 全量模式：扫描媒体库未观看条目
+            servers = self._get_server_instances()
+            raw_items = []
+            for stype, name, inst in servers:
+                try:
+                    if stype == 'jellyfin':
+                        raw_items.extend(self.jellyfin_get_items(inst) or [])
+                    else:
+                        raw_items.extend(self.emby_get_items(inst) or [])
+                except Exception as e:
+                    logger.error(f"【未看洗版】读取 {name}({stype}) 未观看列表失败：{e}")
+            return self._build_wash_tasks(raw_items)
+        except Exception as e:
+            logger.error(f"【未看洗版】构建计划失败：{e}\n{traceback.format_exc()}")
+            return []
+
     def _plan_by_tmdb(self) -> Dict[str, List[dict]]:
         """
         读取媒体库未观看条目并按 tmdbid 归组（供手动选择模式定位剧集未观看的季/集）。
@@ -867,6 +1018,51 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.warning(f"【未看洗版】读取媒体库以定位未观看集失败（将按整部洗版）：{e}")
         return result
 
+    def _is_excluded_item(self, item: dict) -> bool:
+        """
+        按「排除媒体库 / 排除关键字」判断某条未观看条目是否要跳过。
+        基于条目的 LibraryName（库名）：
+        - exclude_libraries：库名精确匹配（去空格、忽略大小写）
+        - exclude_keywords：库名子串匹配（忽略大小写）
+        没有配置任何排除规则时返回 False（不排除）。
+        """
+        if not self._exclude_libraries and not self._exclude_keywords:
+            return False
+        lib = (item.get("LibraryName") or "").strip()
+        if not lib:
+            return False
+        lib_lc = lib.lower()
+        for lib_name in self._exclude_libraries:
+            if lib_name and lib_name.strip().lower() == lib_lc:
+                logger.debug(f"【未看洗版】命中排除媒体库，跳过：{item.get('Name')} (库={lib})")
+                return True
+        for kw in self._exclude_keywords:
+            if kw and kw.strip().lower() in lib_lc:
+                logger.debug(f"【未看洗版】命中排除关键字 '{kw}'，跳过：{item.get('Name')} (库={lib})")
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_str_list(value) -> List[str]:
+        """
+        归一化配置里的字符串列表：支持换行分隔的多行字符串、逗号分隔、列表。
+        前端 VTextField(multiline) 保存的是换行分隔的字符串。
+        """
+        if not value:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str):
+            # 先按换行拆，再按逗号拆，去重
+            parts = []
+            for line in value.splitlines():
+                for piece in line.split(","):
+                    piece = piece.strip()
+                    if piece and piece not in parts:
+                        parts.append(piece)
+            return parts
+        return []
+
     def _build_wash_tasks(self, items: List[dict]) -> List[dict]:
         """
         把媒体服务器返回的未观看条目转换成洗版任务列表：
@@ -874,6 +1070,7 @@ class EmbyUnwatchedWash(_PluginBase):
         - 剧集（开启集粒度）：按季拆分任务，start_episode = 该季第一个未观看的集
           （已观看的集不会被洗版，MoviePilot 会从该集开始搜索/下载）
         - 剧集（关闭集粒度，或拿不到集明细）：整剧洗版（season=None）
+        若配置了「排除媒体库 / 排除关键字」，命中者直接跳过。
         """
         movies: Dict[int, dict] = {}
         series_meta: Dict[str, dict] = {}
@@ -881,6 +1078,9 @@ class EmbyUnwatchedWash(_PluginBase):
 
         for data in items or []:
             if not isinstance(data, dict):
+                continue
+            # 排除媒体库 / 排除关键字：命中则整条跳过（LibraryName 由拉取 Fields 带回）
+            if self._is_excluded_item(data):
                 continue
             _type = data.get("Type")
             if _type == "Movie":
@@ -1118,7 +1318,8 @@ class EmbyUnwatchedWash(_PluginBase):
                            "&SortOrder=Descending"
                            "&Filters=IsUnplayed"
                            "&Recursive=true"
-                           "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
+                           # Fields 含 LibraryName：供「排除媒体库 / 排除关键字」过滤
+                           "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds%2CLibraryName"
                            "&CollapseBoxSetItems=false"
                            "&ExcludeLocationTypes=Virtual"
                            "&EnableTotalRecordCount=true"
