@@ -5,11 +5,11 @@
     "labels": "媒体库",
     "version": "1.0",
     "author": "jiuyaozhuce",
-    "project_url": "https://github.com/jiuyaozhuce/moviepilot-emby-unwatched-wash",
+    "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "level": 1,
     "release": true,
     "system_version": ">=3.0.0",
-    "repo": "https://github.com/jiuyaozhuce/moviepilot-emby-unwatched-wash",
+    "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
       "v1.0": "初始版本：扫描未观看影视，自动创建洗版订阅升级画质"
     }

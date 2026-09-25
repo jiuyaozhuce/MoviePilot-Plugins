@@ -23,7 +23,7 @@
 ## 仓库结构（符合 MoviePilot 官方插件仓库格式）
 
 ```
-moviepilot-emby-unwatched-wash/
+MoviePilot-Plugins/
 ├── package.json          # 插件清单（兜底，MP 可能读取此文件）
 ├── package.v3.json       # 插件清单（v3 实际读取的文件）
 ├── plugins.v3/           # v3 插件源码目录（MP 规定源码须放在此处）
@@ -42,7 +42,7 @@ moviepilot-emby-unwatched-wash/
 ### 方式一：作为插件仓库添加（推荐，最简单）
 
 1. MoviePilot → **设置 → 插件 → 插件仓库 → 新增**
-2. 仓库地址填：`https://github.com/jiuyaozhuce/moviepilot-emby-unwatched-wash`
+2. 仓库地址填：`https://github.com/jiuyaozhuce/MoviePilot-Plugins`
 3. 分支填：`main`
 4. 保存后刷新仓库列表，即可看到「Emby未看洗版」，点击安装。
 
