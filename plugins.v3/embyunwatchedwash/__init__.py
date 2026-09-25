@@ -43,7 +43,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.17"
+    plugin_version = "1.18"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -289,19 +289,13 @@ class EmbyUnwatchedWash(_PluginBase):
 
         排版：采用官方插件推荐的「单 VRow 栅格 + 分区标题（分隔线 + 小标题）」写法，
         自上而下按使用时的逻辑顺序排列：
-        基础设置 -> 执行计划 -> 洗版范围 -> 指定与排除 -> 试运行与手动触发。
+        基础设置 -> 执行计划 -> 洗版范围 -> 排除规则 -> 试运行与手动触发。
+
+        注意：配置页只保留「配置类」字段，媒体库未观看清单属「查看类」内容，
+        统一在「数据查看」页展示，避免两处重复。
         """
-        # 动态拉取媒体库未观看影视，供手动选择洗版（失败时留空，保证配置页可打开）
-        try:
-            options = self._get_library_options()
-        except Exception as e:
-            logger.error(f"【未看洗版】读取未观看列表失败，配置页该项将留空：{e}")
-            options = []
-        options_count = len(options)
-        options_hint = (f'从媒体库未观看列表中手动勾选要洗版的影视'
-                        f'（当前共 {options_count} 部可选项，'
-                        f'{"列表已截断，实际未观看可能更多" if options_count >= 500 else "已全部列出"}）。'
-                        f'不选则对媒体库内所有未观看影视洗版。')
+        # 只拉取媒体库列表供「排除媒体库」选择。
+        # 未观看清单不再在配置页拉取（那会每次打开配置页都全量扫描媒体库）。
         try:
             library_items = self._get_library_list_options()
         except Exception as e:
@@ -376,13 +370,8 @@ class EmbyUnwatchedWash(_PluginBase):
                             hint='开启：按季订阅并把「开始集数」设为该季第一个未看的集（已看集不洗）；关闭：整部剧洗版',
                             **{'persistent-hint': True}),
 
-                    # ---------- 4. 指定与排除 ----------
-                    section('指定与排除'),
-                    control('VSelect', 'selected_items', '指定洗版影视（留空 = 全部未观看）', md=12,
-                            items=options, multiple=True, chips=True, clearable=True,
-                            filterable=True, hideSelected=True,
-                            hint=options_hint,
-                            **{'persistent-hint': True}),
+                    # ---------- 4. 排除规则 ----------
+                    section('排除规则'),
                     control('VSelect', 'exclude_libraries', '排除媒体库', md=6,
                             items=library_items, multiple=True, chips=True, clearable=True,
                             filterable=True, hideSelected=True,
@@ -410,6 +399,8 @@ class EmbyUnwatchedWash(_PluginBase):
             "cron": "",
             "only_once": False,
             "include_series": True,
+            # 兼容旧配置：手动指定清单的配置项已从配置页移除（未观看清单统一在
+            # 「数据查看」页查看），此处保留键位以免历史配置读出异常。
             "selected_items": [],
             "series_episode_level": True,
             "limit": 0,
@@ -596,7 +587,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     'component': 'VCardText',
                     'props': {'class': 'text-caption text-medium-emphasis pb-1'},
                     'text': f"共 {len(options)} 部未观看候选（含电影与剧集）。每组仅预览前 {_DETAIL_LIST_CAP} 部，"
-                            f"点击条目可跳转 TMDB 对照；完整清单请在配置页「指定洗版影视」中检索选择。"
+                            f"点击条目可跳转 TMDB 对照；本页仅供查看，运行时会处理全部未观看影视（排除规则命中的除外）。"
                 },
                 {'component': 'VDivider'},
                 {'component': 'VCardText', 'props': {'class': 'pa-0'}, 'content': body},
@@ -616,7 +607,6 @@ class EmbyUnwatchedWash(_PluginBase):
             options = []
         history = self.get_data('history') or []
         history = sorted(history, key=lambda x: x.get('time', ''), reverse=True)
-        selected = [item for item in (self._selected_items or []) if item not in (None, "")]
 
         contents: List[dict] = []
 
@@ -627,9 +617,10 @@ class EmbyUnwatchedWash(_PluginBase):
                             '媒体库中未观看的影视', 'primary', 'mdi-movie-open-outline'),
             self._stat_card('洗版历史', f"{len(history)} 条",
                             '本地最多保留 500 条', 'success', 'mdi-history'),
-            self._stat_card('运行模式', '手动指定' if selected else '全量',
-                            f"已指定 {len(selected)} 部影视" if selected else '处理全部未观看影视',
-                            'info', 'mdi-tune-variant'),
+            self._stat_card('洗版范围', '电影 + 剧集' if self._include_series else '仅电影',
+                            ('剧集按未观看集洗版' if self._series_episode_level else '剧集按整部洗版')
+                            if self._include_series else '不处理剧集',
+                            'info', 'mdi-movie-filter'),
             self._stat_card('试运行', '已开启' if self._dry_run else '已关闭',
                             '仅输出清单，不创建订阅' if self._dry_run else '按规则正常创建订阅',
                             'warning' if self._dry_run else 'success', 'mdi-test-tube'),
