@@ -12,11 +12,12 @@ from requests import Response
 from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
 from app.core.context import MediaInfo
+from app.core.event import eventmanager
 from app.log import logger
 from app.modules.emby import Emby
 from app.modules.jellyfin import Jellyfin
 from app.plugins import _PluginBase
-from app.schemas.types import MediaType
+from app.schemas.types import MediaType, EventType
 
 lock = RLock()
 
@@ -89,13 +90,29 @@ class EmbyUnwatchedWash(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        return [{
+            "cmd": "/emby_wash",
+            "event": EventType.PluginAction,
+            "desc": "立即执行未看洗版",
+            "category": "未看洗版"
+        }]
 
     def get_api(self) -> List[Dict[str, Any]]:
         """
         获取插件API
         """
-        pass
+        return [{
+            "path": "/history",
+            "endpoint": self.get_history,
+            "methods": ["GET"],
+            "summary": "获取未看洗版历史记录"
+        }]
+
+    def get_history(self) -> List[dict]:
+        """
+        API 端点：返回已洗版历史记录
+        """
+        return self.get_data('history') or []
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -369,10 +386,20 @@ class EmbyUnwatchedWash(_PluginBase):
         except Exception as e:
             logger.error("退出插件失败：%s" % str(e))
 
+    @eventmanager.register(EventType.PluginAction)
+    def emby_wash_command(self, event):
+        """
+        响应远程命令 /emby_wash，立即执行一次扫描
+        """
+        if event.event_data and event.event_data.get("cmd") == "/emby_wash":
+            self.sync()
+
     def sync(self):
         """
         通过流媒体管理工具未观看列表，自动洗版
         """
+        # 本次处理计数
+        washed_count = 0
         # 获取锁
         _is_lock: bool = lock.acquire(timeout=60)
         if not _is_lock:
@@ -406,10 +433,6 @@ class EmbyUnwatchedWash(_PluginBase):
                 # all_item 根据影视名去重
                 result = reduce(function, all_item, [])
                 for data in result:
-                    # 检查缓存
-                    if data.get('Name') in caches:
-                        continue
-
                     # 获取详情
                     if server == 'jellyfin':
                         item_info_resp = Jellyfin().get_iteminfo(itemid=data.get('Id'))
@@ -432,6 +455,9 @@ class EmbyUnwatchedWash(_PluginBase):
                     tmdb_id = item_info_resp.tmdbid
                     if not tmdb_id:
                         continue
+                    # 已处理过的条目（按 tmdbid 去重）跳过
+                    if str(tmdb_id) in caches:
+                        continue
                     # 识别媒体信息
                     mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=tmdb_id, mtype=mtype)
                     if not mediainfo:
@@ -445,8 +471,9 @@ class EmbyUnwatchedWash(_PluginBase):
                                             best_version=True,
                                             username="未看洗版",
                                             exist_ok=True)
-                    # 加入缓存
-                    caches.append(data.get('Name'))
+                    # 加入缓存（按 tmdbid 去重，避免同名影视误判）
+                    caches.append(str(tmdb_id))
+                    washed_count += 1
                     # 存储历史记录
                     if mediainfo.tmdb_id not in [h.get("tmdbid") for h in history]:
                         history.append({
@@ -462,6 +489,12 @@ class EmbyUnwatchedWash(_PluginBase):
             self.save_data('history', history)
             # 保存缓存
             self._cache_path.write_text("\n".join(caches))
+            # 发送完成通知
+            if self._notify:
+                self.post_message(
+                    title="『未看洗版』任务完成",
+                    text=f"本次扫描已处理 {washed_count} 个未观看影视，已创建洗版订阅（更高画质版本）。"
+                )
         finally:
             lock.release()
 
@@ -523,7 +556,7 @@ class EmbyUnwatchedWash(_PluginBase):
             else:
                 return []
         except Exception as e:
-            print(str(e))
+            logger.error(f"解析Items数据出错：{str(e)}")
             return []
 
     @staticmethod

@@ -54,7 +54,7 @@ MoviePilot-Plugins/
 ## 配置
 
 - **启用插件**：开
-- **发送通知**：开（目前为预留开关，行为同上游）
+- **发送通知**：开 → 每次扫描完成后推送一条汇总通知（已处理 N 个影视）
 - **立即运行一次**：开 → 保存后延迟 3 秒执行一次扫描
 - **包含剧集**：开 → 对 `Series`（电视剧）也创建洗版订阅；关 → 仅电影
 - **执行周期**：5 位 cron（如 `0 4 * * *`）；留空则每 30 分钟扫描一次
@@ -63,13 +63,14 @@ MoviePilot-Plugins/
 
 1. 定时：按 `执行周期` / 默认 30 分钟（`get_service`）
 2. 手动：配置页打开「立即运行一次」并保存（`only_once`）
-3. 详情页：查看已洗版历史记录（`get_page`）
+3. 远程命令：向 MoviePilot 发送 `/emby_wash`，立即执行一次扫描（`get_command` + `EventType.PluginAction`）
+4. 详情页：查看已洗版历史记录（`get_page`）；另提供调试 API `GET /api/v1/plugin/EmbyUnwatchedWash/history` 返回历史 JSON
 
 ## 工作原理
 
 1. `sync()` 读取 `settings.MEDIASERVER`，对每个 Emby/Jellyfin 调用 `emby_get_items()`，
    用 `Users/{user}/Items?Filters=IsUnplayed&Recursive=true` 拉取未观看条目。
-2. 按名称去重 → 跳过缓存中已处理的 → `get_iteminfo()` 取 tmdbid → `recognize_media()` 识别。
+2. 按 tmdbid 去重（缓存键由影视名改为 tmdbid，避免同名影视误判）→ 跳过已处理的 → `get_iteminfo()` 取 tmdbid → `recognize_media()` 识别。
 3. `subscribechain.add(..., best_version=True, exist_ok=True)` 创建洗版订阅（**已存在则跳过**）。
 4. 写入缓存与历史，避免重复订阅。
 
