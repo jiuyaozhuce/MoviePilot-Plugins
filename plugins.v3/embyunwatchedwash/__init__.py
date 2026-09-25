@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.11"
+    plugin_version = "1.12"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -101,6 +101,9 @@ class EmbyUnwatchedWash(_PluginBase):
                 self._limit = 0
             # 新增的排除与 Dry-Run 配置
             self._exclude_libraries = self._normalize_str_list(config.get("exclude_libraries", []))
+            # 兼容旧版 exclude_library_names（UI 选择存储）
+            if config.get("exclude_library_names"):
+                self._exclude_libraries = self._normalize_str_list(config.get("exclude_library_names", []))
             self._exclude_keywords = self._normalize_str_list(config.get("exclude_keywords", []))
             self._dry_run = bool(config.get("dry_run", False))
 
@@ -118,6 +121,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 "exclude_libraries": self._exclude_libraries,
                 "exclude_keywords": self._exclude_keywords,
                 "dry_run": self._dry_run,
+                "exclude_library_names": self._exclude_libraries,
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(self.sync, 'date',
@@ -159,6 +163,12 @@ class EmbyUnwatchedWash(_PluginBase):
                 "summary": "获取媒体库未观看影视列表（供手动选择洗版）"
             },
             {
+                "path": "/libraries",
+                "endpoint": self.get_libraries,
+                "methods": ["GET"],
+                "summary": "获取媒体服务器库列表（供排除媒体库选择）"
+            },
+            {
                 "path": "/clear_cache",
                 "endpoint": self.clear_cache,
                 "methods": ["POST"],
@@ -183,6 +193,37 @@ class EmbyUnwatchedWash(_PluginBase):
         API 端点：返回媒体库未观看影视可选项（标题 + tmdbid）
         """
         return self._get_library_options()
+
+    def get_libraries(self) -> List[dict]:
+        """
+        API 端点：返回所有媒体服务器的库列表，供排除媒体库 UI 选择。
+        返回格式：[{"server": "Emby", "name": "电影", "type": "movie"}, ...]
+        """
+        result = []
+        try:
+            for stype, name, inst in self._get_server_instances():
+                try:
+                    if stype == 'jellyfin':
+                        libs = inst.get_librarys() or []
+                    else:
+                        libs = inst.get_librarys() or []
+                    for lib in libs:
+                        lib_name = lib.get('Name') or lib.get('CollectionType') or ''
+                        lib_type = lib.get('CollectionType', '')
+                        # 映射类型标签
+                        type_map = {'movies': '电影', 'tvshows': '电视剧', 'boxsets': '合集',
+                                   'homevideos': '家庭视频', 'photos': '照片', 'books': '书籍'}
+                        result.append({
+                            'server': name,
+                            'name': lib_name,
+                            'type': type_map.get(lib_type, lib_type or '未知'),
+                            'id': lib.get('Id'),
+                        })
+                except Exception as e:
+                    logger.error(f"【未看洗版】读取 {name}({stype}) 库列表失败：{e}")
+        except Exception as e:
+            logger.error(f"【未看洗版】获取媒体库列表失败：{e}")
+        return result
 
     def clear_cache(self) -> dict:
         """
@@ -427,35 +468,18 @@ class EmbyUnwatchedWash(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSelect',
                                         'props': {
                                             'model': 'exclude_libraries',
-                                            'label': '排除媒体库（每行一个库名）',
-                                            'placeholder': '例：Kids\nAdult\nChildren',
-                                            'hint': '按完整库名排除，如「Kids」「Children」这类库将完全跳过',
+                                            'label': '排除媒体库',
+                                            'items': self._get_library_list_options(),
+                                            'multiple': True,
+                                            'chips': True,
+                                            'clearable': True,
+                                            'filterable': True,
+                                            'hideSelected': True,
                                             'persistent-hint': True,
-                                            'rows': 3,
-                                            'multiline': True
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'exclude_keywords',
-                                            'label': '排除关键字（每行一个）',
-                                            'placeholder': '例：children\nkids\nbaby',
-                                            'hint': '对库名做子串匹配（不区分大小写），命中即跳过该库',
-                                            'persistent-hint': True,
-                                            'rows': 3,
-                                            'multiline': True
+                                            'hint': '勾选后该媒体库的所有未观看内容将被跳过',
                                         }
                                     }
                                 ]
@@ -521,7 +545,8 @@ class EmbyUnwatchedWash(_PluginBase):
             "limit": 0,
             "exclude_libraries": [],
             "exclude_keywords": [],
-            "dry_run": False
+            "dry_run": False,
+            "exclude_library_names": []  # UI 选择时存储的库名列表
         }
 
     def get_page(self) -> List[dict]:
@@ -1044,6 +1069,32 @@ class EmbyUnwatchedWash(_PluginBase):
                 logger.debug(f"【未看洗版】命中排除关键字 '{kw}'，跳过：{item.get('Name')} (库={lib})")
                 return True
         return False
+
+    def _get_library_list_options(self) -> List[dict]:
+        """
+        获取媒体服务器库列表，供排除媒体库 VSelect 使用。
+        返回格式：[{"title": "电影 (Emby)", "value": "电影"}, ...]
+        """
+        options = []
+        try:
+            for stype, name, inst in self._get_server_instances():
+                try:
+                    if stype == 'jellyfin':
+                        libs = inst.get_librarys() or []
+                    else:
+                        libs = inst.get_librarys() or []
+                    for lib in libs:
+                        lib_name = lib.get('Name') or ''
+                        if lib_name:
+                            options.append({
+                                'title': f"{lib_name} ({name})",
+                                'value': lib_name,
+                            })
+                except Exception as e:
+                    logger.debug(f"【未看洗版】读取 {name}({stype}) 库列表失败：{e}")
+        except Exception as e:
+            logger.error(f"【未看洗版】获取媒体库列表失败：{e}")
+        return options
 
     @staticmethod
     def _normalize_str_list(value) -> List[str]:
