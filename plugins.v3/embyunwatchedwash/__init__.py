@@ -28,7 +28,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -370,7 +370,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 'props': {
                     'type': 'info',
                     'variant': 'tonal',
-                    'text': '未能从媒体服务器读取未观看列表（可能未配置 settings.MEDIASERVER 或服务器不可达）。'
+                    'text': '未能从媒体服务器读取未观看列表（可能未配置媒体服务器或服务器不可达）。'
                 }
             })
 
@@ -560,27 +560,30 @@ class EmbyUnwatchedWash(_PluginBase):
                     elif status == "skipped":
                         skipped_count += 1
             else:
+                servers = self._media_server_types()
                 logger.info(f"【未看洗版】运行模式：全量扫描 | 包含剧集={self._include_series} | "
-                            f"媒体服务器={settings.MEDIASERVER or '未配置'}")
+                            f"媒体服务器={','.join(servers) or '未配置'}")
                 # 全量模式：扫描媒体库未观看影视
-                if not settings.MEDIASERVER:
-                    logger.warning("【未看洗版】未配置媒体服务器 settings.MEDIASERVER，无法全量扫描")
+                if not servers:
+                    logger.warning("【未看洗版】未检测到已配置的媒体服务器，无法全量扫描")
                     return
-                media_servers = settings.MEDIASERVER.split(',')
 
                 # 读取未观看条目（已分页拉全）
                 all_items = {}
-                for media_server in media_servers:
-                    if media_server == 'jellyfin':
-                        items = self.jellyfin_get_items()
-                        logger.info(f"【未看洗版】Jellyfin 获取到 {len(items)} 条未观看条目")
-                        all_items['jellyfin'] = items
-                    elif media_server == 'emby':
-                        items = self.emby_get_items()
-                        logger.info(f"【未看洗版】Emby 获取到 {len(items)} 条未观看条目")
-                        all_items['emby'] = items
-                    else:
-                        logger.warning(f"【未看洗版】暂不支持的媒体服务器类型：{media_server}")
+                for media_server in servers:
+                    try:
+                        if media_server == 'jellyfin':
+                            items = self.jellyfin_get_items()
+                            logger.info(f"【未看洗版】Jellyfin 获取到 {len(items)} 条未观看条目")
+                            all_items['jellyfin'] = items
+                        elif media_server == 'emby':
+                            items = self.emby_get_items()
+                            logger.info(f"【未看洗版】Emby 获取到 {len(items)} 条未观看条目")
+                            all_items['emby'] = items
+                        else:
+                            logger.warning(f"【未看洗版】暂不支持的媒体服务器类型：{media_server}")
+                    except Exception as e:
+                        logger.error(f"【未看洗版】读取媒体服务器 {media_server} 未观看列表失败：{e}")
 
                 def function(y, x):
                     return y if (x['Name'] in [i['Name'] for i in y]) else (lambda z, u: (z.append(u), z))(y, x)[1]
@@ -705,73 +708,96 @@ class EmbyUnwatchedWash(_PluginBase):
         return "added"
 
     def jellyfin_get_items(self) -> List[dict]:
-        # 获取所有user
-        users_url = "[HOST]Users?&apikey=[APIKEY]"
-        users = self.get_users(Jellyfin().get_data(users_url))
-        if not users:
-            logger.info(f"EmbyUnwatchedWash/users_url: {users_url}")
+        try:
+            # 获取所有user
+            users_url = "[HOST]Users?&apikey=[APIKEY]"
+            users = self.get_users(Jellyfin().get_data(users_url))
+            if not users:
+                return []
+            all_items = []
+            limit = 500
+            for user in users:
+                # 分页拉全：按加入日期降序，仅取未观看
+                start = 0
+                while True:
+                    url = ("[HOST]Users/" + user + "/Items"
+                           "?SortBy=DateCreated%2CSortName"
+                           "&SortOrder=Descending"
+                           "&Filters=IsUnplayed"
+                           "&Recursive=true"
+                           "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
+                           "&CollapseBoxSetItems=false"
+                           "&ExcludeLocationTypes=Virtual"
+                           "&EnableTotalRecordCount=true"
+                           f"&Limit={limit}&StartIndex={start}"
+                           "&apikey=[APIKEY]")
+                    resp = self.get_items(Jellyfin().get_data(url))
+                    if not resp:
+                        break
+                    items = resp
+                    all_items.extend(items)
+                    # 判断是否已经拉完
+                    if len(items) < limit:
+                        break
+                    start += limit
+            return all_items
+        except Exception as e:
+            logger.error(f"【未看洗版】读取 Jellyfin 未观看列表失败：{e}")
             return []
-        all_items = []
-        limit = 500
-        for user in users:
-            # 分页拉全：按加入日期降序，仅取未观看
-            start = 0
-            while True:
-                url = ("[HOST]Users/" + user + "/Items"
-                       "?SortBy=DateCreated%2CSortName"
-                       "&SortOrder=Descending"
-                       "&Filters=IsUnplayed"
-                       "&Recursive=true"
-                       "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
-                       "&CollapseBoxSetItems=false"
-                       "&ExcludeLocationTypes=Virtual"
-                       "&EnableTotalRecordCount=true"
-                       f"&Limit={limit}&StartIndex={start}"
-                       "&apikey=[APIKEY]")
-                resp = self.get_items(Jellyfin().get_data(url))
-                if not resp:
-                    break
-                items = resp
-                all_items.extend(items)
-                # 判断是否已经拉完
-                if len(items) < limit:
-                    break
-                start += limit
-        return all_items
 
     def emby_get_items(self) -> List[dict]:
-        # 获取所有user
-        get_users_url = "[HOST]Users?&api_key=[APIKEY]"
-        users = self.get_users(Emby().get_data(get_users_url))
-        if not users:
+        try:
+            # 获取所有user
+            get_users_url = "[HOST]Users?&api_key=[APIKEY]"
+            users = self.get_users(Emby().get_data(get_users_url))
+            if not users:
+                return []
+            all_items = []
+            limit = 500
+            for user in users:
+                # 分页拉全：按加入日期降序，仅取未观看
+                start = 0
+                while True:
+                    url = ("[HOST]emby/Users/" + user + "/Items"
+                           "?SortBy=DateCreated%2CSortName"
+                           "&SortOrder=Descending"
+                           "&Filters=IsUnplayed"
+                           "&Recursive=true"
+                           "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
+                           "&CollapseBoxSetItems=false"
+                           "&ExcludeLocationTypes=Virtual"
+                           "&EnableTotalRecordCount=true"
+                           f"&Limit={limit}&StartIndex={start}"
+                           "&api_key=[APIKEY]")
+                    resp = self.get_items(Emby().get_data(url))
+                    if not resp:
+                        break
+                    items = resp
+                    all_items.extend(items)
+                    # 判断是否已经拉完
+                    if len(items) < limit:
+                        break
+                    start += limit
+            return all_items
+        except Exception as e:
+            logger.error(f"【未看洗版】读取 Emby 未观看列表失败：{e}")
             return []
-        all_items = []
-        limit = 500
-        for user in users:
-            # 分页拉全：按加入日期降序，仅取未观看
-            start = 0
-            while True:
-                url = ("[HOST]emby/Users/" + user + "/Items"
-                       "?SortBy=DateCreated%2CSortName"
-                       "&SortOrder=Descending"
-                       "&Filters=IsUnplayed"
-                       "&Recursive=true"
-                       "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
-                       "&CollapseBoxSetItems=false"
-                       "&ExcludeLocationTypes=Virtual"
-                       "&EnableTotalRecordCount=true"
-                       f"&Limit={limit}&StartIndex={start}"
-                       "&api_key=[APIKEY]")
-                resp = self.get_items(Emby().get_data(url))
-                if not resp:
-                    break
-                items = resp
-                all_items.extend(items)
-                # 判断是否已经拉完
-                if len(items) < limit:
-                    break
-                start += limit
-        return all_items
+
+    def _media_server_types(self) -> List[str]:
+        """
+        返回需要扫描的媒体服务器类型列表，兼容不同 MoviePilot 版本：
+        - 旧版：读取环境变量 settings.MEDIASERVER（逗号分隔）
+        - 新版：媒体服务器改为数据库配置，settings 上可能已无 MEDIASERVER 属性，
+                此时直接尝试 emby / jellyfin（由模块自身判断是否可用）
+        全程使用 getattr 安全读取，绝不因属性不存在而抛 AttributeError。
+        """
+        raw = getattr(settings, "MEDIASERVER", "") or ""
+        if isinstance(raw, str) and raw.strip():
+            types = [t.strip().lower() for t in raw.split(",") if t.strip()]
+            if types:
+                return types
+        # 未配置环境变量（新版常见）→ 尝试两者
+        return ["emby", "jellyfin"]
 
     def _get_library_options(self) -> List[dict]:
         """
@@ -780,16 +806,21 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         options = []
         try:
-            if not settings.MEDIASERVER:
+            servers = self._media_server_types()
+            if not servers:
                 return options
             seen = set()
             cap = 500
-            for server in settings.MEDIASERVER.split(','):
-                if server == 'jellyfin':
-                    items = self.jellyfin_get_items()
-                elif server == 'emby':
-                    items = self.emby_get_items()
-                else:
+            for server in servers:
+                try:
+                    if server == 'jellyfin':
+                        items = self.jellyfin_get_items()
+                    elif server == 'emby':
+                        items = self.emby_get_items()
+                    else:
+                        continue
+                except Exception as e:
+                    logger.error(f"【未看洗版】读取 {server} 未观看列表失败：{e}")
                     continue
                 for it in items:
                     name = it.get('Name')
