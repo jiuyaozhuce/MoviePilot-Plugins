@@ -3,7 +3,7 @@
             "name": "Emby未看洗版",
             "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
             "labels": "媒体库",
-            "version": "1.12",
+            "version": "1.13",
             "icon": "icon.svg",
             "author": "jiuyaozhuce",
             "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,7 +12,7 @@
             "system_version": ">=3.0.0",
             "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
             "history": {
-                  "v1.12": "新增媒体库选择 UI：排除媒体库改为 VSelect 多选（从插件获取库列表），无需手动输入关键字",
+                  "v1.13": "恢复 exclude_keywords 配置项；合并排除媒体库/关键字为同一 VRow；添加使用说明 Alert",
                   "v1.8": "剧集改为按「未观看集」洗版：以季为单位建订阅，并把订阅的『开始集数』设为该季第一个未观看的集（已看的集不再洗版）；新增『剧集按未观看集洗版』开关与『单次最多处理数量』上限（防大库一次建上千订阅）",
                   "v1.9": "UI/功能优化：① 媒体库未观看选项加 60 秒 TTL 缓存（配置页/详情页不再每次全量扫描）；② 手动选择模式也受『单次最多处理数量』保护；③ 历史记录上限 500 条自动淘汰最旧；④ 历史卡片 TMDB 链接区分电影/剧集；⑤ 新增『清除洗版缓存』与『清除历史记录』维护入口",
                   "v1.10": "新增排除媒体库 / 排除关键字（按 LibraryName 子串匹配，避开 Kids/Children 等库）；新增 Dry-run 预览模式（只列出计划不建订阅）；build_plan 统一计划构建供 dry-run 复用",

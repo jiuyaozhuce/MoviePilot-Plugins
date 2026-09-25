@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.12"
+    plugin_version = "1.13"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -477,6 +477,26 @@ class EmbyUnwatchedWash(_PluginBase):
                                             'label': '排除媒体库（每行一个库名）',
                                             'placeholder': '例：Kids\nAdult\nChildren',
                                             'hint': '按完整库名排除，如「Kids」「Children」这类库将完全跳过',
+                                            'persistent-hint': True,
+                                            'rows': 3,
+                                            'multiline': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'exclude_keywords',
+                                            'label': '排除关键字（每行一个）',
+                                            'placeholder': '例：children\nkids\nbaby',
+                                            'hint': '对库名做子串匹配（不区分大小写），命中即跳过该库',
                                             'persistent-hint': True,
                                             'rows': 3,
                                             'multiline': True
