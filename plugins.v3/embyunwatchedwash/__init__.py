@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.15"
+    plugin_version = "1.16"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -258,282 +258,125 @@ class EmbyUnwatchedWash(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
+
+        排版：采用官方插件推荐的「单 VRow 栅格 + 分区标题（分隔线 + 小标题）」写法，
+        自上而下按使用时的逻辑顺序排列：
+        基础设置 -> 执行计划 -> 洗版范围 -> 指定与排除 -> 试运行与手动触发。
         """
-        # 动态拉取媒体库未观看影视，供手动选择洗版
-        options = self._get_library_options()
+        # 动态拉取媒体库未观看影视，供手动选择洗版（失败时留空，保证配置页可打开）
+        try:
+            options = self._get_library_options()
+        except Exception as e:
+            logger.error(f"【未看洗版】读取未观看列表失败，配置页该项将留空：{e}")
+            options = []
         options_count = len(options)
         options_hint = (f'从媒体库未观看列表中手动勾选要洗版的影视'
                         f'（当前共 {options_count} 部可选项，'
                         f'{"列表已截断，实际未观看可能更多" if options_count >= 500 else "已全部列出"}）。'
                         f'不选则对媒体库内所有未观看影视洗版。')
+        try:
+            library_items = self._get_library_list_options()
+        except Exception as e:
+            logger.error(f"【未看洗版】读取媒体库列表失败，排除项将为空：{e}")
+            library_items = []
 
-        return [
-            {
-                'component': 'VForm',
-                'content': [
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'enabled',
-                                            'label': '启用插件',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'notify',
-                                            'label': '发送通知',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'only_once',
-                                            'label': '立即运行一次',
-                                            'hint': '保存配置后立即运行一次（不受启用开关管控）',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'include_series',
-                                            'label': '包含剧集',
-                                            'hint': '关闭则仅对电影洗版',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'cron',
-                                            'label': '执行周期',
-                                            'placeholder': '5位cron表达式，留空每30分钟'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'series_episode_level',
-                                            'label': '剧集按未观看集洗版',
-                                            'hint': '开启：剧集按季订阅，并把「开始集数」设为该季第一个未看的集（已看的集不洗）；'
-                                                    '关闭：整部剧洗版',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'limit',
-                                            'label': '单次最多处理数量',
-                                            'placeholder': '0 = 不限；建议先设小值试跑',
-                                            'hint': '大库建议先设 5~20，确认无误后再放开，避免一次创建上千订阅',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'selected_items',
-                                            'label': '指定洗版影视（留空=全部未观看）',
-                                            'items': options,
-                                            'multiple': True,
-                                            'chips': True,
-                                            'clearable': True,
-                                            'filterable': True,
-                                            'hideSelected': True,
-                                            'persistent-hint': True,
-                                            'hint': options_hint,
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'exclude_libraries',
-                                            'label': '排除媒体库',
-                                            'items': self._get_library_list_options(),
-                                            'multiple': True,
-                                            'chips': True,
-                                            'clearable': True,
-                                            'filterable': True,
-                                            'hideSelected': True,
-                                            'persistent-hint': True,
-                                            'hint': '勾选后该媒体库的所有未观看内容将被跳过',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'exclude_keywords',
-                                            'label': '排除关键字（每行一个）',
-                                            'placeholder': '例：children\nkids\nbaby',
-                                            'hint': '对库名做子串匹配（不区分大小写），命中即跳过该库',
-                                            'persistent-hint': True,
-                                            'rows': 3,
-                                            'multiline': True
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'dry_run',
-                                            'label': 'Dry-run 预览模式（只列出计划，不创建订阅）',
-                                            'hint': '开启后运行只会打印待洗版条目，不会真正调用 SubscribeChain.add，适合试跑',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': '扫描媒体服务器中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。'
-                                                    '你也可以在上方「指定洗版影视」中手动选择只洗版部分影视；不选则默认对全部未观看影视洗版。'
-                                                    '已处理的条目会写入缓存，不会重复订阅。'
-                                                    '开启 Dry-run 后只打印计划，不会真的创建订阅。'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
+        def cell(content: dict, md: int = 12) -> dict:
+            """把一个组件包进统一样式的栅格单元（md 断点下按 md 值自动分栏）。"""
+            return {
+                'component': 'VCol',
+                'props': {'cols': 12, 'md': md, 'class': 'pa-2'},
+                'content': [content]
             }
-        ], {
+
+        def control(component: str, model: str, label: str, md: int = 12, **props) -> dict:
+            """生成一个带标签的表单项；开关若没有提示文字则隐藏详情区，保证同行开关高度一致。"""
+            node_props: Dict[str, Any] = {'model': model, 'label': label}
+            if component == 'VSwitch' and not props.get('hint'):
+                node_props['hide-details'] = True
+            node_props.update(props)
+            return cell({'component': component, 'props': node_props}, md=md)
+
+        def section(title: str) -> dict:
+            """分区标题：顶部分隔线 + 小标题，用于把配置项按逻辑分组。"""
+            return cell({
+                'component': 'div',
+                'props': {'class': 'pt-2'},
+                'content': [
+                    {'component': 'VDivider', 'props': {'class': 'mb-3'}},
+                    {'component': 'h3', 'props': {'class': 'text-subtitle-1'}, 'text': title},
+                ]
+            })
+
+        return [{
+            'component': 'VForm',
+            'content': [{
+                'component': 'VRow',
+                'props': {'class': 'ma-0'},
+                'content': [
+                    cell({
+                        'component': 'VAlert',
+                        'props': {
+                            'type': 'info',
+                            'variant': 'tonal',
+                            'text': '扫描媒体服务器中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级为更高画质版本。'
+                                    '已处理的条目会写入缓存，不会重复订阅；建议先开启「Dry-run 预览」试跑确认，再正式运行。'
+                        }
+                    }),
+
+                    # ---------- 1. 基础设置 ----------
+                    section('基础设置'),
+                    control('VSwitch', 'enabled', '启用插件', md=6),
+                    control('VSwitch', 'notify', '发送通知', md=6),
+
+                    # ---------- 2. 执行计划 ----------
+                    section('执行计划'),
+                    control('VTextField', 'cron', '执行周期', md=6,
+                            placeholder='留空则每 30 分钟运行一次',
+                            hint='5 位 cron 表达式，留空按 30 分钟间隔；例：0 3 * * * 表示每天 03:00 运行',
+                            **{'persistent-hint': True}),
+                    control('VTextField', 'limit', '单次最多处理数量', md=6,
+                            placeholder='0 = 不限',
+                            hint='大库建议先设 5~20 试跑，确认无误后再放开，避免一次创建上千订阅',
+                            **{'persistent-hint': True}),
+
+                    # ---------- 3. 洗版范围 ----------
+                    section('洗版范围'),
+                    control('VSwitch', 'include_series', '包含剧集', md=6,
+                            hint='关闭则仅对电影洗版',
+                            **{'persistent-hint': True}),
+                    control('VSwitch', 'series_episode_level', '剧集按未观看集洗版', md=6,
+                            hint='开启：按季订阅并把「开始集数」设为该季第一个未看的集（已看集不洗）；关闭：整部剧洗版',
+                            **{'persistent-hint': True}),
+
+                    # ---------- 4. 指定与排除 ----------
+                    section('指定与排除'),
+                    control('VSelect', 'selected_items', '指定洗版影视（留空 = 全部未观看）', md=12,
+                            items=options, multiple=True, chips=True, clearable=True,
+                            filterable=True, hideSelected=True,
+                            hint=options_hint,
+                            **{'persistent-hint': True}),
+                    control('VSelect', 'exclude_libraries', '排除媒体库', md=6,
+                            items=library_items, multiple=True, chips=True, clearable=True,
+                            filterable=True, hideSelected=True,
+                            hint='按库名精确匹配（忽略大小写），勾选后该库的未观看内容将被跳过',
+                            **{'persistent-hint': True}),
+                    control('VTextField', 'exclude_keywords', '排除关键字（每行一个）', md=6,
+                            placeholder='例：children\nkids\nbaby',
+                            rows=3, multiline=True,
+                            hint='对库名做子串匹配（忽略大小写），命中即跳过该库',
+                            **{'persistent-hint': True}),
+
+                    # ---------- 5. 试运行与手动触发 ----------
+                    section('试运行与手动触发'),
+                    control('VSwitch', 'dry_run', 'Dry-run 预览模式', md=6,
+                            hint='只打印待洗版清单，不真正创建订阅，适合正式运行前试跑',
+                            **{'persistent-hint': True}),
+                    control('VSwitch', 'only_once', '保存后立即运行一次', md=6,
+                            hint='保存配置后立刻执行一次（不受启用开关管控），执行后自动关闭',
+                            **{'persistent-hint': True}),
+                ]
+            }]
+        }], {
             "enabled": False,
             "notify": False,
             "cron": "",
@@ -545,7 +388,7 @@ class EmbyUnwatchedWash(_PluginBase):
             "exclude_libraries": [],
             "exclude_keywords": [],
             "dry_run": False,
-            "exclude_library_names": []  # UI 选择时存储的库名列表
+            "exclude_library_names": []  # 兼容旧版：UI 选择时存储的库名列表
         }
 
     def get_page(self) -> List[dict]:

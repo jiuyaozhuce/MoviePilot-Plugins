@@ -3,7 +3,7 @@
             "name": "Emby未看洗版",
             "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
             "labels": "媒体库",
-            "version": "1.15",
+            "version": "1.16",
             "icon": "icon.svg",
             "author": "jiuyaozhuce",
             "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
             "system_version": ">=3.0.0",
             "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
             "history": {
+                  "v1.16": "设置页排版重构：改为官方推荐的「单 VRow 栅格 + 分区标题」写法，按使用逻辑分为 基础设置 / 执行计划 / 洗版范围 / 指定与排除 / 试运行与手动触发 五个分区（分隔线+小标题）；同类字段两栏对齐（md=6），长列表字段整行（md=12）；补充字段提示文案，并保证配置页读取失败时不报错",
                   "v1.15": "修复排除媒体库选择：通过 Emby VirtualFolders API 自动获取库列表，VSelect 多选 UI 正常工作",
                   "v1.14": "修复排除媒体库：通过 Emby VirtualFolders API 自动获取库列表，VSelect 多选 UI",
                   "v1.13": "恢复 exclude_keywords 配置项；合并排除媒体库/关键字为同一 VRow；添加使用说明 Alert",
