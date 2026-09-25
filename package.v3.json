@@ -3,7 +3,7 @@
     "name": "Emby未看洗版",
     "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
     "labels": "媒体库",
-    "version": "1.7",
+    "version": "1.8",
     "icon": "icon.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.8": "剧集改为按「未观看集」洗版：以季为单位建订阅，并把订阅的『开始集数』设为该季第一个未观看的集（已看的集不再洗版）；新增『剧集按未观看集洗版』开关与『单次最多处理数量』上限（防大库一次建上千订阅）",
       "v1.7": "修复 v3 核心 API 不兼容：仅凭 media_id 无法判断电影/剧集，自动依次尝试 电影→剧集 兜底识别（实测已成功创建洗版订阅）",
       "v1.6": "适配 v3 核心 API：recognize_media 改用 media_source+media_id（v3 已移除 tmdbid 参数会抛 TypeError）；SubscribeChain.add 不再传 tmdbid（v3 会静默丢弃），改传 media_source+media_id",
       "v1.5": "诊断增强：识别/建订阅/整体流程均加异常捕获与堆栈日志，并记录识别耗时——此前异常会静默结束，表现为日志停在『正在处理』无后续",

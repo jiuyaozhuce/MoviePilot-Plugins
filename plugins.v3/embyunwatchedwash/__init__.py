@@ -2,7 +2,6 @@ import inspect
 import time
 import traceback
 from datetime import datetime, timedelta
-from functools import reduce
 from pathlib import Path
 from threading import RLock
 from typing import Optional, Any, List, Dict, Tuple
@@ -41,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.7"
+    plugin_version = "1.8"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -65,6 +64,10 @@ class EmbyUnwatchedWash(_PluginBase):
     _only_once: bool = False
     _include_series: bool = True
     _selected_items: List[int] = []
+    # 剧集按「未观看集」精确定位：只从该季第一个未看的集开始洗版（设置订阅的开始集数）
+    _series_episode_level: bool = True
+    # 单次运行最多处理的影视数量（0 = 不限），用于避免大库一次性建过多订阅
+    _limit: int = 0
 
     def init_plugin(self, config: dict = None):
         self._cache_path = settings.TEMP_PATH / "__emby_unwatched_wash_cache__"
@@ -81,6 +84,13 @@ class EmbyUnwatchedWash(_PluginBase):
             self._only_once = config.get("only_once")
             self._include_series = config.get("include_series")
             self._selected_items = config.get("selected_items") or []
+            self._series_episode_level = config.get("series_episode_level")
+            if self._series_episode_level is None:
+                self._series_episode_level = True
+            try:
+                self._limit = int(config.get("limit") or 0)
+            except (TypeError, ValueError):
+                self._limit = 0
 
         if self._only_once:
             self._only_once = False
@@ -91,6 +101,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 "only_once": self._only_once,
                 "include_series": self._include_series,
                 "selected_items": self._selected_items,
+                "series_episode_level": self._series_episode_level,
+                "limit": self._limit,
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(self.sync, 'date',
@@ -284,6 +296,49 @@ class EmbyUnwatchedWash(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'series_episode_level',
+                                            'label': '剧集按未观看集洗版',
+                                            'hint': '开启：剧集按季订阅，并把「开始集数」设为该季第一个未看的集（已看的集不洗）；'
+                                                    '关闭：整部剧洗版',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'limit',
+                                            'label': '单次最多处理数量',
+                                            'placeholder': '0 = 不限；建议先设小值试跑',
+                                            'hint': '大库建议先设 5~20，确认无误后再放开，避免一次创建上千订阅',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
                                 },
                                 'content': [
                                     {
@@ -338,7 +393,9 @@ class EmbyUnwatchedWash(_PluginBase):
             "cron": "",
             "only_once": False,
             "include_series": True,
-            "selected_items": []
+            "selected_items": [],
+            "series_episode_level": True,
+            "limit": 0
         }
 
     def get_page(self) -> List[dict]:
@@ -479,6 +536,10 @@ class EmbyUnwatchedWash(_PluginBase):
                                                 'class': 'pa-0 px-2'
                                             },
                                             'text': f'类型：{mtype}'
+                                                    + (f' 第{history.get("season")}季'
+                                                       if history.get("season") is not None else '')
+                                                    + (f' 开始集数 {history.get("start_episode")}'
+                                                       if history.get("start_episode") else '')
                                         },
                                         {
                                             'component': 'VCardText',
@@ -554,34 +615,30 @@ class EmbyUnwatchedWash(_PluginBase):
 
             if selected:
                 logger.info(f"【未看洗版】运行模式：手动选择（指定 {len(selected)} 个 tmdbid 洗版）")
+                # 开启剧集集粒度时，读取媒体库以定位所选剧集「未观看的集」
+                plan_by_tmdb: Dict[str, List[dict]] = {}
+                if self._include_series and self._series_episode_level:
+                    plan_by_tmdb = self._plan_by_tmdb()
                 for tid in selected:
-                    if tid in caches:
-                        logger.debug(f"【未看洗版】手动模式：tmdbid={tid} 已在缓存，跳过")
-                        continue
-                    # 指定 tmdbid 直接识别，无需媒体服务器
-                    logger.info(f"【未看洗版】手动模式：正在处理 tmdbid={tid}")
-                    try:
-                        _t0 = time.time()
-                        mediainfo: MediaInfo = self._recognize_auto(tid)
-                        logger.info(f"【未看洗版】手动模式：tmdbid={tid} 识别耗时 {time.time() - _t0:.1f}s")
-                    except Exception as e:
-                        logger.error(f"【未看洗版】手动模式：tmdbid={tid} 识别异常：{e}\n{traceback.format_exc()}")
-                        failed_count += 1
-                        continue
-                    if not mediainfo:
-                        logger.warning(f"【未看洗版】手动模式：tmdbid={tid} 识别失败")
-                        failed_count += 1
-                        continue
-                    status = self._wash_one(mediainfo, caches, history)
-                    if status == "added":
-                        washed_count += 1
-                    elif status == "failed":
-                        failed_count += 1
-                    elif status == "skipped":
-                        skipped_count += 1
+                    tasks = plan_by_tmdb.get(str(tid)) or [{
+                        "tmdb_id": tid,
+                        "mtype": None,
+                        "name": None,
+                        "season": None,
+                        "start_episode": None,
+                    }]
+                    for task in tasks:
+                        status = self._process_task(task, caches, history)
+                        if status == "added":
+                            washed_count += 1
+                        elif status == "failed":
+                            failed_count += 1
+                        elif status == "skipped":
+                            skipped_count += 1
             else:
                 servers = self._get_server_instances()
                 logger.info(f"【未看洗版】运行模式：全量扫描 | 包含剧集={self._include_series} | "
+                            f"剧集集粒度={self._series_episode_level} | 单次上限={self._limit or '不限'} | "
                             f"媒体服务器={','.join(n for _, n, _ in servers) or '未检测到已配置服务器'}")
                 # 全量模式：扫描媒体库未观看影视
                 if not servers:
@@ -589,8 +646,8 @@ class EmbyUnwatchedWash(_PluginBase):
                                    "请在 MoviePilot『设置 → 媒体 → 媒体服务器』中添加服务器并确保连接正常")
                     return
 
-                # 读取未观看条目（已分页拉全），按类型聚合
-                all_items = {}
+                # 读取未观看条目（已分页拉全）
+                raw_items = []
                 for stype, name, inst in servers:
                     try:
                         if stype == 'jellyfin':
@@ -598,61 +655,31 @@ class EmbyUnwatchedWash(_PluginBase):
                         else:
                             items = self.emby_get_items(inst)
                         logger.info(f"【未看洗版】{name}({stype}) 获取到 {len(items)} 条未观看条目")
-                        all_items.setdefault(stype, []).extend(items)
+                        raw_items.extend(items or [])
                     except Exception as e:
                         logger.error(f"【未看洗版】读取媒体服务器 {name}({stype}) 未观看列表失败：{e}")
 
-                def function(y, x):
-                    return y if (x['Name'] in [i['Name'] for i in y]) else (lambda z, u: (z.append(u), z))(y, x)[1]
+                if not raw_items:
+                    logger.info("【未看洗版】媒体服务器未返回任何未观看条目，本次无可执行任务")
 
-                # 处理所有结果
-                for server, all_item in all_items.items():
-                    # all_item 根据影视名去重
-                    result = reduce(function, all_item, [])
-                    logger.info(f"【未看洗版】{server} 去重后待处理 {len(result)} 部影视")
-                    for data in result:
-                        name = data.get("Name")
-                        _type = data.get("Type")
-                        # 仅接受 Movie / Series（剧集按配置）
-                        if _type == 'Movie':
-                            mtype = MediaType.MOVIE
-                        elif _type == 'Series' and self._include_series:
-                            mtype = MediaType.TV
-                        else:
-                            logger.debug(f"【未看洗版】跳过（类型不匹配/未开启剧集）：{name} type={_type}")
-                            continue
+                # 构建洗版任务：电影整部；剧集按季，起始集=该季第一个未观看的集
+                tasks = self._build_wash_tasks(raw_items)
+                logger.info(f"【未看洗版】待处理任务：电影 {sum(1 for t in tasks if t['mtype'] == MediaType.MOVIE)} 部 | "
+                            f"剧集 {sum(1 for t in tasks if t['mtype'] == MediaType.TV)} 个")
 
-                        # 直接从列表条目的 ProviderIds 取 tmdbid（列表请求已含该字段，无需再查详情，
-                        # 也规避 v3 中 get_iteminfo 返回的新 schema 与 v2 字段差异）
-                        tmdb_id = self._tmdbid_of_item(data)
-                        if not tmdb_id:
-                            logger.debug(f"【未看洗版】无 tmdbid（ProviderIds 缺失），跳过：{name}")
-                            continue
-                        # 已处理过的条目（按 tmdbid 去重）跳过
-                        if str(tmdb_id) in caches:
-                            logger.debug(f"【未看洗版】已在缓存中，跳过：{name} (tmdbid={tmdb_id})")
-                            continue
-                        # 识别媒体信息
-                        logger.info(f"【未看洗版】正在处理：{name} (tmdbid={tmdb_id})")
-                        try:
-                            _t0 = time.time()
-                            mediainfo: MediaInfo = self._recognize_auto(tmdb_id, mtype=mtype)
-                            logger.info(f"【未看洗版】{name} 识别耗时 {time.time() - _t0:.1f}s")
-                        except Exception as e:
-                            logger.error(f"【未看洗版】识别异常：{name} (tmdbid={tmdb_id})：{e}\n{traceback.format_exc()}")
-                            failed_count += 1
-                            continue
-                        if not mediainfo:
-                            logger.warning(f"【未看洗版】媒体识别失败，跳过：{name} (tmdbid={tmdb_id})")
-                            failed_count += 1
-                            continue
-                        status = self._wash_one(mediainfo, caches, history)
-                        if status == "added":
-                            washed_count += 1
-                        elif status == "failed":
-                            failed_count += 1
-                        elif status == "skipped":
-                            skipped_count += 1
+                limit = self._limit if isinstance(self._limit, int) and self._limit > 0 else 0
+                for task in tasks:
+                    # 单次上限保护（避免大库一次创建上千订阅）
+                    if limit and (washed_count + failed_count) >= limit:
+                        logger.info(f"【未看洗版】已达到单次处理上限 {limit}，本次停止（剩余任务下次运行继续）")
+                        break
+                    status = self._process_task(task, caches, history)
+                    if status == "added":
+                        washed_count += 1
+                    elif status == "failed":
+                        failed_count += 1
+                    elif status == "skipped":
+                        skipped_count += 1
 
             # 任务完成汇总
             logger.info(f"【未看洗版】========== 扫描完成 ========== | "
@@ -681,9 +708,164 @@ class EmbyUnwatchedWash(_PluginBase):
         finally:
             lock.release()
 
-    def _wash_one(self, mediainfo: MediaInfo, caches: List[str], history: List[dict]) -> str:
+    def _process_task(self, task: dict, caches: List[str], history: List[dict]) -> str:
+        """
+        处理单个洗版任务：命中缓存则跳过 → 识别媒体 → 创建洗版订阅。
+        返回：added（已添加）/ failed（失败）/ skipped（缓存跳过）
+        """
+        tmdb_id = task.get("tmdb_id")
+        season = task.get("season")
+        start_episode = task.get("start_episode")
+
+        label = task.get("name") or str(tmdb_id)
+        if season is not None:
+            label = f"{label} 第{season}季"
+        # 缓存键：电影按 tmdbid；剧集按 tmdbid+季（同一季只处理一次）
+        cache_key = str(tmdb_id) if season is None else f"{tmdb_id}:S{season}"
+
+        if cache_key in caches:
+            logger.debug(f"【未看洗版】已在缓存中，跳过：{label} (key={cache_key})")
+            return "skipped"
+
+        _ep_log = "" if start_episode is None else f"，开始集数={start_episode}"
+        logger.info(f"【未看洗版】正在处理：{label} (tmdbid={tmdb_id}{_ep_log})")
+        try:
+            _t0 = time.time()
+            mediainfo: MediaInfo = self._recognize_auto(tmdb_id, mtype=task.get("mtype"))
+            logger.info(f"【未看洗版】{label} 识别耗时 {time.time() - _t0:.1f}s")
+        except Exception as e:
+            logger.error(f"【未看洗版】识别异常：{label} (tmdbid={tmdb_id})：{e}\n{traceback.format_exc()}")
+            return "failed"
+        if not mediainfo:
+            logger.warning(f"【未看洗版】媒体识别失败，跳过：{label} (tmdbid={tmdb_id})")
+            return "failed"
+        return self._wash_one(mediainfo, caches, history,
+                              season=season, start_episode=start_episode, cache_key=cache_key)
+
+    def _plan_by_tmdb(self) -> Dict[str, List[dict]]:
+        """
+        读取媒体库未观看条目并按 tmdbid 归组（供手动选择模式定位剧集未观看的季/集）。
+        读取失败时返回空字典，调用方会退化为「整部洗版」。
+        """
+        result: Dict[str, List[dict]] = {}
+        try:
+            raw_items = []
+            for stype, name, inst in self._get_server_instances():
+                try:
+                    if stype == 'jellyfin':
+                        raw_items.extend(self.jellyfin_get_items(inst) or [])
+                    else:
+                        raw_items.extend(self.emby_get_items(inst) or [])
+                except Exception as e:
+                    logger.error(f"【未看洗版】读取媒体服务器 {name}({stype}) 未观看列表失败：{e}")
+            for task in self._build_wash_tasks(raw_items):
+                result.setdefault(str(task.get("tmdb_id")), []).append(task)
+        except Exception as e:
+            logger.warning(f"【未看洗版】读取媒体库以定位未观看集失败（将按整部洗版）：{e}")
+        return result
+
+    def _build_wash_tasks(self, items: List[dict]) -> List[dict]:
+        """
+        把媒体服务器返回的未观看条目转换成洗版任务列表：
+        - 电影：整部洗版（season=None）
+        - 剧集（开启集粒度）：按季拆分任务，start_episode = 该季第一个未观看的集
+          （已观看的集不会被洗版，MoviePilot 会从该集开始搜索/下载）
+        - 剧集（关闭集粒度，或拿不到集明细）：整剧洗版（season=None）
+        """
+        movies: Dict[int, dict] = {}
+        series_meta: Dict[str, dict] = {}
+        episodes: Dict[str, set] = {}
+
+        for data in items or []:
+            if not isinstance(data, dict):
+                continue
+            _type = data.get("Type")
+            if _type == "Movie":
+                tid = self._tmdbid_of_item(data)
+                if tid and tid not in movies:
+                    movies[tid] = {"name": data.get("Name"), "year": data.get("ProductionYear")}
+            elif _type == "Series":
+                sid = data.get("Id")
+                if sid:
+                    series_meta[sid] = {
+                        "name": data.get("Name"),
+                        "year": data.get("ProductionYear"),
+                        "tmdb_id": self._tmdbid_of_item(data),
+                    }
+            elif _type == "Episode":
+                # 单集：SeriesId 归属剧集 + 季号(ParentIndexNumber) + 集号(IndexNumber)
+                sid = data.get("SeriesId")
+                season = data.get("ParentIndexNumber")
+                ep = data.get("IndexNumber")
+                if sid and season is not None and ep is not None:
+                    try:
+                        episodes.setdefault(sid, set()).add((int(season), int(ep)))
+                    except (TypeError, ValueError):
+                        continue
+
+        tasks: List[dict] = []
+        # 电影任务
+        for tid, m in movies.items():
+            tasks.append({
+                "tmdb_id": tid,
+                "mtype": MediaType.MOVIE,
+                "name": m.get("name"),
+                "season": None,
+                "start_episode": None,
+            })
+
+        if not self._include_series:
+            if series_meta or episodes:
+                logger.info(f"【未看洗版】未开启『包含剧集』，跳过 {len(series_meta) or len(episodes)} 部剧集")
+            return tasks
+
+        # 剧集：按季 + 未观看集定位开始集数
+        handled = set()
+        if self._series_episode_level:
+            for sid, eps in episodes.items():
+                meta = series_meta.get(sid) or {}
+                tmdb_id = meta.get("tmdb_id")
+                if not tmdb_id:
+                    logger.debug(f"【未看洗版】剧集缺少 tmdbid，跳过：{meta.get('name') or sid}")
+                    continue
+                handled.add(sid)
+                by_season: Dict[int, List[int]] = {}
+                for season, ep in eps:
+                    by_season.setdefault(season, []).append(ep)
+                for season in sorted(by_season.keys()):
+                    eps_list = sorted(by_season[season])
+                    tasks.append({
+                        "tmdb_id": tmdb_id,
+                        "mtype": MediaType.TV,
+                        "name": meta.get("name"),
+                        "season": season,
+                        "start_episode": eps_list[0],
+                        "unplayed": eps_list,
+                    })
+                    logger.info(f"【未看洗版】剧集任务：{meta.get('name')} 第{season}季 未观看 {len(eps_list)} 集"
+                                f"（{eps_list[0]}~{eps_list[-1]}）→ 开始集数={eps_list[0]}")
+
+        # 未拿到集明细的剧集 / 关闭集粒度 → 整剧洗版
+        for sid, meta in series_meta.items():
+            if sid in handled:
+                continue
+            if not meta.get("tmdb_id"):
+                continue
+            tasks.append({
+                "tmdb_id": meta["tmdb_id"],
+                "mtype": MediaType.TV,
+                "name": meta.get("name"),
+                "season": None,
+                "start_episode": None,
+            })
+        return tasks
+
+    def _wash_one(self, mediainfo: MediaInfo, caches: List[str], history: List[dict],
+                  season: Optional[int] = None, start_episode: Optional[int] = None,
+                  cache_key: str = None) -> str:
         """
         对单个媒体创建洗版订阅，并写入缓存与历史。
+        season/start_episode 用于剧集按季、按未观看集定位开始集数。
         返回：added（已添加）/ skipped（被类型开关跳过）/ failed（创建失败）
         """
         # 前置校验：剧集开关
@@ -692,6 +874,13 @@ class EmbyUnwatchedWash(_PluginBase):
             return "skipped"
 
         tid_num = self._tmdb_of(mediainfo)
+
+        # 剧集按季/集的参数（会随订阅一起保存：season 为显式参数，start_episode 经 kwargs 落到订阅字段）
+        extra = {}
+        if season is not None:
+            extra["season"] = season
+        if start_episode is not None:
+            extra["start_episode"] = start_episode
 
         # 创建洗版（best_version=True）订阅，兼容 v3（media_source/media_id）与 v2（tmdbid）
         try:
@@ -710,6 +899,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     exist_ok=True,
                     media_source=MediaSource.TMDB,
                     media_id=str(tid_num),
+                    **extra,
                 )
             else:
                 sid, msg = self.subscribechain.add(
@@ -720,6 +910,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     best_version=True,
                     username="未看洗版",
                     exist_ok=True,
+                    **extra,
                 )
         except Exception as e:
             logger.error(f"【未看洗版】创建洗版订阅异常：{mediainfo.title} - {e}\n{traceback.format_exc()}")
@@ -730,14 +921,21 @@ class EmbyUnwatchedWash(_PluginBase):
             return "failed"
 
         # 订阅创建成功
-        logger.info(f"【未看洗版】已创建洗版订阅：{mediainfo.title} ({mediainfo.year}) [{mediainfo.type.value}]")
+        _extra_log = ""
+        if season is not None:
+            _extra_log += f" 第{season}季"
+        if start_episode is not None:
+            _extra_log += f" 开始集数={start_episode}"
+        logger.info(f"【未看洗版】已创建洗版订阅：{mediainfo.title} ({mediainfo.year}) "
+                    f"[{mediainfo.type.value}]{_extra_log}")
 
-        # 加入缓存（按 tmdbid 去重，避免同名影视误判）
+        # 加入缓存（电影按 tmdbid；剧集按 tmdbid+季，避免同一季重复订阅）
         tid = str(tid_num) if tid_num else str(mediainfo.tmdb_id)
-        if tid not in caches:
-            caches.append(tid)
+        key = cache_key or tid
+        if key not in caches:
+            caches.append(key)
         # 存储历史记录
-        if tid_num not in [h.get("tmdbid") for h in history]:
+        if key not in [h.get("key") for h in history]:
             history.append({
                 "title": mediainfo.title,
                 "type": mediainfo.type.value,
@@ -745,6 +943,9 @@ class EmbyUnwatchedWash(_PluginBase):
                 "poster": mediainfo.get_poster_image(),
                 "overview": mediainfo.overview,
                 "tmdbid": tid_num,
+                "season": season,
+                "start_episode": start_episode,
+                "key": key,
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
         return "added"

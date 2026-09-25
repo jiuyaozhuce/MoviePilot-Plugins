@@ -64,7 +64,9 @@ MoviePilot-Plugins/
 - **发送通知 / Notify**：开 → 每次扫描完成后推送汇总通知（成功 N / 失败 M）
 - **立即运行一次 / Run once**：开 → 保存配置后延迟 3 秒执行一次（这是 MoviePilot 官方标准的一次性触发方式，与「豆瓣想看」等官方插件一致；也可发送远程命令 `/emby_wash` 触发）
 - **包含剧集 / Include series**：开 → 对 `Series`（电视剧）也创建洗版订阅；关 → 仅电影
-- **指定洗版影视 / Selected items**：从媒体库未观看列表中**手动多选**。留空 = 对全部未观看影视洗版；勾选 = 只洗版勾选的影视（无需媒体服务器在线，只要 tmdbid 可识别即可）
+- **剧集按未观看集洗版 / Episode level**（默认开）：剧集**不再整部洗版**——按季建订阅，并把订阅的「开始集数」设为**该季第一个未观看的集**，已看过的集不会被洗版；关 → 退回整部剧洗版
+- **单次最多处理数量 / Limit**：0 = 不限。**强烈建议大库先设 5~20 试跑**（你的库有上千部未观看，一次全量会瞬间创建上千订阅）
+- **指定洗版影视 / Selected items**：从媒体库未观看列表中**手动多选**。留空 = 对全部未观看影视洗版；勾选 = 只洗版勾选的影视（剧集同样会按未观看集定位，需媒体服务器在线；否则按整部洗版）
 - **执行周期 / Cron**：5 位 cron（如 `0 4 * * *`）；留空则每 30 分钟扫描一次
 
 ## 触发方式 / How to trigger
@@ -82,8 +84,13 @@ MoviePilot-Plugins/
 2. 若未选择，则通过 `MediaServerHelper().get_services()` 获取**已配置且已连接**的 Emby/Jellyfin 客户端实例
    （MoviePilot v3 走 `app.sdk.services`，v2 走 `app.helper.mediaserver`），对每台服务器调用
    `emby_get_items()` / `jellyfin_get_items()`，用 `Users/{user}/Items?Filters=IsUnplayed&Recursive=true` **分页拉全**未观看条目。
-3. 按 tmdbid 去重（缓存键为 tmdbid，避免同名影视误判）→ 直接从列表条目的 `ProviderIds.Tmdb` 取 tmdbid（不再逐条查详情）→ `recognize_media()` 识别。
-4. `subscribechain.add(..., best_version=True, exist_ok=True)` 创建洗版订阅（**已存在则跳过**）。
+3. 条目按类型归组生成洗版任务：
+   - `Movie` → 整部洗版（电影未看即整部未看）
+   - `Series` + `Episode` → **按季**拆任务，取该季未观看集的最小集号作为 `start_episode`（订阅的「开始集数」），
+     MoviePilot 从该集开始搜索/下载，**已观看的集不会被洗版**；若拿不到集明细（或关闭该开关）则整剧洗版
+   - 电影按 tmdbid 去重、剧集按 `tmdbid+季` 去重（缓存键，避免同一季重复订阅）
+4. 直接从列表条目的 `ProviderIds.Tmdb` 取 tmdbid（不再逐条查详情）→ `recognize_media()` 识别 →
+   `subscribechain.add(..., season=季, start_episode=开始集数, best_version=True, exist_ok=True)` 创建洗版订阅（**已存在则跳过**）。
 5. 写入缓存与历史；若 `发送通知` 开启，推送汇总（含失败数与失败原因提示）。
 
 ## 日志说明 / Logging
