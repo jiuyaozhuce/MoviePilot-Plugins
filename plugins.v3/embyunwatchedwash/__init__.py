@@ -40,7 +40,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.13"
+    plugin_version = "1.14"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -471,15 +471,18 @@ class EmbyUnwatchedWash(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSelect',
                                         'props': {
                                             'model': 'exclude_libraries',
-                                            'label': '排除媒体库（每行一个库名）',
-                                            'placeholder': '例：Kids\nAdult\nChildren',
-                                            'hint': '按完整库名排除，如「Kids」「Children」这类库将完全跳过',
+                                            'label': '排除媒体库',
+                                            'items': self._get_library_list_options(),
+                                            'multiple': True,
+                                            'chips': True,
+                                            'clearable': True,
+                                            'filterable': True,
+                                            'hideSelected': True,
                                             'persistent-hint': True,
-                                            'rows': 3,
-                                            'multiline': True
+                                            'hint': '勾选后该媒体库的所有未观看内容将被跳过',
                                         }
                                     }
                                 ]
@@ -1092,21 +1095,53 @@ class EmbyUnwatchedWash(_PluginBase):
 
     def _get_library_list_options(self) -> List[dict]:
         """
-        获取媒体服务器库列表，供排除媒体库 VSelect 使用。
-        从 _get_library_options() 已提取的库名缓存中获取，无需额外 API 调用。
-        如果缓存为空，返回空列表（用户可手动输入）。
+        获取媒体服务器库列表，供排除媒体库选择使用。
+        通过 Emby/Jellyfin 的 VirtualFolders API 获取库名列表。
         返回格式：[{"title": "电影", "value": "电影"}, ...]
         """
         import time as _time
         now = _time.time()
-        # 如果缓存过期，先触发一次 _get_library_options 来填充库名缓存
-        if not self._library_names_cache or (now - self._library_names_cache_time) >= self._options_cache_ttl:
-            self._get_library_options()
-        # 从缓存返回
-        if self._library_names_cache:
+        # TTL 缓存 5 分钟
+        if self._library_names_cache and (now - self._library_names_cache_time) < 300:
             return [{'title': name, 'value': name} for name in self._library_names_cache]
-        # 缓存为空时返回提示
-        return [{'title': '（请先在配置页点击「指定洗版影视」以加载库列表）', 'value': '__hint__'}]
+        library_names = []
+        try:
+            for stype, name, inst in self._get_server_instances():
+                try:
+                    if stype == 'emby':
+                        # Emby: /emby/Library/VirtualFolders?api_key=...
+                        resp = inst.get_data("[HOST]emby/Library/VirtualFolders?api_key=[APIKEY]")
+                        if resp and resp.status_code == 200:
+                            try:
+                                data = resp.json()
+                                if isinstance(data, list):
+                                    for lib in data:
+                                        lib_name = lib.get('Name')
+                                        if lib_name and lib_name not in library_names:
+                                            library_names.append(lib_name)
+                            except Exception:
+                                pass
+                    else:
+                        # Jellyfin: /jellyfin/Libraries?api_key=...
+                        resp = inst.get_data("[HOST]jellyfin/Libraries?api_key=[APIKEY]")
+                        if resp and resp.status_code == 200:
+                            try:
+                                data = resp.json()
+                                if isinstance(data, list):
+                                    for lib in data:
+                                        lib_name = lib.get('Name')
+                                        if lib_name and lib_name not in library_names:
+                                            library_names.append(lib_name)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug(f"【未看洗版】读取 {name}({stype}) 库列表失败：{e}")
+        except Exception as e:
+            logger.error(f"【未看洗版】获取媒体库列表失败：{e}")
+        # 写缓存
+        self._library_names_cache = sorted(library_names)
+        self._library_names_cache_time = now
+        return [{'title': name, 'value': name} for name in self._library_names_cache]
 
     @staticmethod
     def _normalize_str_list(value) -> List[str]:
