@@ -28,7 +28,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -83,6 +83,7 @@ class EmbyUnwatchedWash(_PluginBase):
             self._scheduler.add_job(self.sync, 'date',
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                     name="立即运行未看洗版")
+            logger.info("【未看洗版】已设置『立即运行一次』任务，约 3 秒后执行")
             # 启动任务
             if self._scheduler.get_jobs():
                 self._scheduler.print_jobs()
@@ -525,8 +526,10 @@ class EmbyUnwatchedWash(_PluginBase):
         # 获取锁
         _is_lock: bool = lock.acquire(timeout=60)
         if not _is_lock:
+            logger.warning("【未看洗版】获取任务锁超时，已有实例在运行，本次跳过")
             return
         try:
+            logger.info("【未看洗版】========== 开始扫描任务 ==========")
             # 读取缓存
             caches = self._cache_path.read_text().split("\n") if self._cache_path.exists() else []
             caches = [c for c in caches if c]
@@ -537,14 +540,16 @@ class EmbyUnwatchedWash(_PluginBase):
             selected = [str(x) for x in (self._selected_items or [])]
 
             if selected:
-                logger.info(f"EmbyUnwatchedWash 手动选择模式，待处理 {len(selected)} 个")
+                logger.info(f"【未看洗版】运行模式：手动选择（指定 {len(selected)} 个 tmdbid 洗版）")
                 for tid in selected:
                     if tid in caches:
+                        logger.debug(f"【未看洗版】手动模式：tmdbid={tid} 已在缓存，跳过")
                         continue
                     # 指定 tmdbid 直接识别，无需媒体服务器
+                    logger.info(f"【未看洗版】手动模式：正在处理 tmdbid={tid}")
                     mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=int(tid))
                     if not mediainfo:
-                        logger.warn(f'未识别到媒体信息，tmdbid：{tid}')
+                        logger.warning(f"【未看洗版】手动模式：tmdbid={tid} 识别失败")
                         failed_count += 1
                         continue
                     status = self._wash_one(mediainfo, caches, history)
@@ -555,9 +560,11 @@ class EmbyUnwatchedWash(_PluginBase):
                     elif status == "skipped":
                         skipped_count += 1
             else:
+                logger.info(f"【未看洗版】运行模式：全量扫描 | 包含剧集={self._include_series} | "
+                            f"媒体服务器={settings.MEDIASERVER or '未配置'}")
                 # 全量模式：扫描媒体库未观看影视
                 if not settings.MEDIASERVER:
-                    logger.warn("EmbyUnwatchedWash 未配置媒体服务器 settings.MEDIASERVER")
+                    logger.warning("【未看洗版】未配置媒体服务器 settings.MEDIASERVER，无法全量扫描")
                     return
                 media_servers = settings.MEDIASERVER.split(',')
 
@@ -565,11 +572,15 @@ class EmbyUnwatchedWash(_PluginBase):
                 all_items = {}
                 for media_server in media_servers:
                     if media_server == 'jellyfin':
-                        all_items['jellyfin'] = self.jellyfin_get_items()
+                        items = self.jellyfin_get_items()
+                        logger.info(f"【未看洗版】Jellyfin 获取到 {len(items)} 条未观看条目")
+                        all_items['jellyfin'] = items
                     elif media_server == 'emby':
-                        all_items['emby'] = self.emby_get_items()
+                        items = self.emby_get_items()
+                        logger.info(f"【未看洗版】Emby 获取到 {len(items)} 条未观看条目")
+                        all_items['emby'] = items
                     else:
-                        logger.info(f"EmbyUnwatchedWash 暂不支持的媒体服务器：{media_server}")
+                        logger.warning(f"【未看洗版】暂不支持的媒体服务器类型：{media_server}")
 
                 def function(y, x):
                     return y if (x['Name'] in [i['Name'] for i in y]) else (lambda z, u: (z.append(u), z))(y, x)[1]
@@ -578,36 +589,43 @@ class EmbyUnwatchedWash(_PluginBase):
                 for server, all_item in all_items.items():
                     # all_item 根据影视名去重
                     result = reduce(function, all_item, [])
+                    logger.info(f"【未看洗版】{server} 去重后待处理 {len(result)} 部影视")
                     for data in result:
-                        # 获取详情
-                        if server == 'jellyfin':
-                            item_info_resp = Jellyfin().get_iteminfo(itemid=data.get('Id'))
-                        else:
-                            item_info_resp = Emby().get_iteminfo(itemid=data.get('Id'))
-                        logger.debug(f'EmbyUnwatchedWash插件 item打印 {item_info_resp}')
-                        if not item_info_resp:
-                            continue
-
+                        name = data.get("Name")
+                        _type = data.get("Type")
                         # 仅接受 Movie / Series（剧集按配置）
-                        _type = data.get('Type')
                         if _type == 'Movie':
                             mtype = MediaType.MOVIE
                         elif _type == 'Series' and self._include_series:
                             mtype = MediaType.TV
                         else:
+                            logger.debug(f"【未看洗版】跳过（类型不匹配/未开启剧集）：{name} type={_type}")
+                            continue
+
+                        # 获取详情
+                        if server == 'jellyfin':
+                            item_info_resp = Jellyfin().get_iteminfo(itemid=data.get('Id'))
+                        else:
+                            item_info_resp = Emby().get_iteminfo(itemid=data.get('Id'))
+                        if not item_info_resp:
+                            logger.warning(f"【未看洗版】获取详情失败，跳过：{name}")
                             continue
 
                         # 获取tmdb_id
                         tmdb_id = self._tmdbid_of(item_info_resp)
                         if not tmdb_id:
+                            logger.debug(f"【未看洗版】无 tmdbid，跳过：{name}")
                             continue
                         # 已处理过的条目（按 tmdbid 去重）跳过
                         if str(tmdb_id) in caches:
+                            logger.debug(f"【未看洗版】已在缓存中，跳过：{name} (tmdbid={tmdb_id})")
                             continue
                         # 识别媒体信息
+                        logger.info(f"【未看洗版】正在处理：{name} (tmdbid={tmdb_id})")
                         mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=tmdb_id, mtype=mtype)
                         if not mediainfo:
-                            logger.warn(f'未识别到媒体信息，标题：{data.get("Name")}，tmdbid：{tmdb_id}')
+                            logger.warning(f"【未看洗版】媒体识别失败，跳过：{name} (tmdbid={tmdb_id})")
+                            failed_count += 1
                             continue
                         status = self._wash_one(mediainfo, caches, history)
                         if status == "added":
@@ -617,6 +635,10 @@ class EmbyUnwatchedWash(_PluginBase):
                         elif status == "skipped":
                             skipped_count += 1
 
+            # 任务完成汇总
+            logger.info(f"【未看洗版】========== 扫描完成 ========== | "
+                        f"新建订阅 {washed_count} 个 | 失败 {failed_count} 个 | "
+                        f"跳过（已处理/剧集未开）{skipped_count} 个")
             # 保存历史记录
             self.save_data('history', history)
             # 保存缓存
@@ -659,8 +681,11 @@ class EmbyUnwatchedWash(_PluginBase):
         )
         if sid is None:
             # 订阅创建失败：通常是系统未开启『允许洗版』、缺少下载器/订阅配置或识别失败
-            logger.warn(f"EmbyUnwatchedWash 创建洗版订阅失败：{mediainfo.title} - {msg}")
+            logger.warning(f"【未看洗版】创建洗版订阅失败：{mediainfo.title} ({mediainfo.year}) - {msg}")
             return "failed"
+
+        # 订阅创建成功
+        logger.info(f"【未看洗版】已创建洗版订阅：{mediainfo.title} ({mediainfo.year}) [{mediainfo.type.value}]")
 
         # 加入缓存（按 tmdbid 去重，避免同名影视误判）
         tid = str(mediainfo.tmdb_id)
