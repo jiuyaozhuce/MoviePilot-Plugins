@@ -64,6 +64,9 @@ class EmbyUnwatchedWash(_PluginBase):
     _options_cache: List[dict] = []
     _options_cache_time: float = 0.0
     _options_cache_ttl: int = 60
+    # 媒体库名称缓存（用于排除媒体库 VSelect）
+    _library_names_cache: List[str] = []
+    _library_names_cache_time: float = 0.0
 
     # 配置属性
     _enabled: bool = False
@@ -468,18 +471,15 @@ class EmbyUnwatchedWash(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VSelect',
+                                        'component': 'VTextField',
                                         'props': {
                                             'model': 'exclude_libraries',
-                                            'label': '排除媒体库',
-                                            'items': self._get_library_list_options(),
-                                            'multiple': True,
-                                            'chips': True,
-                                            'clearable': True,
-                                            'filterable': True,
-                                            'hideSelected': True,
+                                            'label': '排除媒体库（每行一个库名）',
+                                            'placeholder': '例：Kids\nAdult\nChildren',
+                                            'hint': '按完整库名排除，如「Kids」「Children」这类库将完全跳过',
                                             'persistent-hint': True,
-                                            'hint': '勾选后该媒体库的所有未观看内容将被跳过',
+                                            'rows': 3,
+                                            'multiline': True
                                         }
                                     }
                                 ]
@@ -1073,28 +1073,20 @@ class EmbyUnwatchedWash(_PluginBase):
     def _get_library_list_options(self) -> List[dict]:
         """
         获取媒体服务器库列表，供排除媒体库 VSelect 使用。
-        返回格式：[{"title": "电影 (Emby)", "value": "电影"}, ...]
+        从 _get_library_options() 已提取的库名缓存中获取，无需额外 API 调用。
+        如果缓存为空，返回空列表（用户可手动输入）。
+        返回格式：[{"title": "电影", "value": "电影"}, ...]
         """
-        options = []
-        try:
-            for stype, name, inst in self._get_server_instances():
-                try:
-                    if stype == 'jellyfin':
-                        libs = inst.get_librarys() or []
-                    else:
-                        libs = inst.get_librarys() or []
-                    for lib in libs:
-                        lib_name = lib.get('Name') or ''
-                        if lib_name:
-                            options.append({
-                                'title': f"{lib_name} ({name})",
-                                'value': lib_name,
-                            })
-                except Exception as e:
-                    logger.debug(f"【未看洗版】读取 {name}({stype}) 库列表失败：{e}")
-        except Exception as e:
-            logger.error(f"【未看洗版】获取媒体库列表失败：{e}")
-        return options
+        import time as _time
+        now = _time.time()
+        # 如果缓存过期，先触发一次 _get_library_options 来填充库名缓存
+        if not self._library_names_cache or (now - self._library_names_cache_time) >= self._options_cache_ttl:
+            self._get_library_options()
+        # 从缓存返回
+        if self._library_names_cache:
+            return [{'title': name, 'value': name} for name in self._library_names_cache]
+        # 缓存为空时返回提示
+        return [{'title': '（请先在配置页点击「指定洗版影视」以加载库列表）', 'value': '__hint__'}]
 
     @staticmethod
     def _normalize_str_list(value) -> List[str]:
@@ -1466,30 +1458,32 @@ class EmbyUnwatchedWash(_PluginBase):
         构建媒体库未观看影视的可选项（标题 + tmdbid），用于设置页手动选择与 /medias API。
         通过 Items 的 ProviderIds 直接取 Tmdb，避免逐条 get_iteminfo。
         结果带 TTL 缓存（默认 60 秒）：配置页与详情页都会调用，避免每次全量分页扫描。
+        同时提取并缓存媒体库名称，供排除媒体库 VSelect 使用。
         """
         import time as _time
         now = _time.time()
         if self._options_cache and (now - self._options_cache_time) < self._options_cache_ttl:
             return self._options_cache
         options = []
+        library_names = set()
         try:
             servers = self._get_server_instances()
             if not servers:
                 return options
             seen = set()
             cap = 500
-            for stype, name, inst in servers:
+            for stype, srv_name, inst in servers:
                 try:
                     if stype == 'jellyfin':
                         items = self.jellyfin_get_items(inst)
                     else:
                         items = self.emby_get_items(inst)
                 except Exception as e:
-                    logger.error(f"【未看洗版】读取 {name}({stype}) 未观看列表失败：{e}")
+                    logger.error(f"【未看洗版】读取 {srv_name}({stype}) 未观看列表失败：{e}")
                     continue
                 for it in items:
-                    name = it.get('Name')
-                    if not name or name in seen:
+                    item_name = it.get('Name')
+                    if not item_name or item_name in seen:
                         continue
                     t = it.get('Type')
                     if t not in ('Movie', 'Series'):
@@ -1502,10 +1496,14 @@ class EmbyUnwatchedWash(_PluginBase):
                     year = it.get('ProductionYear') or ''
                     typelabel = '电影' if t == 'Movie' else '剧集'
                     options.append({
-                        'title': f"{name} ({year}) [{typelabel}]",
+                        'title': f"{item_name} ({year}) [{typelabel}]",
                         'value': int(pid),
                     })
-                    seen.add(name)
+                    seen.add(item_name)
+                    # 提取库名（来自 LibraryName 字段）
+                    lib_name = (it.get('LibraryName') or '').strip()
+                    if lib_name:
+                        library_names.add(lib_name)
                     if len(options) >= cap:
                         logger.info(f"EmbyUnwatchedWash 媒体库选项已截断至 {cap} 条")
                         break
@@ -1514,6 +1512,9 @@ class EmbyUnwatchedWash(_PluginBase):
         # 写缓存（即使为空也写，避免持续打爆媒体服务器）
         self._options_cache = options
         self._options_cache_time = now
+        # 写库名缓存
+        self._library_names_cache = sorted(library_names)
+        self._library_names_cache_time = now
         return options
 
     @staticmethod
