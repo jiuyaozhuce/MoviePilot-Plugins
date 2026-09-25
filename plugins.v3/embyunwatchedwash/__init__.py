@@ -834,16 +834,19 @@ class EmbyUnwatchedWash(_PluginBase):
                     by_season.setdefault(season, []).append(ep)
                 for season in sorted(by_season.keys()):
                     eps_list = sorted(by_season[season])
+                    # 第 0 集通常是特番/特别篇，不作为开始集数
+                    positive = [e for e in eps_list if e > 0]
+                    start_ep = positive[0] if positive else 1
                     tasks.append({
                         "tmdb_id": tmdb_id,
                         "mtype": MediaType.TV,
                         "name": meta.get("name"),
                         "season": season,
-                        "start_episode": eps_list[0],
+                        "start_episode": start_ep,
                         "unplayed": eps_list,
                     })
                     logger.info(f"【未看洗版】剧集任务：{meta.get('name')} 第{season}季 未观看 {len(eps_list)} 集"
-                                f"（{eps_list[0]}~{eps_list[-1]}）→ 开始集数={eps_list[0]}")
+                                f"（{eps_list[0]}~{eps_list[-1]}）→ 开始集数={start_ep}")
 
         # 未拿到集明细的剧集 / 关闭集粒度 → 整剧洗版
         for sid, meta in series_meta.items():
