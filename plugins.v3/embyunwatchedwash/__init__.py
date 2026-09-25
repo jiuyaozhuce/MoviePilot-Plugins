@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.19"
+    plugin_version = "1.20"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -327,7 +327,7 @@ class EmbyUnwatchedWash(_PluginBase):
         for opt in self._sorted_options():
             try:
                 if int(opt.get('value')) == int(tid):
-                    return str(opt.get('title') or '')
+                    return self._clean_title(opt.get('title'))
             except (TypeError, ValueError):
                 continue
         return ''
@@ -378,8 +378,9 @@ class EmbyUnwatchedWash(_PluginBase):
 
     def select_page(self, page: int = 1) -> dict:
         """API 端点：记住未观看清单页码（GET），供详情页上一页/下一页使用。"""
-        self._save_page(page)
-        return {"success": True, "message": f"已切换到第 {page} 页"}
+        _, page_no, _, _ = self._page_info(self._sorted_options(), page)
+        self._save_page(page_no)
+        return {"success": True, "message": f"已切换到第 {page_no} 页"}
 
     def select_bulk(self, mode: str = "page_all", page: int = 1) -> dict:
         """
@@ -710,13 +711,25 @@ class EmbyUnwatchedWash(_PluginBase):
         return {'component': 'VCard', 'content': card_content}
 
     @staticmethod
-    def _split_title(raw: str) -> Tuple[str, str]:
+    def _clean_title(raw: str) -> str:
+        """整理标题：媒体项缺年份时会出现「名称 () [剧集]」，统一收成「名称 [剧集]」。"""
+        text = str(raw or '').strip()
+        text = text.replace(' () [', ' [').replace('() [', ' [')
+        if text.endswith(' ()'):
+            text = text[:-3]
+        return text.strip()
+
+    @classmethod
+    def _split_title(cls, raw: str) -> Tuple[str, str]:
         """把「名称 (年份) [电影/剧集]」拆成（显示名, 类型标签）。"""
-        text = str(raw or '')
-        for suffix, label in ((' [电影]', '电影'), (' [剧集]', '剧集')):
+        text = cls._clean_title(raw)
+        label = ''
+        for suffix, name in ((' [电影]', '电影'), (' [剧集]', '剧集')):
             if text.endswith(suffix):
-                return text[:-len(suffix)], label
-        return text, ''
+                text = text[:-len(suffix)]
+                label = name
+                break
+        return text.strip(), label
 
     def _page_info(self, options: List[dict], page: int) -> Tuple[List[dict], int, int, int]:
         """按固定每页条数切片，返回（本页条目, 实际页码, 总页数, 总条数）。"""
