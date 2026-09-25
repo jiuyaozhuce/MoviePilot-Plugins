@@ -1,3 +1,5 @@
+import time
+import traceback
 from datetime import datetime, timedelta
 from functools import reduce
 from pathlib import Path
@@ -34,7 +36,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -553,7 +555,14 @@ class EmbyUnwatchedWash(_PluginBase):
                         continue
                     # 指定 tmdbid 直接识别，无需媒体服务器
                     logger.info(f"【未看洗版】手动模式：正在处理 tmdbid={tid}")
-                    mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=int(tid))
+                    try:
+                        _t0 = time.time()
+                        mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=int(tid))
+                        logger.info(f"【未看洗版】手动模式：tmdbid={tid} 识别耗时 {time.time() - _t0:.1f}s")
+                    except Exception as e:
+                        logger.error(f"【未看洗版】手动模式：tmdbid={tid} 识别异常：{e}\n{traceback.format_exc()}")
+                        failed_count += 1
+                        continue
                     if not mediainfo:
                         logger.warning(f"【未看洗版】手动模式：tmdbid={tid} 识别失败")
                         failed_count += 1
@@ -620,7 +629,14 @@ class EmbyUnwatchedWash(_PluginBase):
                             continue
                         # 识别媒体信息
                         logger.info(f"【未看洗版】正在处理：{name} (tmdbid={tmdb_id})")
-                        mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=tmdb_id, mtype=mtype)
+                        try:
+                            _t0 = time.time()
+                            mediainfo: MediaInfo = self.chain.recognize_media(tmdbid=tmdb_id, mtype=mtype)
+                            logger.info(f"【未看洗版】{name} 识别耗时 {time.time() - _t0:.1f}s")
+                        except Exception as e:
+                            logger.error(f"【未看洗版】识别异常：{name} (tmdbid={tmdb_id})：{e}\n{traceback.format_exc()}")
+                            failed_count += 1
+                            continue
                         if not mediainfo:
                             logger.warning(f"【未看洗版】媒体识别失败，跳过：{name} (tmdbid={tmdb_id})")
                             failed_count += 1
@@ -654,6 +670,9 @@ class EmbyUnwatchedWash(_PluginBase):
                         text=f"成功 {washed_count} 个，失败 {failed_count} 个（跳过 {skipped_count} 个）。"
                               f"失败通常因系统未开启『允许洗版』、缺少下载器/订阅配置或媒体识别失败，请检查 MoviePilot 订阅设置与日志。"
                     )
+        except Exception as e:
+            # 兜底：任何未捕获异常都要打出来，否则任务会像“卡住”一样静默结束（无任何完成日志）
+            logger.error(f"【未看洗版】扫描过程发生未捕获异常：{e}\n{traceback.format_exc()}")
         finally:
             lock.release()
 
@@ -668,15 +687,19 @@ class EmbyUnwatchedWash(_PluginBase):
             return "skipped"
 
         # 前置校验：创建洗版（best_version=True）订阅
-        sid, msg = self.subscribechain.add(
-            mtype=mediainfo.type,
-            title=mediainfo.title,
-            year=mediainfo.year,
-            tmdbid=mediainfo.tmdb_id,
-            best_version=True,
-            username="未看洗版",
-            exist_ok=True,
-        )
+        try:
+            sid, msg = self.subscribechain.add(
+                mtype=mediainfo.type,
+                title=mediainfo.title,
+                year=mediainfo.year,
+                tmdbid=mediainfo.tmdb_id,
+                best_version=True,
+                username="未看洗版",
+                exist_ok=True,
+            )
+        except Exception as e:
+            logger.error(f"【未看洗版】创建洗版订阅异常：{mediainfo.title} - {e}\n{traceback.format_exc()}")
+            return "failed"
         if sid is None:
             # 订阅创建失败：通常是系统未开启『允许洗版』、缺少下载器/订阅配置或识别失败
             logger.warning(f"【未看洗版】创建洗版订阅失败：{mediainfo.title} ({mediainfo.year}) - {msg}")
