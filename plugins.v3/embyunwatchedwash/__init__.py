@@ -16,6 +16,12 @@ from app.core.event import eventmanager
 from app.log import logger
 from app.modules.emby import Emby
 from app.modules.jellyfin import Jellyfin
+try:
+    # MoviePilot v3
+    from app.sdk.services import MediaServerHelper
+except ImportError:
+    # MoviePilot v2
+    from app.helper.mediaserver import MediaServerHelper
 from app.plugins import _PluginBase
 from app.schemas.types import MediaType, EventType
 
@@ -28,7 +34,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -560,30 +566,27 @@ class EmbyUnwatchedWash(_PluginBase):
                     elif status == "skipped":
                         skipped_count += 1
             else:
-                servers = self._media_server_types()
+                servers = self._get_server_instances()
                 logger.info(f"【未看洗版】运行模式：全量扫描 | 包含剧集={self._include_series} | "
-                            f"媒体服务器={','.join(servers) or '未配置'}")
+                            f"媒体服务器={','.join(n for _, n, _ in servers) or '未检测到已配置服务器'}")
                 # 全量模式：扫描媒体库未观看影视
                 if not servers:
-                    logger.warning("【未看洗版】未检测到已配置的媒体服务器，无法全量扫描")
+                    logger.warning("【未看洗版】未检测到已配置/已连接的媒体服务器，无法全量扫描。"
+                                   "请在 MoviePilot『设置 → 媒体 → 媒体服务器』中添加服务器并确保连接正常")
                     return
 
-                # 读取未观看条目（已分页拉全）
+                # 读取未观看条目（已分页拉全），按类型聚合
                 all_items = {}
-                for media_server in servers:
+                for stype, name, inst in servers:
                     try:
-                        if media_server == 'jellyfin':
-                            items = self.jellyfin_get_items()
-                            logger.info(f"【未看洗版】Jellyfin 获取到 {len(items)} 条未观看条目")
-                            all_items['jellyfin'] = items
-                        elif media_server == 'emby':
-                            items = self.emby_get_items()
-                            logger.info(f"【未看洗版】Emby 获取到 {len(items)} 条未观看条目")
-                            all_items['emby'] = items
+                        if stype == 'jellyfin':
+                            items = self.jellyfin_get_items(inst)
                         else:
-                            logger.warning(f"【未看洗版】暂不支持的媒体服务器类型：{media_server}")
+                            items = self.emby_get_items(inst)
+                        logger.info(f"【未看洗版】{name}({stype}) 获取到 {len(items)} 条未观看条目")
+                        all_items.setdefault(stype, []).extend(items)
                     except Exception as e:
-                        logger.error(f"【未看洗版】读取媒体服务器 {media_server} 未观看列表失败：{e}")
+                        logger.error(f"【未看洗版】读取媒体服务器 {name}({stype}) 未观看列表失败：{e}")
 
                 def function(y, x):
                     return y if (x['Name'] in [i['Name'] for i in y]) else (lambda z, u: (z.append(u), z))(y, x)[1]
@@ -605,19 +608,11 @@ class EmbyUnwatchedWash(_PluginBase):
                             logger.debug(f"【未看洗版】跳过（类型不匹配/未开启剧集）：{name} type={_type}")
                             continue
 
-                        # 获取详情
-                        if server == 'jellyfin':
-                            item_info_resp = Jellyfin().get_iteminfo(itemid=data.get('Id'))
-                        else:
-                            item_info_resp = Emby().get_iteminfo(itemid=data.get('Id'))
-                        if not item_info_resp:
-                            logger.warning(f"【未看洗版】获取详情失败，跳过：{name}")
-                            continue
-
-                        # 获取tmdb_id
-                        tmdb_id = self._tmdbid_of(item_info_resp)
+                        # 直接从列表条目的 ProviderIds 取 tmdbid（列表请求已含该字段，无需再查详情，
+                        # 也规避 v3 中 get_iteminfo 返回的新 schema 与 v2 字段差异）
+                        tmdb_id = self._tmdbid_of_item(data)
                         if not tmdb_id:
-                            logger.debug(f"【未看洗版】无 tmdbid，跳过：{name}")
+                            logger.debug(f"【未看洗版】无 tmdbid（ProviderIds 缺失），跳过：{name}")
                             continue
                         # 已处理过的条目（按 tmdbid 去重）跳过
                         if str(tmdb_id) in caches:
@@ -707,11 +702,12 @@ class EmbyUnwatchedWash(_PluginBase):
             })
         return "added"
 
-    def jellyfin_get_items(self) -> List[dict]:
+    def jellyfin_get_items(self, instance=None) -> List[dict]:
         try:
+            client = instance or Jellyfin()
             # 获取所有user
             users_url = "[HOST]Users?&apikey=[APIKEY]"
-            users = self.get_users(Jellyfin().get_data(users_url))
+            users = self.get_users(client.get_data(users_url))
             if not users:
                 return []
             all_items = []
@@ -731,7 +727,7 @@ class EmbyUnwatchedWash(_PluginBase):
                            "&EnableTotalRecordCount=true"
                            f"&Limit={limit}&StartIndex={start}"
                            "&apikey=[APIKEY]")
-                    resp = self.get_items(Jellyfin().get_data(url))
+                    resp = self.get_items(client.get_data(url))
                     if not resp:
                         break
                     items = resp
@@ -745,11 +741,12 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.error(f"【未看洗版】读取 Jellyfin 未观看列表失败：{e}")
             return []
 
-    def emby_get_items(self) -> List[dict]:
+    def emby_get_items(self, instance=None) -> List[dict]:
         try:
+            client = instance or Emby()
             # 获取所有user
             get_users_url = "[HOST]Users?&api_key=[APIKEY]"
-            users = self.get_users(Emby().get_data(get_users_url))
+            users = self.get_users(client.get_data(get_users_url))
             if not users:
                 return []
             all_items = []
@@ -769,7 +766,7 @@ class EmbyUnwatchedWash(_PluginBase):
                            "&EnableTotalRecordCount=true"
                            f"&Limit={limit}&StartIndex={start}"
                            "&api_key=[APIKEY]")
-                    resp = self.get_items(Emby().get_data(url))
+                    resp = self.get_items(client.get_data(url))
                     if not resp:
                         break
                     items = resp
@@ -783,21 +780,34 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.error(f"【未看洗版】读取 Emby 未观看列表失败：{e}")
             return []
 
-    def _media_server_types(self) -> List[str]:
+    def _get_server_instances(self) -> List[Tuple[str, str, Any]]:
         """
-        返回需要扫描的媒体服务器类型列表，兼容不同 MoviePilot 版本：
-        - 旧版：读取环境变量 settings.MEDIASERVER（逗号分隔）
-        - 新版：媒体服务器改为数据库配置，settings 上可能已无 MEDIASERVER 属性，
-                此时直接尝试 emby / jellyfin（由模块自身判断是否可用）
-        全程使用 getattr 安全读取，绝不因属性不存在而抛 AttributeError。
+        通过 MediaServerHelper 获取已配置且已连接的媒体服务器客户端实例。
+        返回 [(类型, 名称, 客户端实例), ...]，实例自带 host/apikey（v3 中裸 Emby()/Jellyfin() 无连接信息），
+        可直接调用 get_data / get_iteminfo。兼容 v2（app.helper.mediaserver）与 v3（app.sdk.services）。
         """
-        raw = getattr(settings, "MEDIASERVER", "") or ""
-        if isinstance(raw, str) and raw.strip():
-            types = [t.strip().lower() for t in raw.split(",") if t.strip()]
-            if types:
-                return types
-        # 未配置环境变量（新版常见）→ 尝试两者
-        return ["emby", "jellyfin"]
+        result: List[Tuple[str, str, Any]] = []
+        try:
+            services = MediaServerHelper().get_services()
+        except Exception as e:
+            logger.error(f"【未看洗版】获取媒体服务器服务失败：{e}")
+            return result
+        for name, info in (services or {}).items():
+            try:
+                inst = getattr(info, "instance", None)
+                stype = (getattr(info, "type", "") or "").lower()
+                if not inst:
+                    continue
+                if stype not in ("emby", "jellyfin"):
+                    logger.info(f"【未看洗版】跳过暂不支持的媒体服务器：{name} ({stype})")
+                    continue
+                if hasattr(inst, "is_inactive") and inst.is_inactive():
+                    logger.warning(f"【未看洗版】媒体服务器 {name} 未连接，请检查其 Host/API Key 配置")
+                    continue
+                result.append((stype, name, inst))
+            except Exception as e:
+                logger.error(f"【未看洗版】处理媒体服务器 {name} 失败：{e}")
+        return result
 
     def _get_library_options(self) -> List[dict]:
         """
@@ -806,21 +816,19 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         options = []
         try:
-            servers = self._media_server_types()
+            servers = self._get_server_instances()
             if not servers:
                 return options
             seen = set()
             cap = 500
-            for server in servers:
+            for stype, name, inst in servers:
                 try:
-                    if server == 'jellyfin':
-                        items = self.jellyfin_get_items()
-                    elif server == 'emby':
-                        items = self.emby_get_items()
+                    if stype == 'jellyfin':
+                        items = self.jellyfin_get_items(inst)
                     else:
-                        continue
+                        items = self.emby_get_items(inst)
                 except Exception as e:
-                    logger.error(f"【未看洗版】读取 {server} 未观看列表失败：{e}")
+                    logger.error(f"【未看洗版】读取 {name}({stype}) 未观看列表失败：{e}")
                     continue
                 for it in items:
                     name = it.get('Name')
@@ -847,6 +855,21 @@ class EmbyUnwatchedWash(_PluginBase):
         except Exception as e:
             logger.error(f"EmbyUnwatchedWash 构建媒体库选项失败：{e}")
         return options
+
+    @staticmethod
+    def _tmdbid_of_item(data: dict) -> Optional[int]:
+        """
+        从列表条目的 ProviderIds 中取 tmdbid（列表请求已含 ProviderIds 字段，无需再查详情）。
+        """
+        if not isinstance(data, dict):
+            return None
+        pid = (data.get('ProviderIds') or data.get('Provider_Ids') or {}).get('Tmdb')
+        if not pid:
+            return None
+        try:
+            return int(str(pid).strip())
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _tmdbid_of(resp) -> Optional[int]:

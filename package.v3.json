@@ -3,7 +3,7 @@
     "name": "Emby未看洗版",
     "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
     "labels": "媒体库",
-    "version": "1.3",
+    "version": "1.4",
     "icon": "icon.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.4": "适配 MoviePilot v3：改用 MediaServerHelper 获取已配置的媒体服务器客户端实例（裸 Emby()/Jellyfin() 在 v3 无连接信息导致『配置不完整』）；tmdbid 直接取列表 ProviderIds，不再逐条查详情",
       "v1.3": "兼容新版 MoviePilot：媒体服务器不再硬读 settings.MEDIASERVER（会抛 AttributeError），改用 getattr 安全读取并回退尝试 emby/jellyfin；每个服务器拉取独立异常保护",
       "v1.2": "全面增强日志：任务开始/结束总览、每服务器未观看条数、每部影视处理进度、成功建订阅、最终汇总数字；统一使用 logger（写 moviepilot.log）",
       "v1.1": "新增手动指定洗版影视（媒体库未观看列表多选）；未选则默认全量洗版；分页拉全大库；订阅创建失败告警",

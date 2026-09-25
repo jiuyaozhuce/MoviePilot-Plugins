@@ -79,9 +79,10 @@ MoviePilot-Plugins/
 ## 工作原理 / How it works
 
 1. `sync()` 优先读取 `selected_items`（手动选择）。若非空，直接对每个 tmdbid 调用 `recognize_media` 后创建洗版订阅，**不依赖媒体服务器在线**。
-2. 若未选择，则读取 `settings.MEDIASERVER`，对每个 Emby/Jellyfin 调用 `emby_get_items()` /
-   `jellyfin_get_items()`，用 `Users/{user}/Items?Filters=IsUnplayed&Recursive=true` **分页拉全**未观看条目。
-3. 按 tmdbid 去重（缓存键为 tmdbid，避免同名影视误判）→ 跳过已处理的 → `get_iteminfo()` 取 tmdbid → `recognize_media()` 识别。
+2. 若未选择，则通过 `MediaServerHelper().get_services()` 获取**已配置且已连接**的 Emby/Jellyfin 客户端实例
+   （MoviePilot v3 走 `app.sdk.services`，v2 走 `app.helper.mediaserver`），对每台服务器调用
+   `emby_get_items()` / `jellyfin_get_items()`，用 `Users/{user}/Items?Filters=IsUnplayed&Recursive=true` **分页拉全**未观看条目。
+3. 按 tmdbid 去重（缓存键为 tmdbid，避免同名影视误判）→ 直接从列表条目的 `ProviderIds.Tmdb` 取 tmdbid（不再逐条查详情）→ `recognize_media()` 识别。
 4. `subscribechain.add(..., best_version=True, exist_ok=True)` 创建洗版订阅（**已存在则跳过**）。
 5. 写入缓存与历史；若 `发送通知` 开启，推送汇总（含失败数与失败原因提示）。
 
@@ -108,7 +109,7 @@ MoviePilot-Plugins/
 - **「洗版」= 升级画质**：订阅创建后由 MoviePilot 负责搜索更高画质版本并整理替换，前提是站点/订阅规则允许，且整理模式支持覆盖旧版（与官方洗版要求一致）。
 - **大库分页**：已按 `StartIndex` 分页拉全，不再受 `Limit=500` 限制。
 - 本插件**不会删除任何媒体**，只创建订阅。
-- Plex 暂未在 `settings.MEDIASERVER` 中支持（上游 Plex 走 watchlist API，与「未观看」语义不同，故略去）。
+- Plex 暂不支持（上游 Plex 走 watchlist API，与「未观看」语义不同，故略去）。
 
 ## 洗版不生效 · 排查清单 / Troubleshooting: wash not working
 
@@ -116,7 +117,7 @@ MoviePilot-Plugins/
 
 1. **确认「允许洗版 / 最佳版本」已开启**：MoviePilot 订阅创建 `best_version=True` 后，是否实际生效取决于系统是否允许洗版。若插件通知提示「部分失败 / 未开启允许洗版」，请到 MoviePilot 订阅/设置中确认洗版相关开关已打开。
 2. **确认下载器与订阅配置正常**：洗版最终依赖下载器下载更高画质资源。请确认已配置可用下载器、订阅站点，且手动订阅能正常下载。
-3. **确认媒体服务器已接入**：MoviePilot 中已配置 Emby/Jellyfin（环境变量或界面配置均可；插件会自动探测可用的媒体服务器，无需手动填写特定变量）。全量模式需要媒体服务器在线；手动选择模式可离线。
+3. **确认媒体服务器已接入**：MoviePilot『设置 → 媒体 → 媒体服务器』中已添加 Emby/Jellyfin 且连接正常（插件通过 `MediaServerHelper` 自动枚举已配置的服务器，若日志提示「未连接」请检查 Host 与 API Key）。全量模式需要媒体服务器在线；手动选择模式可离线。
 4. **确认 TMDB API Key 可用**：`recognize_media` 需要 TMDB 识别媒体信息；TMDB Key 失效会导致识别失败（日志会打印 `未识别到媒体信息`）。
 5. **确认已有更高画质资源**：洗版是「有更好版本才替换」。如果站点上当前最高画质就是你已经有的版本，订阅会一直等待，不会重复下载。
 6. **查看日志与通知**：插件会记录每条 `创建洗版订阅失败` 的原因（如 `未开启允许洗版`、`缺少下载器` 等），并（开启通知时）汇总到消息中。
@@ -128,7 +129,7 @@ MoviePilot-Plugins/
 **Troubleshooting — wash not taking effect:**
 1. Make sure "allow best version / wash" is enabled in MoviePilot; the plugin reports failures when it is off.
 2. Ensure a working downloader and subscription sites are configured (wash still needs a higher-quality release to download).
-3. For full-library mode, `settings.MEDIASERVER` (Emby/Jellyfin) must be configured; manual-pick mode works offline.
+3. For full-library mode, an Emby/Jellyfin server must be configured and connected in MoviePilot (the plugin enumerates servers via `MediaServerHelper`); manual-pick mode works offline.
 4. A valid TMDB API Key is required for media recognition.
 5. Wash only replaces when a *better* quality release exists on your sites.
 6. Check MoviePilot logs/notifications — the plugin logs the exact failure reason per item.
