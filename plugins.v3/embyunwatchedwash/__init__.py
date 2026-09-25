@@ -33,6 +33,9 @@ except ImportError:
 
 lock = RLock()
 
+# 详情页「媒体库未观看清单」每组（电影/剧集）最多预览的条目数，避免页面过长
+_DETAIL_LIST_CAP = 30
+
 
 class EmbyUnwatchedWash(_PluginBase):
     # 插件名称
@@ -40,7 +43,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.16"
+    plugin_version = "1.17"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -174,14 +177,20 @@ class EmbyUnwatchedWash(_PluginBase):
             {
                 "path": "/clear_cache",
                 "endpoint": self.clear_cache,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "清除洗版缓存（重置后会重新处理已洗版条目）"
             },
             {
                 "path": "/clear_history",
                 "endpoint": self.clear_history,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "清除洗版历史记录（仅清 UI 列表，不影响已建订阅）"
+            },
+            {
+                "path": "/delete_history",
+                "endpoint": self.delete_history,
+                "methods": ["GET"],
+                "summary": "删除单条洗版历史记录（key 为历史记录唯一标识）"
             }
         ]
 
@@ -206,7 +215,7 @@ class EmbyUnwatchedWash(_PluginBase):
 
     def clear_cache(self) -> dict:
         """
-        API 端点：清除洗版缓存文件（POST）。清除后已处理条目会重新进入洗版队列。
+        API 端点：清除洗版缓存文件（GET）。清除后已处理条目会重新进入洗版队列。
         """
         try:
             if self._cache_path and self._cache_path.exists():
@@ -219,7 +228,10 @@ class EmbyUnwatchedWash(_PluginBase):
 
     def clear_history(self) -> dict:
         """
-        API 端点：清除洗版历史记录（POST）。仅清 UI 列表，不影响已创建的订阅。
+        API 端点：清除洗版历史记录（GET）。仅清 UI 列表，不影响已创建的订阅。
+        
+        注：插件动态路由默认走 apikey 鉴权，而详情页事件只会把参数拼进 query，
+        因此这些维护类端点统一声明为 GET（与官方插件 delete_history 的做法一致）。
         """
         try:
             self.save_data('history', [])
@@ -227,6 +239,22 @@ class EmbyUnwatchedWash(_PluginBase):
             return {"success": True, "message": "历史已清除"}
         except Exception as e:
             logger.error(f"【未看洗版】清除历史失败：{e}")
+            return {"success": False, "message": str(e)}
+
+    def delete_history(self, key: str) -> dict:
+        """
+        API 端点：按唯一 key 删除单条洗版历史记录（GET），供详情页卡片右上角按钮调用。
+        """
+        try:
+            history = self.get_data('history') or []
+            remain = [item for item in history if str(item.get('key')) != str(key)]
+            if len(remain) == len(history):
+                return {"success": False, "message": "未找到对应的历史记录"}
+            self.save_data('history', remain)
+            logger.info(f"【未看洗版】已删除单条洗版历史（key={key}）")
+            return {"success": True, "message": "已删除该条历史"}
+        except Exception as e:
+            logger.error(f"【未看洗版】删除单条历史失败：{e}")
             return {"success": False, "message": str(e)}
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -391,224 +419,305 @@ class EmbyUnwatchedWash(_PluginBase):
             "exclude_library_names": []  # 兼容旧版：UI 选择时存储的库名列表
         }
 
-    def get_page(self) -> List[dict]:
+    # ------------------------------------------------------------------
+    # 详情页（数据查看）构件
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _api_key() -> str:
         """
-        拼装插件详情页面，需要返回页面配置，同时附带数据
+        详情页按钮调用插件 API 时需要在 query 中携带的 apikey。
+        插件动态路由默认走 apikey 鉴权（Header 或 Query），而详情页事件只会把 params
+        拼进 query/body，因此统一用 GET + query apikey 的方式调用。
         """
-        contents = []
+        return str(getattr(settings, "API_TOKEN", "") or "")
 
-        # 媒体库未观看影视（供查看 / 手动选择参考）
-        try:
-            options = self._get_library_options()
-        except Exception:
-            options = []
-        if options:
-            items_content = []
-            for opt in options[:100]:
-                items_content.append({
-                    'component': 'VListItem',
-                    'props': {
-                        'title': opt.get('title'),
-                        'density': 'compact',
-                    }
-                })
-            contents.append({
-                'component': 'VCard',
-                'props': {'class': 'mb-3'},
-                'content': [
-                    {
-                        'component': 'VCardTitle',
-                        'props': {'class': 'text-subtitle-1'},
-                        'text': f'媒体库未观看影视（共 {len(options)} 部，此处显示前 100）'
-                    },
-                    {
-                        'component': 'VList',
-                        'content': items_content
-                    }
-                ]
+    @staticmethod
+    def _section_title(text: str, hint: str = "") -> dict:
+        """
+        详情页分区标题：全宽一行，主标题 + 次要说明。
+        """
+        content = [
+            {'component': 'span', 'props': {'class': 'text-subtitle-1 font-weight-bold'}, 'text': text}
+        ]
+        if hint:
+            content.append({
+                'component': 'span',
+                'props': {'class': 'text-caption text-medium-emphasis ms-2'},
+                'text': hint
             })
-        else:
-            contents.append({
-                'component': 'VAlert',
-                'props': {
-                    'type': 'info',
-                    'variant': 'tonal',
-                    'text': '未能从媒体服务器读取未观看列表（可能未配置媒体服务器或服务器不可达）。'
-                }
-            })
+        return {'component': 'div', 'props': {'class': 'd-flex align-center flex-wrap mb-2'}, 'content': content}
 
-        # 当前洗版模式
-        selected = self._selected_items or []
-        if selected:
-            mode_text = f"当前为【手动选择模式】，已指定 {len(selected)} 部影视进行洗版。"
-        else:
-            mode_text = "当前为【全量模式】，将对媒体库内所有未观看影视洗版。"
-        contents.append({
-            'component': 'VAlert',
-            'props': {
-                'type': 'info',
-                'variant': 'tonal',
-                'text': mode_text + " 可在插件配置页『指定洗版影视』中手动选择。"
-            }
-        })
+    @staticmethod
+    def _grid(cards: List[dict]) -> dict:
+        """
+        官方详情页栅格容器：grid + grid-info-card（自适应列宽 15rem，明暗主题通用）。
+        """
+        return {'component': 'div', 'props': {'class': 'grid gap-3 grid-info-card mb-2'}, 'content': cards}
 
-        # 洗版历史
-        historys = self.get_data('history')
-        if not historys:
-            contents.append({
+    @staticmethod
+    def _stat_card(label: str, value: str, caption: str = "", color: str = "primary",
+                   icon: Optional[str] = None) -> dict:
+        """
+        概览统计卡：小标题 + 主数值 + 说明。颜色一律取主题色，保证浅色/深色主题都可读。
+        """
+        head = [{'component': 'span', 'props': {'class': 'text-caption text-medium-emphasis'}, 'text': label}]
+        if icon:
+            head.append({'component': 'VIcon', 'props': {'icon': icon, 'size': 'small', 'color': color}})
+        inner = [
+            {'component': 'div', 'props': {'class': 'd-flex align-center justify-space-between'}, 'content': head},
+            {'component': 'div', 'props': {'class': 'text-h6 font-weight-bold mt-1'}, 'text': value},
+        ]
+        if caption:
+            inner.append({
                 'component': 'div',
-                'text': '暂无洗版历史',
-                'props': {
-                    'class': 'text-center',
-                }
+                'props': {'class': 'text-caption text-medium-emphasis mt-1'},
+                'text': caption
             })
-            return [{
-                'component': 'div',
-                'props': {
-                    'class': 'grid gap-3 grid-info-card',
-                },
-                'content': contents
-            }]
-
-        # 数据按时间降序排序
-        historys = sorted(historys, key=lambda x: x.get('time'), reverse=True)
-        # 详情页操作入口：清除缓存 / 清除历史（走插件自定义 API）
-        contents.insert(0, {
+        return {
             'component': 'VCard',
-            'props': {'class': 'mb-3'},
+            'props': {'variant': 'tonal', 'color': color},
+            'content': [{'component': 'VCardText', 'content': inner}]
+        }
+
+    def _history_card(self, history: dict) -> dict:
+        """
+        洗版历史卡片：海报 + 标题（跳 TMDB）+ 类型/季集/时间，右上角可删除单条记录。
+        """
+        title = history.get("title")
+        poster = history.get("poster")
+        mtype = history.get("type")
+        tmdbid = history.get("tmdbid")
+        # 电影走 /movie/，剧集走 /tv/，避免历史卡片跳错页
+        tmdb_path = "tv" if mtype == "电视剧" else "movie"
+        tmdb_url = f"https://www.themoviedb.org/{tmdb_path}/{tmdbid}" if tmdbid else None
+
+        # 详情行：类型（年份）→ 季/起始集（有才显示）→ 时间
+        detail_lines = [f"类型：{mtype or '未知'}" + (f"（{history.get('year')}）" if history.get('year') else "")]
+        season = history.get("season")
+        start_episode = history.get("start_episode")
+        if season is not None or start_episode:
+            ep_line = f"第{season}季" if season is not None else ""
+            if start_episode:
+                ep_line += f" 起始集 {start_episode}"
+            detail_lines.append(ep_line.strip())
+        detail_lines.append(f"时间：{history.get('time') or '-'}")
+
+        card_content: List[dict] = []
+        # 单条删除：官方写法 VDialogCloseBtn + events 调插件 API，执行后页面自动刷新
+        record_key = history.get("key")
+        if record_key:
+            card_content.append({
+                'component': 'VDialogCloseBtn',
+                'props': {'innerClass': 'absolute top-0 right-0'},
+                'events': {
+                    'click': {
+                        'api': 'plugin/EmbyUnwatchedWash/delete_history',
+                        'method': 'get',
+                        'params': {'key': str(record_key), 'apikey': self._api_key()}
+                    }
+                }
+            })
+        card_content.append({
+            'component': 'div',
+            'props': {'class': 'd-flex justify-space-start flex-nowrap flex-row'},
             'content': [
                 {
-                    'component': 'VCardTitle',
-                    'props': {'class': 'text-subtitle-1'},
-                    'text': '维护操作'
+                    'component': 'div',
+                    'content': [{
+                        'component': 'VImg',
+                        'props': {
+                            'src': poster,
+                            'height': 120,
+                            'width': 80,
+                            'aspect-ratio': '2/3',
+                            'class': 'object-cover shadow ring-gray-500',
+                            'cover': True,
+                            # 海报为空时不渲染图片占位，避免控制台 404
+                            'srcset': '',
+                            'alt': title or '',
+                        }
+                    }]
                 },
                 {
-                    'component': 'VCardText',
-                    'props': {'class': 'pa-0'},
-                    'text': '清除缓存：重置已处理记录，下次运行会重新洗版（用于想重跑某批影视）。'
-                            '清除历史：仅删本页列表，不影响已建订阅。'
-                },
-                {
-                    'component': 'VCardActions',
+                    'component': 'div',
                     'content': [
                         {
-                            'component': 'VBtn',
-                            'props': {
-                                'color': 'warning',
-                                'variant': 'tonal',
-                                'size': 'small',
-                                'prepend-icon': 'mdi-refresh',
-                                'onclick': 'api_post("/plugins/embyunwatchedwash/clear_cache")',
-                            },
-                            'text': '清除洗版缓存'
+                            'component': 'VCardTitle',
+                            'props': {'class': 'ps-1 pe-5 break-words whitespace-break-spaces'},
+                            'content': [{
+                                'component': 'a',
+                                'props': {'href': tmdb_url, 'target': '_blank'} if tmdb_url else {},
+                                'text': title
+                            }]
                         },
-                        {
-                            'component': 'VBtn',
-                            'props': {
-                                'color': 'error',
-                                'variant': 'tonal',
-                                'size': 'small',
-                                'prepend-icon': 'mdi-history',
-                                'onclick': 'api_post("/plugins/embyunwatchedwash/clear_history")',
-                            },
-                            'text': '清除历史记录'
-                        }
+                        *[{'component': 'VCardText', 'props': {'class': 'pa-0 px-2'}, 'text': line}
+                          for line in detail_lines],
                     ]
                 }
             ]
         })
-        for history in historys[:50]:
-            title = history.get("title")
-            poster = history.get("poster")
-            mtype = history.get("type")
-            time_str = history.get("time")
-            tmdbid = history.get("tmdbid")
-            # 电影走 /movie/，剧集走 /tv/，避免历史卡片跳错页
-            tmdb_path = "tv" if mtype == "电视剧" else "movie"
-            tmdb_url = f"https://www.themoviedb.org/{tmdb_path}/{tmdbid}" if tmdbid else None
-            contents.append(
-                {
-                    'component': 'VCard',
-                    'content': [
-                        {
-                            'component': 'div',
-                            'props': {
-                                'class': 'd-flex justify-space-start flex-nowrap flex-row',
-                            },
-                            'content': [
-                                {
-                                    'component': 'div',
-                                    'content': [
-                                        {
-                                            'component': 'VImg',
-                                            'props': {
-                                                'src': poster,
-                                                'height': 120,
-                                                'width': 80,
-                                                'aspect-ratio': '2/3',
-                                                'class': 'object-cover shadow ring-gray-500',
-                                                'cover': True,
-                                                # 海报为空时不渲染图片占位，避免控制台 404
-                                                'srcset': '',
-                                                'alt': title or '',
-                                            }
-                                        }
-                                    ]
-                                },
-                                {
-                                    'component': 'div',
-                                    'content': [
-                                        {
-                                            'component': 'VCardTitle',
-                                            'props': {
-                                                'class': 'ps-1 pe-5 break-words whitespace-break-spaces'
-                                            },
-                                            'content': [
-                                                {
-                                                    'component': 'a',
-                                                    'props': {
-                                                        'href': tmdb_url,
-                                                        'target': '_blank',
-                                                    } if tmdb_url else {},
-                                                    'text': title
-                                                }
-                                            ]
-                                        },
-                                        {
-                                            'component': 'VCardText',
-                                            'props': {
-                                                'class': 'pa-0 px-2'
-                                            },
-                                            'text': f'类型：{mtype}'
-                                                    + (f' 第{history.get("season")}季'
-                                                       if history.get("season") is not None else '')
-                                                    + (f' 开始集数 {history.get("start_episode")}'
-                                                       if history.get("start_episode") else '')
-                                        },
-                                        {
-                                            'component': 'VCardText',
-                                            'props': {
-                                                'class': 'pa-0 px-2'
-                                            },
-                                            'text': f'时间：{time_str}'
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            )
+        return {'component': 'VCard', 'content': card_content}
 
-        return [
-            {
+    def _unwatched_card(self, options: List[dict]) -> dict:
+        """
+        媒体库未观看清单：按电影/剧集分组，每组仅预览前 N 条，条目可点击跳 TMDB。
+        """
+        movies = [opt for opt in options if str(opt.get("title", "")).endswith("[电影]")]
+        series = [opt for opt in options if str(opt.get("title", "")).endswith("[剧集]")]
+        body: List[dict] = []
+        for label, tmdb_path, group in (("电影", "movie", movies), ("剧集", "tv", series)):
+            if not group:
+                continue
+            shown = group[:_DETAIL_LIST_CAP]
+            body.append({
                 'component': 'div',
-                'props': {
-                    'class': 'grid gap-3 grid-info-card',
+                'props': {'class': 'text-caption font-weight-bold text-medium-emphasis mt-3 px-2'},
+                'text': f"{label}（{len(group)}）"
+            })
+            items = []
+            for opt in shown:
+                props = {'title': opt.get("title"), 'density': 'compact'}
+                if opt.get("value"):
+                    props['href'] = f"https://www.themoviedb.org/{tmdb_path}/{opt.get('value')}"
+                    props['target'] = '_blank'
+                items.append({'component': 'VListItem', 'props': props})
+            body.append({'component': 'VList', 'props': {'density': 'compact'}, 'content': items})
+            if len(group) > len(shown):
+                body.append({
+                    'component': 'div',
+                    'props': {'class': 'text-caption text-medium-emphasis px-2 mb-2'},
+                    'text': f"…另有 {len(group) - len(shown)} 部未显示"
+                })
+        return {
+            'component': 'VCard',
+            'props': {'class': 'mb-3'},
+            'content': [
+                {
+                    'component': 'VCardText',
+                    'props': {'class': 'text-caption text-medium-emphasis pb-1'},
+                    'text': f"共 {len(options)} 部未观看候选（含电影与剧集）。每组仅预览前 {_DETAIL_LIST_CAP} 部，"
+                            f"点击条目可跳转 TMDB 对照；完整清单请在配置页「指定洗版影视」中检索选择。"
                 },
-                'content': contents
-            }
-        ]
+                {'component': 'VDivider'},
+                {'component': 'VCardText', 'props': {'class': 'pa-0'}, 'content': body},
+            ]
+        }
+
+    def get_page(self) -> List[dict]:
+        """
+        拼装插件详情页面（数据查看）。
+        自上而下按使用逻辑排列：运行概览 → 运行提示 → 洗版历史 → 未观看清单 → 维护操作。
+        """
+        # ---------- 数据准备（任何一步失败都降级为空，避免详情页打不开） ----------
+        try:
+            options = self._get_library_options() or []
+        except Exception as e:
+            logger.error(f"【未看洗版】详情页读取未观看清单失败：{e}")
+            options = []
+        history = self.get_data('history') or []
+        history = sorted(history, key=lambda x: x.get('time', ''), reverse=True)
+        selected = [item for item in (self._selected_items or []) if item not in (None, "")]
+
+        contents: List[dict] = []
+
+        # ---------- 1. 运行概览：5 张统计卡，一屏一行 ----------
+        contents.append(self._section_title('运行概览', '数据来自媒体服务器扫描结果与插件本地记录'))
+        contents.append(self._grid([
+            self._stat_card('未观看候选', f"{len(options)} 部",
+                            '媒体库中未观看的影视', 'primary', 'mdi-movie-open-outline'),
+            self._stat_card('洗版历史', f"{len(history)} 条",
+                            '本地最多保留 500 条', 'success', 'mdi-history'),
+            self._stat_card('运行模式', '手动指定' if selected else '全量',
+                            f"已指定 {len(selected)} 部影视" if selected else '处理全部未观看影视',
+                            'info', 'mdi-tune-variant'),
+            self._stat_card('试运行', '已开启' if self._dry_run else '已关闭',
+                            '仅输出清单，不创建订阅' if self._dry_run else '按规则正常创建订阅',
+                            'warning' if self._dry_run else 'success', 'mdi-test-tube'),
+            self._stat_card('排除规则', f"{len(self._exclude_libraries)} 个库",
+                            f"关键字 {len(self._exclude_keywords)} 条" if self._exclude_keywords
+                            else '未设置排除关键字',
+                            'warning' if (self._exclude_libraries or self._exclude_keywords) else 'primary',
+                            'mdi-filter-off-outline'),
+        ]))
+
+        # ---------- 2. 运行提示：按需出现，不常驻 ----------
+        if self._dry_run:
+            contents.append({'component': 'VAlert', 'props': {
+                'type': 'warning', 'variant': 'tonal', 'class': 'mb-2', 'prepend-icon': 'mdi-test-tube',
+                'text': 'Dry-run 预览已开启：运行只会把待洗版清单写入日志，不会创建订阅。'}})
+        if not options:
+            contents.append({'component': 'VAlert', 'props': {
+                'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
+                'prepend-icon': 'mdi-alert-circle-outline',
+                'text': '暂未读取到未观看清单，请检查媒体服务器配置与连通性；下方历史记录不受影响。'}})
+        if self._exclude_libraries or self._exclude_keywords:
+            rules = []
+            if self._exclude_libraries:
+                rules.append('排除媒体库：' + '、'.join(self._exclude_libraries))
+            if self._exclude_keywords:
+                rules.append('排除关键字：' + '、'.join(self._exclude_keywords))
+            contents.append({'component': 'VAlert', 'props': {
+                'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
+                'prepend-icon': 'mdi-filter-off-outline',
+                'text': '；'.join(rules) + '（命中即跳过该库）'}})
+
+        # ---------- 3. 洗版历史 ----------
+        contents.append(self._section_title(
+            '洗版历史', f"共 {len(history)} 条 · 按时间倒序 · 右上角可删除单条"))
+        if history:
+            contents.append(self._grid([self._history_card(item) for item in history[:50]]))
+            if len(history) > 50:
+                contents.append({
+                    'component': 'div',
+                    'props': {'class': 'text-caption text-medium-emphasis mb-3'},
+                    'text': f"仅展示最近 50 条，本地共保留 {len(history)} 条。"
+                })
+        else:
+            contents.append({
+                'component': 'VCard',
+                'props': {'variant': 'tonal', 'class': 'mb-3'},
+                'content': [{
+                    'component': 'VCardText',
+                    'props': {'class': 'text-center text-caption text-medium-emphasis py-6'},
+                    'text': '暂无洗版历史，运行一次未看洗版后这里会出现记录。'
+                }]
+            })
+
+        # ---------- 4. 媒体库未观看清单 ----------
+        if options:
+            contents.append(self._section_title('媒体库未观看清单', f"共 {len(options)} 部候选"))
+            contents.append(self._unwatched_card(options))
+
+        # ---------- 5. 维护操作：危险操作垫底，点击后自动刷新页面 ----------
+        apikey = self._api_key()
+        contents.append(self._section_title('维护操作', '点击后页面会自动刷新'))
+        contents.append({
+            'component': 'VCard',
+            'props': {'variant': 'tonal', 'color': 'warning', 'class': 'mb-3'},
+            'content': [
+                {'component': 'VCardText', 'props': {'class': 'text-caption'},
+                 'text': '清除洗版缓存：重置已处理记录，下次运行会重新对这批影视创建订阅。'},
+                {'component': 'VCardText', 'props': {'class': 'text-caption pt-0'},
+                 'text': '清除历史记录：仅清空上方列表，已创建的订阅不受影响。'},
+                {'component': 'VCardActions', 'content': [
+                    {'component': 'VBtn',
+                     'props': {'color': 'warning', 'variant': 'tonal', 'size': 'small',
+                               'prepend-icon': 'mdi-refresh'},
+                     'text': '清除洗版缓存',
+                     'events': {'click': {'api': 'plugin/EmbyUnwatchedWash/clear_cache',
+                                          'method': 'get', 'params': {'apikey': apikey}}}},
+                    {'component': 'VBtn',
+                     'props': {'color': 'error', 'variant': 'tonal', 'size': 'small',
+                               'prepend-icon': 'mdi-delete-sweep'},
+                     'text': '清除历史记录',
+                     'events': {'click': {'api': 'plugin/EmbyUnwatchedWash/clear_history',
+                                          'method': 'get', 'params': {'apikey': apikey}}}},
+                ]},
+            ]
+        })
+
+        return contents
+
 
     def stop_service(self):
         """
