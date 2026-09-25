@@ -33,8 +33,10 @@ except ImportError:
 
 lock = RLock()
 
-# 详情页「媒体库未观看清单」每组（电影/剧集）最多预览的条目数，避免页面过长
-_DETAIL_LIST_CAP = 30
+# 详情页「媒体库未观看清单」每页条数。
+# 详情页的点击事件由官方渲染器处理：每次动作都会重载整页并回到顶部，因此这里
+# 用「服务端记住页码 + 固定每页条数」的方式，让勾选后仍停留在同一页、同一屏内。
+_LIST_PAGE_SIZE = 12
 
 
 class EmbyUnwatchedWash(_PluginBase):
@@ -43,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.18"
+    plugin_version = "1.19"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -191,6 +193,24 @@ class EmbyUnwatchedWash(_PluginBase):
                 "endpoint": self.delete_history,
                 "methods": ["GET"],
                 "summary": "删除单条洗版历史记录（key 为历史记录唯一标识）"
+            },
+            {
+                "path": "/select_set",
+                "endpoint": self.select_set,
+                "methods": ["GET"],
+                "summary": "勾选/取消勾选单个未观看影视（详情页点条目即保存，on=1 勾选 / on=0 取消）"
+            },
+            {
+                "path": "/select_page",
+                "endpoint": self.select_page,
+                "methods": ["GET"],
+                "summary": "记住未观看清单页码（详情页每次动作都会重载，靠它回到同一页）"
+            },
+            {
+                "path": "/select_bulk",
+                "endpoint": self.select_bulk,
+                "methods": ["GET"],
+                "summary": "批量操作洗版清单（mode=page_all 全选本页 / page_none 取消本页 / clear_all 清空恢复全量）"
             }
         ]
 
@@ -255,6 +275,146 @@ class EmbyUnwatchedWash(_PluginBase):
             return {"success": True, "message": "已删除该条历史"}
         except Exception as e:
             logger.error(f"【未看洗版】删除单条历史失败：{e}")
+            return {"success": False, "message": str(e)}
+
+    # ------------------------------------------------------------------
+    # 勾选洗版清单：详情页「媒体库未观看清单」逐条勾选，点击即保存
+    # ------------------------------------------------------------------
+    def _normalized_selected(self) -> List[int]:
+        """把配置里的 selected_items 归一化为去重的 int 列表（保持顺序）。"""
+        out: List[int] = []
+        for item in (self._selected_items or []):
+            try:
+                tid = int(item)
+            except (TypeError, ValueError):
+                continue
+            if tid not in out:
+                out.append(tid)
+        return out
+
+    def _persist_selected(self, items: List[int]) -> None:
+        """
+        把勾选结果写回插件配置。
+        update_config 需要完整字段（否则未传的键会丢），所以整份回写。
+        """
+        self._selected_items = items
+        self.update_config({
+            "enabled": self._enabled,
+            "cron": self._cron,
+            "notify": self._notify,
+            "only_once": False,
+            "include_series": self._include_series,
+            "selected_items": items,
+            "series_episode_level": self._series_episode_level,
+            "limit": self._limit,
+            "exclude_libraries": self._exclude_libraries,
+            "exclude_keywords": self._exclude_keywords,
+            "dry_run": self._dry_run,
+            "exclude_library_names": self._exclude_libraries,
+        })
+
+    def _sorted_options(self) -> List[dict]:
+        """未观看清单按标题排序，保证分页顺序稳定（否则翻页会串行）。"""
+        try:
+            options = self._get_library_options() or []
+        except Exception as e:
+            logger.error(f"【未看洗版】读取未观看清单失败：{e}")
+            return []
+        return sorted(options, key=lambda x: (str(x.get('title') or ''), str(x.get('value') or '')))
+
+    def _title_of(self, tid: int) -> str:
+        """按 tmdbid 反查标题，仅用于日志/提示文案。"""
+        for opt in self._sorted_options():
+            try:
+                if int(opt.get('value')) == int(tid):
+                    return str(opt.get('title') or '')
+            except (TypeError, ValueError):
+                continue
+        return ''
+
+    def _saved_page(self) -> int:
+        """读取上次停留的未观看清单页码。"""
+        try:
+            return int(self.get_data('list_page') or 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def _save_page(self, page: int) -> None:
+        """记住未观看清单页码：详情页每次点击都会整页重载，靠它回到同一页。"""
+        try:
+            self.save_data('list_page', int(page))
+        except Exception as e:
+            logger.warning(f"【未看洗版】记住清单页码失败：{e}")
+
+    def select_set(self, value: int = 0, on: int = 1, page: int = 1) -> dict:
+        """
+        API 端点：勾选 / 取消勾选单个未观看影视（GET）。
+
+        传「期望状态」（on=1 勾选、on=0 取消）而不是「翻转」：这样即使前端把事件
+        触发两次，结果也一致，不会把勾选弄反。
+        """
+        try:
+            tid = int(value)
+        except (TypeError, ValueError):
+            return {"success": False, "message": "无效的影视 ID"}
+        try:
+            current = self._normalized_selected()
+            if int(on) == 1:
+                if tid not in current:
+                    current.append(tid)
+                act = "已加入洗版清单"
+            else:
+                current = [x for x in current if x != tid]
+                act = "已移出洗版清单"
+            self._persist_selected(current)
+            self._save_page(page)
+            name = self._title_of(tid) or str(tid)
+            logger.info(f"【未看洗版】{act}：{name}（当前共 {len(current)} 部）")
+            return {"success": True, "count": len(current),
+                    "message": f"{act}：{name}（当前共 {len(current)} 部）"}
+        except Exception as e:
+            logger.error(f"【未看洗版】更新洗版清单失败：{e}")
+            return {"success": False, "message": str(e)}
+
+    def select_page(self, page: int = 1) -> dict:
+        """API 端点：记住未观看清单页码（GET），供详情页上一页/下一页使用。"""
+        self._save_page(page)
+        return {"success": True, "message": f"已切换到第 {page} 页"}
+
+    def select_bulk(self, mode: str = "page_all", page: int = 1) -> dict:
+        """
+        API 端点：批量操作洗版清单（GET）。
+        mode=page_all 全选本页 / page_none 取消本页 / clear_all 清空（恢复处理全部未观看）。
+        """
+        try:
+            current = self._normalized_selected()
+            if mode == "clear_all":
+                self._persist_selected([])
+                self._save_page(page)
+                logger.info("【未看洗版】已清空洗版清单，恢复处理全部未观看")
+                return {"success": True, "count": 0,
+                        "message": "已清空洗版清单，恢复『处理全部未观看』"}
+            page_items, _, _, _ = self._page_info(self._sorted_options(), page)
+            page_ids: List[int] = []
+            for opt in page_items:
+                try:
+                    page_ids.append(int(opt.get('value')))
+                except (TypeError, ValueError):
+                    continue
+            if mode == "page_all":
+                merged = current + [x for x in page_ids if x not in current]
+                msg = f"本页 {len(page_ids)} 部已全部加入洗版清单（当前共 {len(merged)} 部）"
+            elif mode == "page_none":
+                merged = [x for x in current if x not in page_ids]
+                msg = f"已取消本页勾选（当前共 {len(merged)} 部）"
+            else:
+                return {"success": False, "message": f"未知操作：{mode}"}
+            self._persist_selected(merged)
+            self._save_page(page)
+            logger.info(f"【未看洗版】{msg}")
+            return {"success": True, "count": len(merged), "message": msg}
+        except Exception as e:
+            logger.error(f"【未看洗版】批量更新洗版清单失败：{e}")
             return {"success": False, "message": str(e)}
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -549,36 +709,115 @@ class EmbyUnwatchedWash(_PluginBase):
         })
         return {'component': 'VCard', 'content': card_content}
 
-    def _unwatched_card(self, options: List[dict]) -> dict:
+    @staticmethod
+    def _split_title(raw: str) -> Tuple[str, str]:
+        """把「名称 (年份) [电影/剧集]」拆成（显示名, 类型标签）。"""
+        text = str(raw or '')
+        for suffix, label in ((' [电影]', '电影'), (' [剧集]', '剧集')):
+            if text.endswith(suffix):
+                return text[:-len(suffix)], label
+        return text, ''
+
+    def _page_info(self, options: List[dict], page: int) -> Tuple[List[dict], int, int, int]:
+        """按固定每页条数切片，返回（本页条目, 实际页码, 总页数, 总条数）。"""
+        total = len(options)
+        pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+        try:
+            page_no = int(page)
+        except (TypeError, ValueError):
+            page_no = 1
+        page_no = min(max(1, page_no), pages)
+        start = (page_no - 1) * _LIST_PAGE_SIZE
+        return options[start:start + _LIST_PAGE_SIZE], page_no, pages, total
+
+    def _unwatched_card(self, options: List[dict], page: int = 1) -> dict:
         """
-        媒体库未观看清单：按电影/剧集分组，每组仅预览前 N 条，条目可点击跳 TMDB。
+        媒体库未观看清单（可勾选）：分页展示，点条目即勾选/取消并立即保存。
+
+        官方详情页渲染器（PageRender）是无状态的：任何点击都会整页重载。因此勾选状态
+        直接落在插件配置 selected_items 上（点一次存一次，重载后按服务端状态回显），
+        页码也存在插件数据里，保证重载后仍停在同一页。
         """
-        movies = [opt for opt in options if str(opt.get("title", "")).endswith("[电影]")]
-        series = [opt for opt in options if str(opt.get("title", "")).endswith("[剧集]")]
-        body: List[dict] = []
-        for label, tmdb_path, group in (("电影", "movie", movies), ("剧集", "tv", series)):
-            if not group:
+        apikey = self._api_key()
+        page_items, page_no, page_total, total = self._page_info(options, page)
+        selected_set = set(self._normalized_selected())
+
+        def action(api: str, params: Dict[str, Any]) -> dict:
+            """官方事件写法：GET + query 参数（插件路由默认 apikey 鉴权）。"""
+            payload = dict(params)
+            payload['apikey'] = apikey
+            return {'click': {'api': api, 'method': 'get', 'params': payload}}
+
+        rows: List[dict] = []
+        for opt in page_items:
+            try:
+                tid = int(opt.get('value'))
+            except (TypeError, ValueError):
                 continue
-            shown = group[:_DETAIL_LIST_CAP]
-            body.append({
-                'component': 'div',
-                'props': {'class': 'text-caption font-weight-bold text-medium-emphasis mt-3 px-2'},
-                'text': f"{label}（{len(group)}）"
-            })
-            items = []
-            for opt in shown:
-                props = {'title': opt.get("title"), 'density': 'compact'}
-                if opt.get("value"):
-                    props['href'] = f"https://www.themoviedb.org/{tmdb_path}/{opt.get('value')}"
-                    props['target'] = '_blank'
-                items.append({'component': 'VListItem', 'props': props})
-            body.append({'component': 'VList', 'props': {'density': 'compact'}, 'content': items})
-            if len(group) > len(shown):
-                body.append({
-                    'component': 'div',
-                    'props': {'class': 'text-caption text-medium-emphasis px-2 mb-2'},
-                    'text': f"…另有 {len(group) - len(shown)} 部未显示"
+            name, type_label = self._split_title(opt.get('title'))
+            checked = tid in selected_set
+            btn_props: Dict[str, Any] = {
+                'class': 'flex-grow-1 justify-start text-none',
+                'density': 'compact',
+                'size': 'small',
+                'variant': 'tonal' if checked else 'text',
+                'prepend-icon': 'mdi-checkbox-marked' if checked else 'mdi-checkbox-blank-outline',
+                'text': name or str(tid),
+            }
+            if checked:
+                btn_props['color'] = 'primary'
+            row: List[dict] = [{
+                'component': 'VBtn',
+                'props': btn_props,
+                'events': action('plugin/EmbyUnwatchedWash/select_set', {
+                    'value': tid, 'on': 0 if checked else 1, 'page': page_no
                 })
+            }]
+            if type_label:
+                row.append({
+                    'component': 'span',
+                    'props': {'class': 'text-caption text-medium-emphasis ms-2 flex-shrink-0'},
+                    'text': type_label
+                })
+            tmdb_path = 'tv' if type_label == '剧集' else 'movie'
+            row.append({
+                'component': 'a',
+                'props': {'class': 'text-caption ms-3 flex-shrink-0 text-decoration-none',
+                          'href': f"https://www.themoviedb.org/{tmdb_path}/{tid}",
+                          'target': '_blank'},
+                'text': 'TMDB'
+            })
+            rows.append({'component': 'div', 'props': {'class': 'd-flex align-center px-2'},
+                         'content': row})
+
+        def toolbar_btn(label: str, api: str, params: Dict[str, Any],
+                        disabled: bool = False, color: str = "") -> dict:
+            btn: Dict[str, Any] = {'size': 'small', 'variant': 'tonal',
+                                   'class': 'text-none', 'text': label}
+            if disabled:
+                btn['disabled'] = True
+            if color:
+                btn['color'] = color
+            return {'component': 'VBtn', 'props': btn, 'events': action(api, params)}
+
+        selected_count = len(selected_set)
+        if selected_count:
+            hint = (f'已勾选 {selected_count} 部：运行时只对这批影视创建洗版订阅；'
+                    f'点「清空全部」恢复处理全部未观看。')
+        else:
+            hint = ('未勾选任何项时处理全部未观看影视（排除规则命中的除外）；'
+                    '点击条目即勾选，勾选结果会立即保存。')
+
+        body: List[dict] = []
+        if rows:
+            body.append({'component': 'VCardText', 'props': {'class': 'pa-0 py-1'}, 'content': rows})
+        else:
+            body.append({
+                'component': 'VCardText',
+                'props': {'class': 'text-center text-caption text-medium-emphasis py-6'},
+                'text': '当前页没有可勾选的条目。'
+            })
+
         return {
             'component': 'VCard',
             'props': {'class': 'mb-3'},
@@ -586,25 +825,50 @@ class EmbyUnwatchedWash(_PluginBase):
                 {
                     'component': 'VCardText',
                     'props': {'class': 'text-caption text-medium-emphasis pb-1'},
-                    'text': f"共 {len(options)} 部未观看候选（含电影与剧集）。每组仅预览前 {_DETAIL_LIST_CAP} 部，"
-                            f"点击条目可跳转 TMDB 对照；本页仅供查看，运行时会处理全部未观看影视（排除规则命中的除外）。"
+                    'text': f"共 {total} 部未观看候选 · 第 {page_no}/{page_total} 页 · "
+                            f"每页 {_LIST_PAGE_SIZE} 部"
+                },
+                {
+                    'component': 'VAlert',
+                    'props': {'type': 'warning' if selected_count else 'info',
+                              'variant': 'tonal', 'density': 'compact', 'class': 'mb-2',
+                              'text': hint}
                 },
                 {'component': 'VDivider'},
-                {'component': 'VCardText', 'props': {'class': 'pa-0'}, 'content': body},
+                *body,
+                {'component': 'VDivider'},
+                {'component': 'VCardActions', 'props': {'class': 'flex-wrap ga-1 px-2'}, 'content': [
+                    toolbar_btn('上一页', 'plugin/EmbyUnwatchedWash/select_page',
+                                {'page': page_no - 1}, disabled=page_no <= 1),
+                    {'component': 'span',
+                     'props': {'class': 'text-caption text-medium-emphasis px-2'},
+                     'text': f"{page_no} / {page_total}"},
+                    toolbar_btn('下一页', 'plugin/EmbyUnwatchedWash/select_page',
+                                {'page': page_no + 1}, disabled=page_no >= page_total),
+                    toolbar_btn('全选本页', 'plugin/EmbyUnwatchedWash/select_bulk',
+                                {'mode': 'page_all', 'page': page_no}),
+                    toolbar_btn('取消本页', 'plugin/EmbyUnwatchedWash/select_bulk',
+                                {'mode': 'page_none', 'page': page_no}),
+                    toolbar_btn('清空全部', 'plugin/EmbyUnwatchedWash/select_bulk',
+                                {'mode': 'clear_all', 'page': page_no},
+                                disabled=selected_count == 0, color='error'),
+                ]},
             ]
         }
 
     def get_page(self) -> List[dict]:
         """
         拼装插件详情页面（数据查看）。
-        自上而下按使用逻辑排列：运行概览 → 运行提示 → 洗版历史 → 未观看清单 → 维护操作。
+        自上而下按使用逻辑排列：
+        运行概览 → 运行提示 → 媒体库未观看清单（可勾选）→ 洗版历史 → 维护操作。
+
+        未观看清单排在历史之前：清单是可选可改的「操作区」，而详情页每次点击都会整页
+        重载并回到顶部，把它放在靠前的位置可以少滚一点。
         """
         # ---------- 数据准备（任何一步失败都降级为空，避免详情页打不开） ----------
-        try:
-            options = self._get_library_options() or []
-        except Exception as e:
-            logger.error(f"【未看洗版】详情页读取未观看清单失败：{e}")
-            options = []
+        # 清单按标题排序（分页顺序才稳定）；勾选状态来自插件配置 selected_items
+        options = self._sorted_options()
+        selected = self._normalized_selected()
         history = self.get_data('history') or []
         history = sorted(history, key=lambda x: x.get('time', ''), reverse=True)
 
@@ -641,6 +905,12 @@ class EmbyUnwatchedWash(_PluginBase):
                 'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
                 'prepend-icon': 'mdi-alert-circle-outline',
                 'text': '暂未读取到未观看清单，请检查媒体服务器配置与连通性；下方历史记录不受影响。'}})
+        if selected:
+            contents.append({'component': 'VAlert', 'props': {
+                'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
+                'prepend-icon': 'mdi-format-list-checks',
+                'text': f'已勾选 {len(selected)} 部影视：运行时只对这批创建洗版订阅，'
+                        f'其余未观看内容会跳过；在下方清单点「清空全部」可恢复处理全部未观看。'}})
         if self._exclude_libraries or self._exclude_keywords:
             rules = []
             if self._exclude_libraries:
@@ -652,7 +922,12 @@ class EmbyUnwatchedWash(_PluginBase):
                 'prepend-icon': 'mdi-filter-off-outline',
                 'text': '；'.join(rules) + '（命中即跳过该库）'}})
 
-        # ---------- 3. 洗版历史 ----------
+        # ---------- 3. 媒体库未观看清单（可勾选，点击即保存） ----------
+        contents.append(self._section_title(
+            '媒体库未观看清单', '点条目即勾选并立即保存 · 未勾选任何项则处理全部未观看'))
+        contents.append(self._unwatched_card(options, page=self._saved_page()))
+
+        # ---------- 4. 洗版历史 ----------
         contents.append(self._section_title(
             '洗版历史', f"共 {len(history)} 条 · 按时间倒序 · 右上角可删除单条"))
         if history:
@@ -673,11 +948,6 @@ class EmbyUnwatchedWash(_PluginBase):
                     'text': '暂无洗版历史，运行一次未看洗版后这里会出现记录。'
                 }]
             })
-
-        # ---------- 4. 媒体库未观看清单 ----------
-        if options:
-            contents.append(self._section_title('媒体库未观看清单', f"共 {len(options)} 部候选"))
-            contents.append(self._unwatched_card(options))
 
         # ---------- 5. 维护操作：危险操作垫底，点击后自动刷新页面 ----------
         apikey = self._api_key()
