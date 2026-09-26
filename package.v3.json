@@ -3,7 +3,7 @@
             "name": "Emby未看洗版",
             "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
             "labels": "媒体库",
-            "version": "1.22",
+            "version": "1.23",
             "icon": "icon.svg",
             "author": "jiuyaozhuce",
             "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
             "system_version": ">=3.0.0",
             "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
             "history": {
+                  "v1.23": "修复未观看清单「字看不到」：清单行与工具条按钮的标签此前写在 props.text，而详情页渲染器永远会填默认插槽（模板里 {{ config.text }}），Vuetify 的 VBtn 是「插槽优先」（编译后 default: () => [s.default?.() ?? t.text]），于是 props.text 被丢弃、按钮渲染成没有标签的空白块；现统一改为顶层 text。另给未勾选行与无颜色按钮加 text-high-emphasis，提升深色主题下的对比度",
                   "v1.22": "交互接口秒级返回：勾选/翻页/批量改为只读未看清单快照，不再在点击时同步扫描媒体库（扫描动辑十几秒，会触发前端 Service Worker NetworkFirst 的 5 秒超时回退旧缓存）；分页口径与页面当前渲染一致",
                   "v1.21": "修复“服务器返回了无效响应”：详情页点击（勾选/翻页/删除/维护）后前端报错且不刷新。原因是插件接口只返回 {success, message} 两个键，而详情页渲染器用的是严格信封客户端（要求恰好三个键 success/message/data）；现全部接口改为返回标准三键信封，与官方 schemas.Response 一致",
                   "v1.20": "细节修正：媒体项缺年份时标题会显示成「小猪佩奇 ()」，现统一收成「小猪佩奇」（勾选列表与提示文案同步处理）；/select_page 会把页码收敛到有效范围，避免存进越界页码",

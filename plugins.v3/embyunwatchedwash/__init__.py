@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.22"
+    plugin_version = "1.23"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -802,19 +802,25 @@ class EmbyUnwatchedWash(_PluginBase):
                 continue
             name, type_label = self._split_title(opt.get('title'))
             checked = tid in selected_set
+            # 文字必须放在配置的**顶层** text（渲染器把它塞进默认插槽）；
+            # 若写进 props.text，会被 VBtn 的「插槽优先」逻辑吃掉（s.default?.() ?? t.text），
+            # 按钮会渲染成一个没有标签的空按钮。
+            # 未勾选行额外加 text-high-emphasis：卡片内的继承色是 medium-emphasis（偏暗），
+            # 提到高强调度可保证深浅色主题下都清晰可读。
             btn_props: Dict[str, Any] = {
-                'class': 'flex-grow-1 justify-start text-none',
+                'class': 'flex-grow-1 justify-start text-none'
+                         + ('' if checked else ' text-high-emphasis'),
                 'density': 'compact',
                 'size': 'small',
                 'variant': 'tonal' if checked else 'text',
                 'prepend-icon': 'mdi-checkbox-marked' if checked else 'mdi-checkbox-blank-outline',
-                'text': name or str(tid),
             }
             if checked:
                 btn_props['color'] = 'primary'
             row: List[dict] = [{
                 'component': 'VBtn',
                 'props': btn_props,
+                'text': name or str(tid),
                 'events': action('plugin/EmbyUnwatchedWash/select_set', {
                     'value': tid, 'on': 0 if checked else 1, 'page': page_no
                 })
@@ -838,13 +844,18 @@ class EmbyUnwatchedWash(_PluginBase):
 
         def toolbar_btn(label: str, api: str, params: Dict[str, Any],
                         disabled: bool = False, color: str = "") -> dict:
-            btn: Dict[str, Any] = {'size': 'small', 'variant': 'tonal',
-                                   'class': 'text-none', 'text': label}
+            # 同上：标签放顶层 text，别放 props（VBtn 只要默认插槽存在就忽略 props.text）
+            btn: Dict[str, Any] = {
+                'size': 'small',
+                'variant': 'tonal',
+                'class': 'text-none' + ('' if color else ' text-high-emphasis'),
+            }
             if disabled:
                 btn['disabled'] = True
             if color:
                 btn['color'] = color
-            return {'component': 'VBtn', 'props': btn, 'events': action(api, params)}
+            return {'component': 'VBtn', 'props': btn, 'text': label,
+                    'events': action(api, params)}
 
         selected_count = len(selected_set)
         if selected_count:
