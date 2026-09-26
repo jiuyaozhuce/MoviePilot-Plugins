@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.26"
+    plugin_version = "1.27"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -1018,8 +1018,13 @@ class EmbyUnwatchedWash(_PluginBase):
             # 文字必须放在配置的**顶层** text（渲染器把它塞进默认插槽）；
             # 若写进 props.text，会被 VBtn 的「插槽优先」逻辑吃掉（s.default?.() ?? t.text），
             # 按钮会渲染成一个没有标签的空按钮。
-            # 未勾选行额外加 text-high-emphasis：卡片内的继承色是 medium-emphasis（偏暗），
+            # 未勾选行加 text-high-emphasis：卡片内的继承色是 medium-emphasis（偏暗），
             # 提到高强调度可保证深浅色主题下都清晰可读。
+            #
+            # 已勾选行的配色**刻意不用 color='primary'**：primary 跟随用户主题，
+            # 本机主题的 primary 是紫色，选中项名称整片紫字很刺眼（用户明确反馈伤眼）。
+            # 改用「tonal 变体 + 低饱和语义色」——tonal 只给一层浅底 + 深色文字，
+            # 选中态靠浅绿底 + checkbox-marked 图标表达，文字保持中性可读。
             btn_props: Dict[str, Any] = {
                 'class': 'flex-grow-1 justify-start text-none'
                          + ('' if checked else ' text-high-emphasis'),
@@ -1029,7 +1034,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 'prepend-icon': 'mdi-checkbox-marked' if checked else 'mdi-checkbox-blank-outline',
             }
             if checked:
-                btn_props['color'] = 'primary'
+                btn_props['color'] = 'success'
             row: List[dict] = [{
                 'component': 'VBtn',
                 'props': btn_props,
