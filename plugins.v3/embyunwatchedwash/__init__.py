@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.34"
+    plugin_version = "1.35"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -1447,7 +1447,40 @@ class EmbyUnwatchedWash(_PluginBase):
             if auto_mode and self._first_run_unlimited and not recorded_keys:
                 unlimited_first_run = True
 
-            if auto_mode:
+            if not auto_mode:
+                # ---------- 手动选择模式：只处理清单里勾选的 tmdbid ----------
+                logger.info(f"【未看洗版】运行模式：手动选择（指定 {len(selected)} 个 tmdbid 洗版）")
+                # 开启剧集集粒度时，读取媒体库以定位所选剧集「未观看的集」（只算勾选的 tmdbid）
+                plan_by_tmdb: Dict[str, List[dict]] = {}
+                if self._include_series and self._series_episode_level:
+                    plan_by_tmdb = self._plan_by_tmdb(wanted=selected)
+                # 手动模式同样受 limit 保护（避免一次勾选几百部直接爆订阅）
+                limit = self._limit if isinstance(self._limit, int) and self._limit > 0 else 0
+                for tid in selected:
+                    if limit and (washed_count + failed_count) >= limit:
+                        logger.info(f"【未看洗版】已达到单次处理上限 {limit}，本次停止（剩余选择下次运行继续）")
+                        break
+                    tasks = plan_by_tmdb.get(str(tid)) or [{
+                        "tmdb_id": tid,
+                        "mtype": None,
+                        "name": None,
+                        "season": None,
+                        "start_episode": None,
+                    }]
+                    for task in tasks:
+                        if limit and (washed_count + failed_count) >= limit:
+                            logger.info(f"【未看洗版】已达到单次处理上限 {limit}，本次停止（剩余任务下次运行继续）")
+                            break
+                        status = self._process_task(task, caches, history, skipped_items)
+                        if status == "added":
+                            washed_count += 1
+                        elif status == "reused":
+                            reused_count += 1
+                        elif status == "failed":
+                            failed_count += 1
+                        elif status == "skipped":
+                            skipped_count += 1
+            else:
                 servers = self._get_server_instances()
                 _limit_label = '不限（首次全量不设上限）' if unlimited_first_run else (self._limit or '不限')
                 logger.info(f"【未看洗版】运行模式：自动化洗版 | 包含剧集={self._include_series} | "
