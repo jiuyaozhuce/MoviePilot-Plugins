@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.27"
+    plugin_version = "1.28"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -1018,22 +1018,23 @@ class EmbyUnwatchedWash(_PluginBase):
             # 文字必须放在配置的**顶层** text（渲染器把它塞进默认插槽）；
             # 若写进 props.text，会被 VBtn 的「插槽优先」逻辑吃掉（s.default?.() ?? t.text），
             # 按钮会渲染成一个没有标签的空按钮。
-            # 未勾选行加 text-high-emphasis：卡片内的继承色是 medium-emphasis（偏暗），
-            # 提到高强调度可保证深浅色主题下都清晰可读。
             #
-            # 已勾选行的配色**刻意不用 color='primary'**：primary 跟随用户主题，
-            # 本机主题的 primary 是紫色，选中项名称整片紫字很刺眼（用户明确反馈伤眼）。
-            # 改用「tonal 变体 + 低饱和语义色」——tonal 只给一层浅底 + 深色文字，
-            # 选中态靠浅绿底 + checkbox-marked 图标表达，文字保持中性可读。
+            # 配色原则：**影视名称一律保持中性（不染色）**。
+            # - 旧版勾选行用 color='primary' 给名称染色，而 primary 跟随用户主题，
+            #   本机主题是紫色（#7B68EE，对深色背景对比度仅 4.51），整片紫字长时间看很刺眼。
+            # - 现改为：勾选态只给一层「tonal 浅底」+ 实心勾选图标，文字强制中性高强调，
+            #   既不依赖主题色相，也不换成另一种彩字（换色只是把刺眼换个颜色而已）。
+            # - 未勾选态保持无底色 + 中性文字。
             btn_props: Dict[str, Any] = {
-                'class': 'flex-grow-1 justify-start text-none'
-                         + ('' if checked else ' text-high-emphasis'),
+                'class': 'flex-grow-1 justify-start text-none text-high-emphasis'
+                         + (' list-btn-checked' if checked else ''),
                 'density': 'compact',
                 'size': 'small',
                 'variant': 'tonal' if checked else 'text',
-                'prepend-icon': 'mdi-checkbox-marked' if checked else 'mdi-checkbox-blank-outline',
+                'prepend-icon': 'mdi-checkbox-marked-circle' if checked else 'mdi-checkbox-blank-outline',
             }
             if checked:
+                # color 只用来渲染浅底，名称颜色由 list-btn-checked 强制改回中性
                 btn_props['color'] = 'success'
             row: List[dict] = [{
                 'component': 'VBtn',
@@ -1158,6 +1159,19 @@ class EmbyUnwatchedWash(_PluginBase):
         history = sorted(history, key=lambda x: x.get('time', ''), reverse=True)
 
         contents: List[dict] = []
+
+        # ---------- 0. 宿主样式：把清单里已勾选行的名称钉回中性色 ----------
+        # 勾选态只靠「tonal 浅底 + 实心勾选图标」表达，影视名称不染色。
+        # 这样无论用户把主题 primary 设成什么颜色（本机是刺眼的紫），名称都不会跟着变色。
+        # 用 Vuetify 主题变量而非写死色值，浅色/深色主题都能拿到正确的中性前景色：
+        #   深色主题 → 纯白；浅色主题 → 纯黑（已实测两种主题均正确）
+        contents.append({
+            'component': 'style',
+            'text': '.list-btn-checked .v-btn__content{'
+                    'color:rgba(var(--v-theme-on-surface),var(--v-high-emphasis-opacity))'
+                    '!important;}'
+                    '.list-btn-checked .v-icon{opacity:1;}'
+        })
 
         # ---------- 1. 运行概览：5 张统计卡，一屏一行 ----------
         contents.append(self._section_title('运行概览', '数据来自媒体服务器扫描结果与插件本地记录'))
