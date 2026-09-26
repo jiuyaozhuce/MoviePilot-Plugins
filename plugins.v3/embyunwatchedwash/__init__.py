@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.20"
+    plugin_version = "1.21"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -214,26 +214,43 @@ class EmbyUnwatchedWash(_PluginBase):
             }
         ]
 
-    def get_history(self) -> List[dict]:
+    @staticmethod
+    def _api_response(success: bool, message: str = "", data: Any = None) -> Dict[str, Any]:
+        """
+        构造 MoviePilot 标准接口响应信封。
+
+        ⚠️ 响应体必须**恰好**是 {success, message, data} 三个键：
+        详情页事件由前端 PageRender 用「数据客户端」发起（源码里是 `import api from '@/api'`，
+        取默认导出，而非 pluginApi），该客户端的响应拦截器会做**严格信封校验**——键数必须为 3、
+        success 必须是 bool、message 必须是 str、且必须存在 data 键。少一个键就会被判为
+        invalid-envelope，前端随即弹出「服务器返回了无效响应」并 reject，**即使 HTTP 状态码是 200、
+        服务端数据也已正确落库**（点一次勾选，服务端存了，页面却报错且不刷新，就是这么来的）。
+
+        官方插件同此约定，例如 doubanrank 返回的是 schemas.Response(success=..., message=...)，
+        序列化后即为三键结构（data 默认为 null）。
+        """
+        return {"success": bool(success), "message": str(message or ""), "data": data}
+
+    def get_history(self) -> Dict[str, Any]:
         """
         API 端点：返回已洗版历史记录
         """
-        return self.get_data('history') or []
+        return self._api_response(True, "获取成功", self.get_data('history') or [])
 
-    def get_medias(self) -> List[dict]:
+    def get_medias(self) -> Dict[str, Any]:
         """
         API 端点：返回媒体库未观看影视可选项（标题 + tmdbid）
         """
-        return self._get_library_options()
+        return self._api_response(True, "获取成功", self._get_library_options())
 
-    def get_libraries(self) -> List[dict]:
+    def get_libraries(self) -> Dict[str, Any]:
         """
         API 端点：返回所有媒体服务器的库列表，供排除媒体库 UI 选择。
-        返回格式：[{"title": "电影", "value": "电影"}, ...]
+        data 格式：[{"title": "电影", "value": "电影"}, ...]
         """
-        return self._get_library_list_options()
+        return self._api_response(True, "获取成功", self._get_library_list_options())
 
-    def clear_cache(self) -> dict:
+    def clear_cache(self) -> Dict[str, Any]:
         """
         API 端点：清除洗版缓存文件（GET）。清除后已处理条目会重新进入洗版队列。
         """
@@ -241,27 +258,27 @@ class EmbyUnwatchedWash(_PluginBase):
             if self._cache_path and self._cache_path.exists():
                 self._cache_path.unlink()
                 logger.info("【未看洗版】已清除洗版缓存")
-            return {"success": True, "message": "缓存已清除"}
+            return self._api_response(True, "缓存已清除")
         except Exception as e:
             logger.error(f"【未看洗版】清除缓存失败：{e}")
-            return {"success": False, "message": str(e)}
+            return self._api_response(False, str(e))
 
-    def clear_history(self) -> dict:
+    def clear_history(self) -> Dict[str, Any]:
         """
         API 端点：清除洗版历史记录（GET）。仅清 UI 列表，不影响已创建的订阅。
-        
+
         注：插件动态路由默认走 apikey 鉴权，而详情页事件只会把参数拼进 query，
         因此这些维护类端点统一声明为 GET（与官方插件 delete_history 的做法一致）。
         """
         try:
             self.save_data('history', [])
             logger.info("【未看洗版】已清除洗版历史")
-            return {"success": True, "message": "历史已清除"}
+            return self._api_response(True, "历史已清除")
         except Exception as e:
             logger.error(f"【未看洗版】清除历史失败：{e}")
-            return {"success": False, "message": str(e)}
+            return self._api_response(False, str(e))
 
-    def delete_history(self, key: str) -> dict:
+    def delete_history(self, key: str) -> Dict[str, Any]:
         """
         API 端点：按唯一 key 删除单条洗版历史记录（GET），供详情页卡片右上角按钮调用。
         """
@@ -269,13 +286,13 @@ class EmbyUnwatchedWash(_PluginBase):
             history = self.get_data('history') or []
             remain = [item for item in history if str(item.get('key')) != str(key)]
             if len(remain) == len(history):
-                return {"success": False, "message": "未找到对应的历史记录"}
+                return self._api_response(False, "未找到对应的历史记录")
             self.save_data('history', remain)
             logger.info(f"【未看洗版】已删除单条洗版历史（key={key}）")
-            return {"success": True, "message": "已删除该条历史"}
+            return self._api_response(True, "已删除该条历史")
         except Exception as e:
             logger.error(f"【未看洗版】删除单条历史失败：{e}")
-            return {"success": False, "message": str(e)}
+            return self._api_response(False, str(e))
 
     # ------------------------------------------------------------------
     # 勾选洗版清单：详情页「媒体库未观看清单」逐条勾选，点击即保存
@@ -346,7 +363,7 @@ class EmbyUnwatchedWash(_PluginBase):
         except Exception as e:
             logger.warning(f"【未看洗版】记住清单页码失败：{e}")
 
-    def select_set(self, value: int = 0, on: int = 1, page: int = 1) -> dict:
+    def select_set(self, value: int = 0, on: int = 1, page: int = 1) -> Dict[str, Any]:
         """
         API 端点：勾选 / 取消勾选单个未观看影视（GET）。
 
@@ -356,7 +373,7 @@ class EmbyUnwatchedWash(_PluginBase):
         try:
             tid = int(value)
         except (TypeError, ValueError):
-            return {"success": False, "message": "无效的影视 ID"}
+            return self._api_response(False, "无效的影视 ID")
         try:
             current = self._normalized_selected()
             if int(on) == 1:
@@ -370,19 +387,19 @@ class EmbyUnwatchedWash(_PluginBase):
             self._save_page(page)
             name = self._title_of(tid) or str(tid)
             logger.info(f"【未看洗版】{act}：{name}（当前共 {len(current)} 部）")
-            return {"success": True, "count": len(current),
-                    "message": f"{act}：{name}（当前共 {len(current)} 部）"}
+            return self._api_response(True, f"{act}：{name}（当前共 {len(current)} 部）",
+                                      {"count": len(current), "value": tid, "on": int(on)})
         except Exception as e:
             logger.error(f"【未看洗版】更新洗版清单失败：{e}")
-            return {"success": False, "message": str(e)}
+            return self._api_response(False, str(e))
 
-    def select_page(self, page: int = 1) -> dict:
+    def select_page(self, page: int = 1) -> Dict[str, Any]:
         """API 端点：记住未观看清单页码（GET），供详情页上一页/下一页使用。"""
         _, page_no, _, _ = self._page_info(self._sorted_options(), page)
         self._save_page(page_no)
-        return {"success": True, "message": f"已切换到第 {page_no} 页"}
+        return self._api_response(True, f"已切换到第 {page_no} 页", {"page": page_no})
 
-    def select_bulk(self, mode: str = "page_all", page: int = 1) -> dict:
+    def select_bulk(self, mode: str = "page_all", page: int = 1) -> Dict[str, Any]:
         """
         API 端点：批量操作洗版清单（GET）。
         mode=page_all 全选本页 / page_none 取消本页 / clear_all 清空（恢复处理全部未观看）。
@@ -393,8 +410,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 self._persist_selected([])
                 self._save_page(page)
                 logger.info("【未看洗版】已清空洗版清单，恢复处理全部未观看")
-                return {"success": True, "count": 0,
-                        "message": "已清空洗版清单，恢复『处理全部未观看』"}
+                return self._api_response(True, "已清空洗版清单，恢复『处理全部未观看』",
+                                          {"count": 0})
             page_items, _, _, _ = self._page_info(self._sorted_options(), page)
             page_ids: List[int] = []
             for opt in page_items:
@@ -409,14 +426,14 @@ class EmbyUnwatchedWash(_PluginBase):
                 merged = [x for x in current if x not in page_ids]
                 msg = f"已取消本页勾选（当前共 {len(merged)} 部）"
             else:
-                return {"success": False, "message": f"未知操作：{mode}"}
+                return self._api_response(False, f"未知操作：{mode}")
             self._persist_selected(merged)
             self._save_page(page)
             logger.info(f"【未看洗版】{msg}")
-            return {"success": True, "count": len(merged), "message": msg}
+            return self._api_response(True, msg, {"count": len(merged), "page_size": len(page_ids)})
         except Exception as e:
             logger.error(f"【未看洗版】批量更新洗版清单失败：{e}")
-            return {"success": False, "message": str(e)}
+            return self._api_response(False, str(e))
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
