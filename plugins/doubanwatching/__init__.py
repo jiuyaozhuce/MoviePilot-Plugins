@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.10"
+    plugin_version = "v1.9.11"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -489,13 +489,18 @@ class DouBanWatching(_PluginBase):
         attrs = {"refresh": 600, "border": False}
         line_items = self.get_line_item(mobile=mobile)
         if line_items:
-            # 海报墙：顶层 VRow 自动换行，no-gutters 防止负 margin 溢出容器
+            # 海报墙：CSS Grid 自适应列数，剩余宽度均摊到每列，
+            # 每行精确填满容器（避免最后一行右侧剩下不到一张海报的空隙）
+            gap = "6px" if mobile else "8px"
+            min_w = "44px" if mobile else "66px"
+            grid_style = (f"display:grid; grid-template-columns:repeat(auto-fill, minmax({min_w}, 1fr)); "
+                          f"gap:{gap}; width:100%;")
             elements = [
                 {
                     'component': 'VRow',
                     'props': {
                         'no-gutters': True,
-                        'align-content': 'start'
+                        'style': grid_style
                     },
                     'content': line_items
                 }
@@ -545,20 +550,18 @@ class DouBanWatching(_PluginBase):
         # 限制每月最多显示数
         limit_num = self._mobile_num if mobile else self._pc_num
 
-        card_w = "44px" if mobile else "66px"
-        card_h = "66px" if mobile else "99px"
         month_text_class = "text-subtitle-2 font-weight-bold" if mobile else "text-subtitle-1 font-weight-bold"
         num_text_class = "text-caption"
 
         def month_card(label: int, total: int) -> dict:
-            """与海报同尺寸的月份卡：显示“X月 / 看过N部”。"""
+            """与海报同尺寸的月份卡：撑满所在网格列，2:3 比例与海报等宽等高。"""
             return {
                 "component": "VCard",
                 "props": {
                     "variant": "tonal",
                     "color": "#AF85FD",
                     "class": "rounded-lg",
-                    "style": f"width:{card_w}; height:{card_h}; flex-shrink: 0;"
+                    "style": "width:100%; aspect-ratio:2/3;"
                 },
                 "content": [
                     {
@@ -595,7 +598,7 @@ class DouBanWatching(_PluginBase):
                         "subject_id") + "?from=mdouban&open=app",
                     "target": "_blank",
                     "title": val.get("subject_name"),
-                    "style": "padding: 0.2rem"
+                    "style": "display:block; width:100%;"
                 },
                 "content": [
                     {
@@ -608,7 +611,7 @@ class DouBanWatching(_PluginBase):
                                 "component": "VImg",
                                 "props": {
                                     "src": poster.replace("/original/", "/w200/"),
-                                    "style": f"width:{card_w}; height:{card_h};",
+                                    "style": "width:100%; display:block;",
                                     "aspect-ratio": "2/3",
                                     "cover": True
                                 }

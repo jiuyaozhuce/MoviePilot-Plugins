@@ -58,7 +58,7 @@
     "name": "豆瓣书影音档案",
     "description": "将剧集在看、看完状态同步到豆瓣书影音档案。",
     "labels": "豆瓣",
-    "version": "1.9.10",
+    "version": "1.9.11",
     "icon": "douban.png",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -67,6 +67,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.9.11": "海报间距自适应容器宽度：改为 CSS Grid auto-fill 布局，剩余宽度均摊到每列，每行精确填满，消除最后一行右侧的半张海报空隙",
       "v1.9.10": "仪表板改为海报墙布局：海报按观看时间新到旧平铺、宽度不足自动换行，跨月插入与海报同尺寸的月份卡片（月份+当月观看总数）",
       "v1.9.9": "修复仪表盘组件内容超宽需左右滚动的问题（VRow 负 margin 未被 VCol 抵消，改用 no-gutters 并限宽 100%）；新增空状态提示、海报圆角与悬停显示片名",
       "v1.9.8": "插件来源合并至本仓库（jiuyaozhuce/MoviePilot-Plugins），载荷与 v1.9.7 相同（v3 recognize_media 适配 + get_subject_id 解包修复）",
