@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.25"
+    plugin_version = "1.26"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -74,9 +74,23 @@ class EmbyUnwatchedWash(_PluginBase):
     _library_names_cache_time: float = 0.0
     # 清单里被「排除规则」隐去的条目数 / 涉及库名 / 被隐去的 tmdbid 集合
     # （详情页要把这件事告诉用户，否则「共 N 部」与设置页看到的库对不上）
+    # 本次运行时「已存在于洗版记录」的 key 集合，用于把「真新建」与
+    # 「复用已有订阅」区分开（订阅接口对已存在的订阅也会返回 ID，
+    # 若只按返回值判定，汇总里的「新建订阅 N 个」会虚高）。
+    _recorded: set = set()
+
     _options_hidden: int = 0
     _options_hidden_libs: List[str] = []
     _options_excluded_ids: set = set()
+
+    # ------------------------------------------------------------------
+    # 配置自愈标记
+    # ------------------------------------------------------------------
+    # 每次「读取配置 → 派生」时，检查 selected_items 是否与洗版记录（history）
+    # 冲突（记录了同名影视却被取消勾选，通常由旧版删历史不同步造成），
+    # 命中则置位，由 sync() 在真正运行前按 history 重建勾选，避免改配置的副作用
+    # 落在只读路径上（打开详情页不该写库）。
+    _selection_dirty: bool = False
 
     # 配置属性
     _enabled: bool = False
@@ -119,6 +133,9 @@ class EmbyUnwatchedWash(_PluginBase):
                 self._exclude_libraries = self._normalize_str_list(config.get("exclude_library_names", []))
             self._exclude_keywords = self._normalize_str_list(config.get("exclude_keywords", []))
             self._dry_run = bool(config.get("dry_run", False))
+
+        # 配置自愈：洗版记录与勾选列表必须一致（详见方法注释）
+        self._repair_selection()
 
         if self._only_once:
             self._only_once = False
@@ -270,15 +287,18 @@ class EmbyUnwatchedWash(_PluginBase):
 
     def clear_history(self) -> Dict[str, Any]:
         """
-        API 端点：清除洗版历史记录（GET）。仅清 UI 列表，不影响已创建的订阅。
+        API 端点：清除洗版历史记录（GET）。
 
-        注：插件动态路由默认走 apikey 鉴权，而详情页事件只会把参数拼进 query，
-        因此这些维护类端点统一声明为 GET（与官方插件 delete_history 的做法一致）。
+        这是「清空全部」语义：记录、去重缓存、勾选清单三者一起清，
+        避免出现「记录没了却还被缓存拦住」或「清单为空→被当成全量模式重洗一遍」。
+        已创建的 MoviePilot 订阅不受影响（记录只是本地留痕）。
         """
         try:
-            self.save_data('history', [])
-            logger.info("【未看洗版】已清除洗版历史")
-            return self._api_response(True, "历史已清除")
+            self._clear_history_and_cache()
+            self._persist_selected([])
+            logger.info("【未看洗版】已清除洗版记录（同时清空去重缓存与勾选清单）")
+            return self._api_response(True, "已清除洗版记录，并同步清空勾选清单与去重缓存；"
+                                            "已创建的订阅不受影响")
         except Exception as e:
             logger.error(f"【未看洗版】清除历史失败：{e}")
             return self._api_response(False, str(e))
@@ -286,15 +306,60 @@ class EmbyUnwatchedWash(_PluginBase):
     def delete_history(self, key: str) -> Dict[str, Any]:
         """
         API 端点：按唯一 key 删除单条洗版历史记录（GET），供详情页卡片右上角按钮调用。
+
+        与勾选清单联动（详见 `_remove_history_by_tid` 的说明）：
+        删的是影视的**全部**记录（剧集有多季多条），并同步
+        ① 取消它在清单里的勾选；② 清掉它的去重缓存，让下次运行能重新提交。
+        已创建的 MoviePilot 订阅不会被删除。
         """
         try:
             history = self.get_data('history') or []
-            remain = [item for item in history if str(item.get('key')) != str(key)]
-            if len(remain) == len(history):
+            target = next((h for h in history if str(h.get('key')) == str(key)), None)
+            if target is None:
                 return self._api_response(False, "未找到对应的历史记录")
+
+            raw = target.get("tmdbid")
+            if raw is None:
+                raw = str(key).split(":")[0]
+            try:
+                tid = int(raw)
+            except (TypeError, ValueError):
+                tid = None
+
+            if tid is None:
+                # 拿不到 tmdbid 时退化为只删这一条，不做联动
+                remain = [h for h in history if str(h.get('key')) != str(key)]
+                self.save_data('history', remain)
+                logger.info(f"【未看洗版】已删除单条洗版历史（key={key}，无 tmdbid 未联动清单）")
+                return self._api_response(True, "已删除该条历史")
+
+            name = target.get('title') or str(tid)
+            # 同步取消勾选（调用方负责提示文案，这里只落数据）
+            current = self._normalized_selected()
+            unselected = tid in current
+            if unselected:
+                self._persist_selected([x for x in current if x != tid])
+            else:
+                # 可能此前被「配置自愈」补回勾选前置了标记，这里也用不上
+                self._selection_dirty = False
+
+            # 删掉该影视的全部记录 + 去重缓存（剧集多季一起删，避免删一条留一条）
+            remain = [h for h in history if int(h.get("tmdbid") or -1) != tid]
+            removed = len(history) - len(remain)
             self.save_data('history', remain)
-            logger.info(f"【未看洗版】已删除单条洗版历史（key={key}）")
-            return self._api_response(True, "已删除该条历史")
+            killed = self._remove_cache_keys_for_tid(tid)
+
+            tip = f"已删除「{name}」的 {removed} 条洗版记录"
+            if unselected:
+                tip += "，并已在清单中取消勾选"
+            if killed:
+                tip += "；去重缓存已清除，下次运行可重新提交"
+            tip += "。已创建的订阅不受影响。"
+            logger.info(f"【未看洗版】删除洗版记录：{name}（记录 {removed} 条 / 清单联动="
+                        f"{'是' if unselected else '否'} / 缓存 {killed} 条）")
+            return self._api_response(True, tip, {"history_removed": removed,
+                                                  "unselected": unselected,
+                                                  "cache_removed": killed})
         except Exception as e:
             logger.error(f"【未看洗版】删除单条历史失败：{e}")
             return self._api_response(False, str(e))
@@ -399,6 +464,120 @@ class EmbyUnwatchedWash(_PluginBase):
         except Exception as e:
             logger.warning(f"【未看洗版】记住清单页码失败：{e}")
 
+    # ------------------------------------------------------------------
+    # 「洗版记录（history）」与「勾选清单（selected_items）」的一致性
+    # ------------------------------------------------------------------
+    # 设计：洗版记录 = 插件**已为该影视提交过洗版订阅**的事实，是唯一事实来源；
+    #       勾选清单 = 「已提交过」∪「手动选中但还没跑」的并集。
+    # 因此两侧必须联动，否则会出现「历史里没有、勾选里还亮着」或反之的错位：
+    #   · 取消勾选影视 X → 说明用户认为 X 不该再洗版 → 同时删掉 X 的洗版记录
+    #   · 删除影视 X 的记录 → 说明用户认为 X 从没洗过 → 同时取消 X 的勾选，
+    #     并清掉去重缓存里的 X，让下次运行能真正重新提交
+    # 取消勾选/删记录都**不会删除已创建的 MoviePilot 订阅**（记录只是本地留痕），
+    # 需要撤订阅得去 MoviePilot 订阅页手动删。
+    @staticmethod
+    def _history_tids(history: List[dict]) -> set:
+        """取洗版记录覆盖的 tmdbid 集合（记录里 tmdbid 缺失时用 key 兜底）。"""
+        tids: set = set()
+        for item in (history or []):
+            raw = item.get("tmdbid")
+            if raw is None:
+                # key 形如 "270844"（电影）或 "270844:S1"（剧集）
+                raw = str(item.get("key") or "").split(":")[0]
+            try:
+                tids.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return tids
+
+    def _remove_history_by_tid(self, tid: int) -> int:
+        """
+        删除某 tmdbid 的**全部**洗版记录（剧集会有多季多条），返回删除条数。
+        同时从去重缓存里移除对应的 key —— 否则「删了记录却仍被缓存拦住」，
+        下次运行依旧不会重新提交，用户会认为删除没生效。
+        """
+        history = self.get_data('history') or []
+        remain = [h for h in history if int(h.get("tmdbid") or -1) != int(tid)]
+        removed = len(history) - len(remain)
+        if removed:
+            try:
+                self.save_data('history', remain)
+            except Exception as e:
+                logger.error(f"【未看洗版】删除洗版记录失败：{e}")
+                return 0
+        killed = self._remove_cache_keys_for_tid(tid)
+        if removed or killed:
+            name = self._title_of(tid) or str(tid)
+            logger.info(f"【未看洗版】取消勾选已同步删除洗版记录：{name}"
+                        f"（记录 {removed} 条 / 缓存 {killed} 条）")
+        return removed
+
+    def _remove_cache_keys_for_tid(self, tid: int) -> int:
+        """
+        从去重缓存中移除该 tmdbid 的所有键（电影 key=`tid`；剧集 key=`tid:S{n}`）。
+        """
+        try:
+            if not self._cache_path or not self._cache_path.exists():
+                return 0
+            keys = [c for c in self._cache_path.read_text().split("\n") if c]
+            prefix = f"{int(tid)}:"
+            remain = [k for k in keys if k != str(int(tid)) and not k.startswith(prefix)]
+            if len(remain) == len(keys):
+                return 0
+            self._cache_path.write_text("\n".join(remain))
+            return len(keys) - len(remain)
+        except Exception as e:
+            logger.warning(f"【未看洗版】清理去重缓存失败（tid={tid}）：{e}")
+            return 0
+
+    def _clear_history_and_cache(self) -> None:
+        """
+        同时清空洗版记录与去重缓存（供「清理勾选」使用）。
+        两者都是「已处理」的凭据，必须整体清掉，否则会一边说没记录、一边又被缓存拦住。
+        """
+        try:
+            self.save_data('history', [])
+        except Exception as e:
+            logger.error(f"【未看洗版】清空洗版记录失败：{e}")
+        try:
+            if self._cache_path and self._cache_path.exists():
+                self._cache_path.write_text("")
+        except Exception as e:
+            logger.warning(f"【未看洗版】清空去重缓存失败：{e}")
+
+    def _repair_selection(self) -> None:
+        """
+        配置自愈：勾选清单里凡是有洗版记录的项，都自动补回勾选。
+
+        `selected_items` 为空有特殊含义 ——「不勾选任何项 = 处理全部未观看」，
+        所以只要存在洗版记录，勾选清单就**不能**为空，否则会被当成「全量模式」，
+        把整个媒体库重新洗一遍。旧版本删历史不联动勾选，正是踩了这个坑。
+        """
+        try:
+            history = self.get_data('history') or []
+        except Exception as e:
+            logger.warning(f"【未看洗版】配置自愈时读取洗版记录失败：{e}")
+            return
+        recorded = self._history_tids(history)
+        if not recorded:
+            return
+        current = set(self._normalized_selected())
+        missing = sorted(recorded - current)
+        if not missing:
+            return
+        merged = self._normalized_selected()
+        for tid in missing:
+            if tid not in merged:
+                merged.append(tid)
+        try:
+            self._persist_selected(merged)
+            logger.info(f"【未看洗版】配置自愈：洗版记录中有 {len(missing)} 部未在勾选清单里，"
+                        f"已自动补回勾选（避免被当成『处理全部未观看』）")
+        except Exception as e:
+            # 只读路径（如打开详情页）写配置失败时留标记，交给下次 sync() 处理
+            self._selection_dirty = True
+            logger.warning(f"【未看洗版】配置自愈写回失败，将在下次运行时重试：{e}")
+
     def select_set(self, value: int = 0, on: int = 1, page: int = 1) -> Dict[str, Any]:
         """
         API 端点：勾选 / 取消勾选单个未观看影视（GET）。
@@ -416,15 +595,23 @@ class EmbyUnwatchedWash(_PluginBase):
                 if tid not in current:
                     current.append(tid)
                 act = "已加入洗版清单"
+                removed = 0
             else:
                 current = [x for x in current if x != tid]
                 act = "已移出洗版清单"
+                # 取消勾选 = 用户认为这部不该再洗版 → 同步删掉它的洗版记录与去重缓存，
+                # 否则会出现「记录里还有、清单里已取消」的错位。
+                removed = self._remove_history_by_tid(tid)
             self._persist_selected(current)
             self._save_page(page)
             name = self._title_of(tid) or str(tid)
-            logger.info(f"【未看洗版】{act}：{name}（当前共 {len(current)} 部）")
-            return self._api_response(True, f"{act}：{name}（当前共 {len(current)} 部）",
-                                      {"count": len(current), "value": tid, "on": int(on)})
+            tip = f"{act}：{name}（当前共 {len(current)} 部）"
+            if removed:
+                tip += f"，已同步删除 {removed} 条洗版记录（已创建的订阅不受影响）"
+            logger.info(f"【未看洗版】{tip}")
+            return self._api_response(True, tip,
+                                      {"count": len(current), "value": tid,
+                                       "on": int(on), "history_removed": removed})
         except Exception as e:
             logger.error(f"【未看洗版】更新洗版清单失败：{e}")
             return self._api_response(False, str(e))
@@ -443,10 +630,13 @@ class EmbyUnwatchedWash(_PluginBase):
         try:
             current = self._normalized_selected()
             if mode == "clear_all":
+                # 清空勾选时一并清掉记录与缓存：否则下一次运行会把全部未观看按
+                # 「全量模式」重新洗一遍（记录里的 key 已被清、缓存也没了）。
+                self._clear_history_and_cache()
                 self._persist_selected([])
                 self._save_page(page)
-                logger.info("【未看洗版】已清空洗版清单，恢复处理全部未观看")
-                return self._api_response(True, "已清空洗版清单，恢复『处理全部未观看』",
+                logger.info("【未看洗版】已清空洗版清单与洗版记录，恢复处理全部未观看")
+                return self._api_response(True, "已清空洗版清单与洗版记录，恢复『处理全部未观看』",
                                           {"count": 0})
             page_items, _, _, _ = self._page_info(self._cached_options_snapshot(), page)
             page_ids: List[int] = []
@@ -461,6 +651,9 @@ class EmbyUnwatchedWash(_PluginBase):
             elif mode == "page_none":
                 merged = [x for x in current if x not in page_ids]
                 msg = f"已取消本页勾选（当前共 {len(merged)} 部）"
+                # 与单条取消一致：同步删掉本页的洗版记录与去重缓存
+                for tid in page_ids:
+                    self._remove_history_by_tid(tid)
             else:
                 return self._api_response(False, f"未知操作：{mode}")
             self._persist_selected(merged)
@@ -970,8 +1163,8 @@ class EmbyUnwatchedWash(_PluginBase):
                              + (f"（{'、'.join(hidden_libs)}）" if hidden_libs else ''))
                             if hidden_count else '媒体库中未观看的影视',
                             'primary', 'mdi-movie-open-outline'),
-            self._stat_card('洗版历史', f"{len(history)} 条",
-                            '本地最多保留 500 条', 'success', 'mdi-history'),
+            self._stat_card('洗版记录', f"{len(history)} 条",
+                            '删除一条会同步取消其勾选', 'success', 'mdi-history'),
             self._stat_card('洗版范围', '电影 + 剧集' if self._include_series else '仅电影',
                             ('剧集按未观看集洗版' if self._series_episode_level else '剧集按整部洗版')
                             if self._include_series else '不处理剧集',
@@ -1020,6 +1213,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 'prepend-icon': 'mdi-format-list-checks',
                 'text': f'已勾选 {len(selected)} 部影视：运行时只对这批创建洗版订阅，'
                         f'其余未观看内容会跳过；在下方清单点「清空全部」可恢复处理全部未观看。'
+                        f'已提交过订阅的会以「复用」方式跳过，不再重复创建。'
                         + extra}})
         if self._exclude_libraries or self._exclude_keywords:
             rules = []
@@ -1033,14 +1227,24 @@ class EmbyUnwatchedWash(_PluginBase):
                 'prepend-icon': 'mdi-filter-off-outline',
                 'text': '；'.join(rules) + tail}})
 
+        # 两个区域的关系容易混淆，常驻一条说明（这两处数据必须始终一致）
+        contents.append({'component': 'VAlert', 'props': {
+            'type': 'info', 'variant': 'tonal', 'density': 'compact', 'class': 'mb-2',
+            'prepend-icon': 'mdi-link-variant',
+            'text': '「清单勾选」与「洗版记录」已联动：勾选 = 已提交过洗版订阅；'
+                    '取消勾选会同步删除它的洗版记录，删除记录也会同步取消勾选；'
+                    '两者都只影响插件本身的清单/留痕，不会删除 MoviePilot 里已创建的订阅。'}})
+
         # ---------- 3. 媒体库未观看清单（可勾选，点击即保存） ----------
         contents.append(self._section_title(
-            '媒体库未观看清单', '点条目即勾选并立即保存 · 未勾选任何项则处理全部未观看'))
+            '媒体库未观看清单',
+            '点条目即勾选并立即保存 · 未勾选任何项则处理全部未观看 · 取消勾选会一并删除其洗版记录'))
         contents.append(self._unwatched_card(options, page=self._saved_page()))
 
         # ---------- 4. 洗版历史 ----------
         contents.append(self._section_title(
-            '洗版历史', f"共 {len(history)} 条 · 按时间倒序 · 右上角可删除单条"))
+            '洗版记录',
+            f"共 {len(history)} 条 · 按时间倒序 · 删除一条会同步取消上方勾选并清除去重缓存"))
         if history:
             contents.append(self._grid([self._history_card(item) for item in history[:50]]))
             if len(history) > 50:
@@ -1056,7 +1260,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 'content': [{
                     'component': 'VCardText',
                     'props': {'class': 'text-center text-caption text-medium-emphasis py-6'},
-                    'text': '暂无洗版历史，运行一次未看洗版后这里会出现记录。'
+                    'text': '暂无可显示的洗版记录。运行一次未看洗版，成功提交订阅的影视会出现在这里。'
                 }]
             })
 
@@ -1070,7 +1274,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 {'component': 'VCardText', 'props': {'class': 'text-caption'},
                  'text': '清除洗版缓存：重置已处理记录，下次运行会重新对这批影视创建订阅。'},
                 {'component': 'VCardText', 'props': {'class': 'text-caption pt-0'},
-                 'text': '清除历史记录：仅清空上方列表，已创建的订阅不受影响。'},
+                 'text': '清除历史记录：清空上方列表与去重缓存，并取消全部勾选（恢复处理全部未观看）；已创建的订阅不受影响。'},
                 {'component': 'VCardActions', 'content': [
                     {'component': 'VBtn',
                      'props': {'color': 'warning', 'variant': 'tonal', 'size': 'small',
@@ -1121,6 +1325,7 @@ class EmbyUnwatchedWash(_PluginBase):
         washed_count = 0
         skipped_count = 0
         failed_count = 0
+        reused_count = 0
 
         # 获取锁
         _is_lock: bool = lock.acquire(timeout=60)
@@ -1154,11 +1359,26 @@ class EmbyUnwatchedWash(_PluginBase):
                     logger.info("【未看洗版】Dry-run 结束（仅列出以上条目，未实际创建订阅）")
                 return
             # ---------- 正常模式 ----------
-            # 读取缓存
+            # 配置自愈兜底：勾选清单必须覆盖全部洗版记录，否则空清单会被当成
+            # 「处理全部未观看」把整个媒体库重洗一遍。详情页那次修复若因只读写库
+            # 失败，会在这里补上。
+            if self._selection_dirty:
+                self._repair_selection()
+                self._selection_dirty = False
+
+            # 读取历史记录。注意：不再以缓存文件为去重依据（它可能被旧版本清空过），
+            # 而是「缓存文件 ∪ 洗版记录」——记录里存在的 key 一定不该重复提交。
+            history = self.get_data('history') or []
             caches = self._cache_path.read_text().split("\n") if self._cache_path.exists() else []
             caches = [c for c in caches if c]
-            # 读取历史记录
-            history = self.get_data('history') or []
+            recorded_keys = [str(h.get("key")) for h in history if h.get("key")]
+            self._recorded = set(recorded_keys)          # 供 _wash_one 判定是否「真新建」
+            for k in recorded_keys:
+                if k not in caches:
+                    caches.append(k)
+            if recorded_keys:
+                logger.info(f"【未看洗版】去重依据：洗版记录 {len(recorded_keys)} 条"
+                            f"（与缓存取并集，记录内的条目不会重复提交）")
 
             # 手动选择模式
             selected = [str(x) for x in (self._selected_items or [])]
@@ -1189,6 +1409,8 @@ class EmbyUnwatchedWash(_PluginBase):
                         status = self._process_task(task, caches, history)
                         if status == "added":
                             washed_count += 1
+                        elif status == "reused":
+                            reused_count += 1
                         elif status == "failed":
                             failed_count += 1
                         elif status == "skipped":
@@ -1234,6 +1456,8 @@ class EmbyUnwatchedWash(_PluginBase):
                     status = self._process_task(task, caches, history)
                     if status == "added":
                         washed_count += 1
+                    elif status == "reused":
+                        reused_count += 1
                     elif status == "failed":
                         failed_count += 1
                     elif status == "skipped":
@@ -1241,8 +1465,8 @@ class EmbyUnwatchedWash(_PluginBase):
 
             # 任务完成汇总
             logger.info(f"【未看洗版】========== 扫描完成 ========== | "
-                        f"新建订阅 {washed_count} 个 | 失败 {failed_count} 个 | "
-                        f"跳过（已处理/剧集未开）{skipped_count} 个")
+                        f"新建订阅 {washed_count} 个 | 复用已有 {reused_count} 个 | "
+                        f"失败 {failed_count} 个 | 跳过（已处理/剧集未开）{skipped_count} 个")
             # 保存历史记录
             self.save_data('history', history)
             # 保存缓存
@@ -1252,12 +1476,14 @@ class EmbyUnwatchedWash(_PluginBase):
                 if failed_count == 0:
                     self.post_message(
                         title="『未看洗版』任务完成",
-                        text=f"本次处理 {washed_count} 个未观看影视（跳过 {skipped_count} 个），已创建洗版订阅。"
+                        text=f"本次新建洗版订阅 {washed_count} 个"
+                             f"（复用已有 {reused_count} 个，跳过 {skipped_count} 个）。"
                     )
                 else:
                     self.post_message(
                         title="『未看洗版』部分失败",
-                        text=f"成功 {washed_count} 个，失败 {failed_count} 个（跳过 {skipped_count} 个）。"
+                        text=f"新建 {washed_count} 个（复用 {reused_count} 个），失败 {failed_count} 个"
+                             f"（跳过 {skipped_count} 个）。"
                               f"失败通常因系统未开启『允许洗版』、缺少下载器/订阅配置或媒体识别失败，请检查 MoviePilot 订阅设置与日志。"
                     )
         except Exception as e:
@@ -1269,7 +1495,10 @@ class EmbyUnwatchedWash(_PluginBase):
     def _process_task(self, task: dict, caches: List[str], history: List[dict]) -> str:
         """
         处理单个洗版任务：命中缓存则跳过 → 识别媒体 → 创建洗版订阅。
-        返回：added（已添加）/ failed（失败）/ skipped（缓存跳过）
+        返回：added（真新建订阅）/ reused（复用已有订阅）/ failed（失败）/ skipped（缓存跳过）
+
+        注意 caches 不只来自缓存文件，运行开始时已把洗版记录的 key 并入，
+        所以「记录里有的」同样会被跳过，不会重复提交。
         """
         tmdb_id = task.get("tmdb_id")
         season = task.get("season")
@@ -1667,7 +1896,7 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         对单个媒体创建洗版订阅，并写入缓存与历史。
         season/start_episode 用于剧集按季、按未观看集定位开始集数。
-        返回：added（已添加）/ skipped（被类型开关跳过）/ failed（创建失败）
+        返回：added（真新建）/ reused（复用已有订阅）/ skipped（被类型开关跳过）/ failed（创建失败）
         """
         # 前置校验：剧集开关
         if mediainfo.type == MediaType.TV and not self._include_series:
@@ -1721,21 +1950,28 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.warning(f"【未看洗版】创建洗版订阅失败：{mediainfo.title} ({mediainfo.year}) - {msg}")
             return "failed"
 
+        # 「新建」还是「复用已有订阅」：订阅接口对已存在的订阅同样返回 ID，
+        # 只看 sid 会把复用也计成新建（历史/订阅表对数时容易误判，见 v1.26）。
+        _key = cache_key or (str(tid_num) if tid_num else str(mediainfo.tmdb_id))
+        is_new = _key not in (getattr(self, '_recorded', set()) or set())
+
         # 订阅创建成功
         _extra_log = ""
         if season is not None:
             _extra_log += f" 第{season}季"
         if start_episode is not None:
             _extra_log += f" 开始集数={start_episode}"
-        logger.info(f"【未看洗版】已创建洗版订阅：{mediainfo.title} ({mediainfo.year}) "
-                    f"[{mediainfo.type.value}]{_extra_log}")
+        logger.info(f"【未看洗版】{'已创建洗版订阅' if is_new else '复用已有洗版订阅'}："
+                    f"{mediainfo.title} ({mediainfo.year})[{mediainfo.type.value}]{_extra_log}")
 
         # 加入缓存（电影按 tmdbid；剧集按 tmdbid+季，避免同一季重复订阅）
         tid = str(tid_num) if tid_num else str(mediainfo.tmdb_id)
         key = cache_key or tid
         if key not in caches:
             caches.append(key)
-        # 存储历史记录（带上限，避免无限增长）
+        # 存储历史记录（带上限，避免无限增长）。
+        # 自愈入口已把记录里的 key 并入去重集合，所以走到这里通常确实是新条目；
+        # 仍保留 key 去重判断，避免同一轮里重复 append。
         if key not in [h.get("key") for h in history]:
             history.append({
                 "title": mediainfo.title,
@@ -1753,7 +1989,9 @@ class EmbyUnwatchedWash(_PluginBase):
             if len(history) > 500:
                 history.sort(key=lambda x: x.get("time", ""), reverse=True)
                 del history[500:]
-        return "added"
+        # 返回值区分「真新建」（汇总里才计为新建订阅）与「复用已有订阅」，
+        # 两者都写历史，但复用不该虚报成新建（对数以 subscribe 表为准）。
+        return "added" if is_new else "reused"
 
     def jellyfin_get_items(self, instance=None) -> List[dict]:
         """拉取 Jellyfin 未观看条目；同样按媒体库逐个拉取并打上 LibraryName（理由见 emby_get_items）。"""
