@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.30"
+    plugin_version = "1.31"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -584,14 +584,24 @@ class EmbyUnwatchedWash(_PluginBase):
 
         传「期望状态」（on=1 勾选、on=0 取消）而不是「翻转」：这样即使前端把事件
         触发两次，结果也一致，不会把勾选弄反。
+
+        参数校验：value 必须是正整数 tmdbid（0/负数/非数字一律拒绝）；on 只认 1，
+        其余值一律按 0（取消）处理，避免非法值把状态弄成第三种。
         """
         try:
             tid = int(value)
         except (TypeError, ValueError):
             return self._api_response(False, "无效的影视 ID")
+        # tmdbid 必为正整数：0 / 负数都是脏参数（旧版会照单全收写进清单，造成幽灵条目）
+        if tid <= 0:
+            return self._api_response(False, f"无效的影视 ID：{tid}")
+        try:
+            want_on = 1 if int(on) == 1 else 0
+        except (TypeError, ValueError):
+            return self._api_response(False, f"无效的勾选状态：{on}")
         try:
             current = self._normalized_selected()
-            if int(on) == 1:
+            if want_on == 1:
                 if tid not in current:
                     current.append(tid)
                 act = "已加入洗版清单"
@@ -611,7 +621,7 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.info(f"【未看洗版】{tip}")
             return self._api_response(True, tip,
                                       {"count": len(current), "value": tid,
-                                       "on": int(on), "history_removed": removed})
+                                       "on": want_on, "history_removed": removed})
         except Exception as e:
             logger.error(f"【未看洗版】更新洗版清单失败：{e}")
             return self._api_response(False, str(e))
@@ -1299,10 +1309,10 @@ class EmbyUnwatchedWash(_PluginBase):
 
             if selected:
                 logger.info(f"【未看洗版】运行模式：手动选择（指定 {len(selected)} 个 tmdbid 洗版）")
-                # 开启剧集集粒度时，读取媒体库以定位所选剧集「未观看的集」
+                # 开启剧集集粒度时，读取媒体库以定位所选剧集「未观看的集」（只算勾选的 tmdbid）
                 plan_by_tmdb: Dict[str, List[dict]] = {}
                 if self._include_series and self._series_episode_level:
-                    plan_by_tmdb = self._plan_by_tmdb()
+                    plan_by_tmdb = self._plan_by_tmdb(wanted=selected)
                 # 手动模式同样受 limit 保护（避免一次勾选几百部直接爆订阅）
                 limit = self._limit if isinstance(self._limit, int) and self._limit > 0 else 0
                 for tid in selected:
@@ -1452,10 +1462,10 @@ class EmbyUnwatchedWash(_PluginBase):
         try:
             selected = [str(x) for x in (self._selected_items or [])]
             if selected:
-                # 手动模式：读取媒体库定位剧集未观看的季/集
+                # 手动模式：读取媒体库定位剧集未观看的季/集（只算被勾选的，别全库建任务）
                 plan_by_tmdb: Dict[str, List[dict]] = {}
                 if self._include_series and self._series_episode_level:
-                    plan_by_tmdb = self._plan_by_tmdb()
+                    plan_by_tmdb = self._plan_by_tmdb(wanted=selected)
                 plan_items: List[dict] = []
                 for tid in selected:
                     tasks = plan_by_tmdb.get(str(tid)) or [{
@@ -1490,10 +1500,15 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.error(f"【未看洗版】构建计划失败：{e}\n{traceback.format_exc()}")
             return []
 
-    def _plan_by_tmdb(self) -> Dict[str, List[dict]]:
+    def _plan_by_tmdb(self, wanted: Optional[List[str]] = None) -> Dict[str, List[dict]]:
         """
         读取媒体库未观看条目并按 tmdbid 归组（供手动选择模式定位剧集未观看的季/集）。
         读取失败时返回空字典，调用方会退化为「整部洗版」。
+
+        `wanted` 是本次真正要处理的 tmdbid 集合（字符串）。传入时只保留这些 tmdbid 的任务：
+        手动模式往往只勾 1~2 部，若仍对全库建任务，不仅白拉一遍库（本机 1000+ 条），
+        还会把不相关的「剧集任务：…」打进日志，让人误以为要洗整库。传 None 表示不过滤
+        （供 `_build_plan` 的完整预览使用）。
         """
         result: Dict[str, List[dict]] = {}
         try:
@@ -1506,7 +1521,8 @@ class EmbyUnwatchedWash(_PluginBase):
                         raw_items.extend(self.emby_get_items(inst) or [])
                 except Exception as e:
                     logger.error(f"【未看洗版】读取媒体服务器 {name}({stype}) 未观看列表失败：{e}")
-            for task in self._build_wash_tasks(raw_items):
+            wanted_set = {str(x) for x in wanted} if wanted else None
+            for task in self._build_wash_tasks(raw_items, wanted=wanted_set):
                 result.setdefault(str(task.get("tmdb_id")), []).append(task)
         except Exception as e:
             logger.warning(f"【未看洗版】读取媒体库以定位未观看集失败（将按整部洗版）：{e}")
@@ -1701,7 +1717,7 @@ class EmbyUnwatchedWash(_PluginBase):
             return parts
         return []
 
-    def _build_wash_tasks(self, items: List[dict]) -> List[dict]:
+    def _build_wash_tasks(self, items: List[dict], wanted: Optional[set] = None) -> List[dict]:
         """
         把媒体服务器返回的未观看条目转换成洗版任务列表：
         - 电影：整部洗版（season=None）
@@ -1709,10 +1725,17 @@ class EmbyUnwatchedWash(_PluginBase):
           （已观看的集不会被洗版，MoviePilot 会从该集开始搜索/下载）
         - 剧集（关闭集粒度，或拿不到集明细）：整剧洗版（season=None）
         若配置了「排除媒体库 / 排除关键字」，命中者直接跳过。
+
+        `wanted`（字符串 tmdbid 集合）：传入时只产出这些 tmdbid 的任务，并抑制逐条
+        「剧集任务：…」日志（手动模式只勾几部时，日志不该刷出整库的剧集）。
         """
         movies: Dict[int, dict] = {}
         series_meta: Dict[str, dict] = {}
         episodes: Dict[str, set] = {}
+
+        def _keep(tid) -> bool:
+            """wanted 为 None 时全留；否则只留命中的 tmdbid。"""
+            return True if wanted is None else str(tid) in wanted
 
         for data in items or []:
             if not isinstance(data, dict):
@@ -1723,18 +1746,24 @@ class EmbyUnwatchedWash(_PluginBase):
             _type = data.get("Type")
             if _type == "Movie":
                 tid = self._tmdbid_of_item(data)
-                if tid and tid not in movies:
+                if tid and tid not in movies and _keep(tid):
                     movies[tid] = {"name": data.get("Name"), "year": data.get("ProductionYear")}
             elif _type == "Series":
+                tid = self._tmdbid_of_item(data)
+                if not _keep(tid):
+                    continue
                 sid = data.get("Id")
                 if sid:
                     series_meta[sid] = {
                         "name": data.get("Name"),
                         "year": data.get("ProductionYear"),
-                        "tmdb_id": self._tmdbid_of_item(data),
+                        "tmdb_id": tid,
                     }
             elif _type == "Episode":
                 # 单集：SeriesId 归属剧集 + 季号(ParentIndexNumber) + 集号(IndexNumber)
+                tid = self._tmdbid_of_item(data)
+                if not _keep(tid):
+                    continue
                 sid = data.get("SeriesId")
                 season = data.get("ParentIndexNumber")
                 ep = data.get("IndexNumber")
@@ -1786,8 +1815,11 @@ class EmbyUnwatchedWash(_PluginBase):
                         "start_episode": start_ep,
                         "unplayed": eps_list,
                     })
-                    logger.info(f"【未看洗版】剧集任务：{meta.get('name')} 第{season}季 未观看 {len(eps_list)} 集"
-                                f"（{eps_list[0]}~{eps_list[-1]}）→ 开始集数={start_ep}")
+                    # wanted 过滤时这是「辅助扫描」的产物，真正的执行日志由 sync 逐条打印，
+                    # 这里再打一遍会让人误以为要洗整库的剧集。
+                    if wanted is None:
+                        logger.info(f"【未看洗版】剧集任务：{meta.get('name')} 第{season}季 未观看 {len(eps_list)} 集"
+                                    f"（{eps_list[0]}~{eps_list[-1]}）→ 开始集数={start_ep}")
 
         # 未拿到集明细的剧集 / 关闭集粒度 → 整剧洗版
         for sid, meta in series_meta.items():
@@ -2165,8 +2197,10 @@ class EmbyUnwatchedWash(_PluginBase):
                     seen.add(item_name)
                     year = it.get('ProductionYear') or ''
                     typelabel = '电影' if t == 'Movie' else '剧集'
+                    # 必须过 _clean_title：Emby 条目的 ProductionYear 常为空，
+                    # 直接拼会得到「名称 () [剧集]」这种空括号脏标题，污染 /medias 接口与设置页下拉框。
                     options.append({
-                        'title': f"{item_name} ({year}) [{typelabel}]",
+                        'title': self._clean_title(f"{item_name} ({year}) [{typelabel}]"),
                         'value': tid,
                     })
                     if len(options) >= cap:
