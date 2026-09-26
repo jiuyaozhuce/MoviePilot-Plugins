@@ -3,7 +3,7 @@
     "name": "Emby未看洗版",
     "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
     "labels": "媒体库",
-    "version": "1.33",
+    "version": "1.34",
     "icon": "icon.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.34": "三项优化：① 运行模式由两个布尔开关改为三态下拉「运行模式」——自动化洗版 / 手动选择（按清单勾选），语义互斥不再需要用户自己拼组合；旧 auto_full 布尔保留为读取兼容并等价迁移，升级前后行为不变。② 新增「首次全量不设上限」：自动化模式下若洗版记录为空（首次开跑），本次忽略单次上限一次，让整库一口气铺完，不必被 limit=5 拆成上百轮 cron（之后照旧受上限保护）。③ 跳过不再只有数字：运行日志列出跳过明细（前 30 条，含可读标签与 cache key），并新增「通知里附带跳过明细」开关，把去重命中的条目附进完成通知，用于回答「为什么这部没洗」",
       "v1.33": "新增「自动化洗版」开关（配置页 → 运行模式）：开启后忽略勾选清单，对全部（未排除的）媒体库未观看影视建洗版订阅，配合执行周期即可实现「新片入库后自动订阅」，无需手动勾选；关闭则退回按详情页清单手动选择。附带开关「自动化模式仍显示勾选清单」（默认关闭，界面更简洁）。优先级判定收敛到 _is_auto_full()：开关为真 > 清单非空 > 清单为空（旧兼容），并同步给 sync/_build_plan/get_page/_repair_selection 四处复用，保证界面显示与实际运行模式一致；自动化模式下跳过配置自愈（清单不参与运行，不应被凭空补勾选）",
       "v1.32": "修正插件详情页的作者信息：plugin_author 由上游 fork 残留的 forked-from-bestfilmversion(wlj) 改为 jiuyaozhuce，author_url 由上游 bestfilmversion 目录改为本仓库地址，与 package.v3.json 中的 author/project_url 对齐",
       "v1.31": "三处健壮性修复：/medias 标题空括号、select_set 参数校验、手动模式不再整库建任务",
