@@ -49,7 +49,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.36"
+    plugin_version = "1.37"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -99,7 +99,6 @@ class EmbyUnwatchedWash(_PluginBase):
     # 配置属性
     _enabled: bool = False
     _cron: str = ""
-    _notify: bool = False
     _only_once: bool = False
     _include_series: bool = True
     _selected_items: List[int] = []
@@ -119,8 +118,6 @@ class EmbyUnwatchedWash(_PluginBase):
     # 首次全量不设限：自动化模式下，若洗版记录为空（= 首次开跑），本次忽略 limit 一次，
     # 让「首次整库」能一口气铺完，不被单次上限拆成很多轮慢慢挪（之后照旧受 limit 保护）。
     _first_run_unlimited: bool = True
-    # 任务完成后是否把「跳过明细」附在通知里（去重命中的 key 清单）
-    _notify_skipped_detail: bool = False
     # ------------------------------------------------------------------
     # 已观看联动（v1.36）：洗版订阅建好后，媒体被标记为已观看时收缩/取消订阅
     # ------------------------------------------------------------------
@@ -144,7 +141,6 @@ class EmbyUnwatchedWash(_PluginBase):
         if config:
             self._enabled = config.get("enabled")
             self._cron = config.get("cron")
-            self._notify = config.get("notify")
             self._only_once = config.get("only_once")
             self._include_series = config.get("include_series")
             self._selected_items = config.get("selected_items") or []
@@ -156,7 +152,6 @@ class EmbyUnwatchedWash(_PluginBase):
             self._auto_full_show_picker = bool(config.get("auto_full_show_picker", False))
             # 首次全量不设限：默认 True（首次开跑一口气铺完）；老配置里没有该键时也取 True
             self._first_run_unlimited = bool(config.get("first_run_unlimited", True))
-            self._notify_skipped_detail = bool(config.get("notify_skipped_detail", False))
             # 已观看联动（v1.36）：默认关闭，避免误判把订阅删了
             self._cancel_watched = bool(config.get("cancel_watched", False))
             self._watched_check_servers = self._normalize_str_list(
@@ -184,14 +179,12 @@ class EmbyUnwatchedWash(_PluginBase):
             self.update_config({
                 "enabled": self._enabled,
                 "cron": self._cron,
-                "notify": self._notify,
                 "only_once": self._only_once,
                 "include_series": self._include_series,
                 "selected_items": self._selected_items,
                 "wash_scope": self._wash_scope,
                 "auto_full_show_picker": self._auto_full_show_picker,
                 "first_run_unlimited": self._first_run_unlimited,
-                "notify_skipped_detail": self._notify_skipped_detail,
                 "cancel_watched": self._cancel_watched,
                 "watched_check_servers": self._watched_check_servers,
                 "series_episode_level": self._series_episode_level,
@@ -488,14 +481,12 @@ class EmbyUnwatchedWash(_PluginBase):
         self.update_config({
             "enabled": self._enabled,
             "cron": self._cron,
-            "notify": self._notify,
             "only_once": False,
             "include_series": self._include_series,
             "selected_items": items,
             "wash_scope": self._wash_scope,
             "auto_full_show_picker": self._auto_full_show_picker,
             "first_run_unlimited": self._first_run_unlimited,
-            "notify_skipped_detail": self._notify_skipped_detail,
             "series_episode_level": self._series_episode_level,
             "limit": self._limit,
             "exclude_libraries": self._exclude_libraries,
@@ -884,7 +875,6 @@ class EmbyUnwatchedWash(_PluginBase):
                     # ---------- 1. 基础设置 ----------
                     section('基础设置'),
                     control('VSwitch', 'enabled', '启用插件', md=6),
-                    control('VSwitch', 'notify', '发送通知', md=6),
 
                     # ---------- 2. 执行计划 ----------
                     section('执行计划'),
@@ -957,15 +947,10 @@ class EmbyUnwatchedWash(_PluginBase):
                     control('VSwitch', 'only_once', '保存后立即运行一次', md=6,
                             hint='保存配置后立刻执行一次（不受启用开关管控），执行后自动关闭',
                             **{'persistent-hint': True}),
-                    control('VSwitch', 'notify_skipped_detail', '通知里附带跳过明细', md=6,
-                            hint='在完成通知里追加被跳过的条目（去重命中）。排「为什么这部没洗」时很有用，'
-                                 '但条目多时消息会很长',
-                            **{'persistent-hint': True}),
                 ]
             }]
         }], {
             "enabled": False,
-            "notify": False,
             "cron": "",
             "only_once": False,
             "include_series": True,
@@ -973,11 +958,10 @@ class EmbyUnwatchedWash(_PluginBase):
             # 「数据查看」页查看），此处保留键位以免历史配置读出异常。
             "selected_items": [],
             # 运行模式：默认「手动选择」—— 升级后行为与旧版一致，不会突然对全库建订阅。
-            # 首次全量不设限默认开启；跳过明细默认不进通知（避免长消息刷屏）。
+            # 首次全量不设限默认开启。
             "wash_scope": "manual",
             "auto_full_show_picker": False,
             "first_run_unlimited": True,
-            "notify_skipped_detail": False,
             # 已观看联动默认关闭：这是「删订阅」的动作，误判代价高，需用户显式开启
             "cancel_watched": False,
             "watched_check_servers": [],
@@ -1320,18 +1304,12 @@ class EmbyUnwatchedWash(_PluginBase):
                 'prepend-icon': 'mdi-alert-circle-outline',
                 'text': '暂未读取到未观看清单，请检查媒体服务器配置与连通性；下方历史记录不受影响。'}})
 
-        # ---------- 2. 自动化模式提示 / 媒体库未观看清单（可勾选，点击即保存） ----------
+        # ---------- 2. 媒体库未观看清单（可勾选，点击即保存） ----------
+        # 注：数据页不再展示「运行模式」提示模块（运行模式已在设置页配置，
+        # 详情页只保留可操作的清单与记录，避免与设置页信息重复）。
         auto_mode = self._is_auto_full()
-        if auto_mode and not self._auto_full_show_picker:
-            # 自动化模式：清单不参与运行，用提示卡代替，避免用户误以为还要手动勾选
-            contents.append(self._section_title('运行模式', '自动化洗版 · 清单不参与'))
-            contents.append({'component': 'VAlert', 'props': {
-                'type': 'success', 'variant': 'tonal', 'class': 'mb-3 text-subtitle-2',
-                'prepend-icon': 'mdi-auto-fix',
-                'text': '当前运行模式为「自动化洗版」：每次运行会对全部（未排除的）媒体库未观看影视建洗版订阅，'
-                        '无需手动勾选。新电影 / 剧集入库后，将在下一个执行周期自动处理。'
-                        '如需改回手动选择，请在「插件配置 → 运行模式」中改为「手动选择（按清单勾选）」。'}})
-        else:
+        show_picker = not (auto_mode and not self._auto_full_show_picker)
+        if show_picker:
             if auto_mode:
                 picker_hint = '自动化模式下清单可留空；勾选与否都不影响全量洗版结果，仅作临时补充之用'
             else:
@@ -1390,7 +1368,9 @@ class EmbyUnwatchedWash(_PluginBase):
             ]
         })
 
-        return contents
+        # 用 MoviePilot 官方 VContainer 包裹整页内容，使数据页宽度与设置页（get_form）
+        # 共用官方默认容器宽度，不再出现数据页过宽的情况；不写死任何 px 值。
+        return [{'component': 'VContainer', 'props': {'class': 'pa-0'}, 'content': contents}]
 
 
     def stop_service(self):
@@ -1608,35 +1588,6 @@ class EmbyUnwatchedWash(_PluginBase):
             self.save_data('history', history)
             # 保存缓存
             self._cache_path.write_text("\n".join(caches))
-            # 发送完成通知
-            if self._notify:
-                _extra = ""
-                if unlimited_first_run:
-                    _extra += f"（本次为首次全量，已忽略单次上限）"
-                if self._notify_skipped_detail and skipped_items:
-                    _detail = '\n'.join(f"· {it.get('label')}" for it in skipped_items[:20])
-                    _more = f"\n… 等共 {len(skipped_items)} 条" if len(skipped_items) > 20 else ""
-                    _extra += f"\n\n跳过明细（此前已处理）：\n{_detail}{_more}"
-                # 已观看联动结果（只在真的动了订阅时才提，避免每次都刷同一段话）
-                if watched_results and (watched_results.get("deleted") or watched_results.get("shrunk")):
-                    _lines = [f"· {t}" for t in (watched_results.get("details") or [])[:15]]
-                    _extra += (f"\n\n已观看联动：取消 {watched_results.get('deleted', 0)} 个，"
-                               f"收缩 {watched_results.get('shrunk', 0)} 个\n"
-                               + '\n'.join(_lines))
-                if failed_count == 0:
-                    self.post_message(
-                        title="『未看洗版』任务完成",
-                        text=f"本次新建洗版订阅 {washed_count} 个"
-                             f"（复用已有 {reused_count} 个，跳过 {skipped_count} 个）。"
-                             f"{_extra}"
-                    )
-                else:
-                    self.post_message(
-                        title="『未看洗版』部分失败",
-                        text=f"新建 {washed_count} 个（复用 {reused_count} 个），失败 {failed_count} 个"
-                             f"（跳过 {skipped_count} 个）。{_extra}"
-                              f"失败通常因系统未开启『允许洗版』、缺少下载器/订阅配置或媒体识别失败，请检查 MoviePilot 订阅设置与日志。"
-                    )
         except Exception as e:
             # 兜底：任何未捕获异常都要打出来，否则任务会像“卡住”一样静默结束（无任何完成日志）
             logger.error(f"【未看洗版】扫描过程发生未捕获异常：{e}\n{traceback.format_exc()}")

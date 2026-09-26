@@ -3,7 +3,7 @@
             "name": "Emby未看洗版",
             "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
             "labels": "媒体库",
-            "version": "1.36",
+            "version": "1.37",
             "icon": "icon.svg",
             "author": "jiuyaozhuce",
             "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
             "system_version": ">=3.0.0",
             "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
             "history": {
+                  "v1.37": "界面与通知精简：① 数据查看页不再展示「运行模式」提示模块（运行模式已在设置页配置，详情页只保留可操作的清单与记录，避免信息重复）；整页内容改用 MoviePilot 官方 VContainer 包裹，与设置页共用官方默认宽度容器，不再出现过宽；② 移除插件自有的「发送通知」完成摘要（含「通知里附带跳过明细」开关）——统一交给 MoviePilot 官方订阅通知渠道，避免与企业微信、Meow 等已配置的渠道重复发送（其他官方插件也不自行发双渠道通知）。删除了 _notify / _notify_skipped_detail 两个配置项与 sync() 里的 post_message 块",
                   "v1.36": "新增「已观看联动」（配置页 → 已观看联动，默认关闭）：订阅建好后用户追看，洗版订阅会跟着自动收拾。① 电影变为已观看 → 取消该洗版订阅并清掉本地留痕（记录＋去重缓存，否则下次重新想看会被缓存挡住）；② 电视剧则按集判断——已观看的集不再洗，把 start_episode 推进到第一个未观看集（与 v1.8 建订阅时的语义一致，priority.compute_lack_episode 的目标范围就是 range(start_episode, total+1)），该季/整剧看完则直接取消订阅；③ 只处理 username=未看洗版 的订阅，绝不动用户手动建的；集状态未知/服务器找不到该条目时一律不动（宁可漏收也不误删）。订阅读改删全部走 v3 组合根入口（subscription_repository / sync_subscription_mutation_scope / sync_subscription_delete_scope）；观看状态走 Emby /Shows/{id}/Episodes?UserId= 与 AnyProviderIdEquals=Tmdb.{id}。新增「观看状态核对服务器」多选，可指定用哪台服务器判定。附带 35 条离线单测（AST 结构回归 + 11 条订阅核对分支 + 配置守卫）",
                   "v1.35": "修复 v1.34 引入的回归：手动选择模式完全不执行 —— v1.34 把手动/自动化统一到 _is_auto_full() 后，sync() 里只保留了 if auto_mode 一条执行分支，手动模式会扫描完 0 条、清单里勾选的条目一个都不处理（实测日志：15:24:44 那次运行仅 7ms，「扫描完成 | 模式=手动选择 | 跳过 0 个」，勾选项被静默忽略）。现恢复 if not auto_mode: 手动分支（按清单遍历 + _plan_by_tmdb 定位未观看集 + limit 保护），自动化逻辑移入 else 分支，汇总/保存/通知保持在外层两种模式共用。新增 AST 结构回归测试，锁死「两条分支 + 分支外收尾」这一结构防止再次退化",
                   "v1.34": "三项优化：① 运行模式由两个布尔开关改为三态下拉「运行模式」——自动化洗版 / 手动选择（按清单勾选），语义互斥不再需要用户自己拼组合；旧 auto_full 布尔保留为读取兼容并等价迁移，升级前后行为不变。② 新增「首次全量不设上限」：自动化模式下若洗版记录为空（首次开跑），本次忽略单次上限一次，让整库一口气铺完，不必被 limit=5 拆成上百轮 cron（之后照旧受上限保护）。③ 跳过不再只有数字：运行日志列出跳过明细（前 30 条，含可读标签与 cache key），并新增「通知里附带跳过明细」开关，把去重命中的条目附进完成通知，用于回答「为什么这部没洗」",
