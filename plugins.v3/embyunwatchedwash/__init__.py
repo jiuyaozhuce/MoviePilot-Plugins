@@ -33,6 +33,10 @@ except ImportError:
 
 lock = RLock()
 
+# 洗版订阅的归属标记：本插件创建的所有订阅都以它作为 username。
+# 已观看联动只会动 username 等于这个值的订阅，绝不碰用户手动建的订阅。
+WASH_USERNAME = "未看洗版"
+
 # 详情页「媒体库未观看清单」每页条数。
 # 详情页的点击事件由官方渲染器处理：每次动作都会重载整页并回到顶部，因此这里
 # 用「服务端记住页码 + 固定每页条数」的方式，让勾选后仍停留在同一页、同一屏内。
@@ -45,7 +49,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.35"
+    plugin_version = "1.36"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -117,6 +121,17 @@ class EmbyUnwatchedWash(_PluginBase):
     _first_run_unlimited: bool = True
     # 任务完成后是否把「跳过明细」附在通知里（去重命中的 key 清单）
     _notify_skipped_detail: bool = False
+    # ------------------------------------------------------------------
+    # 已观看联动（v1.36）：洗版订阅建好后，媒体被标记为已观看时收缩/取消订阅
+    # ------------------------------------------------------------------
+    #   True  = 开启：电影已观看→取消订阅；剧集已观看的集→把订阅的开始集数推进到
+    #           第一个未观看集（整季都已观看→取消该季订阅）
+    #   False = 关闭（默认）：只订阅不管，行为与 v1.35 完全一致
+    # 之所以默认关闭：这是会「删订阅」的动作，误判代价高（媒体服务器没连上、
+    # 条目被重命名等都可能误判成「已观看」），必须先让用户显式打开。
+    _cancel_watched: bool = False
+    # 「已观看」判定所依据的媒体服务器；为空表示所有已配置且连接的服务器
+    _watched_check_servers: List[str] = []
 
     def init_plugin(self, config: dict = None):
         self._cache_path = settings.TEMP_PATH / "__emby_unwatched_wash_cache__"
@@ -142,6 +157,10 @@ class EmbyUnwatchedWash(_PluginBase):
             # 首次全量不设限：默认 True（首次开跑一口气铺完）；老配置里没有该键时也取 True
             self._first_run_unlimited = bool(config.get("first_run_unlimited", True))
             self._notify_skipped_detail = bool(config.get("notify_skipped_detail", False))
+            # 已观看联动（v1.36）：默认关闭，避免误判把订阅删了
+            self._cancel_watched = bool(config.get("cancel_watched", False))
+            self._watched_check_servers = self._normalize_str_list(
+                config.get("watched_check_servers", []))
             self._series_episode_level = config.get("series_episode_level")
             if self._series_episode_level is None:
                 self._series_episode_level = True
@@ -173,6 +192,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 "auto_full_show_picker": self._auto_full_show_picker,
                 "first_run_unlimited": self._first_run_unlimited,
                 "notify_skipped_detail": self._notify_skipped_detail,
+                "cancel_watched": self._cancel_watched,
+                "watched_check_servers": self._watched_check_servers,
                 "series_episode_level": self._series_episode_level,
                 "limit": self._limit,
                 "exclude_libraries": self._exclude_libraries,
@@ -807,6 +828,15 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.error(f"【未看洗版】读取媒体库列表失败，排除项将为空：{e}")
             library_items = []
 
+        # 媒体服务器清单供「观看状态核对服务器」选择。这里只列名称，不主动连服务器，
+        # 打不开也不该让配置页整个失败。
+        try:
+            server_names = self._get_server_names()
+        except Exception as e:
+            logger.error(f"【未看洗版】读取媒体服务器清单失败，核对服务器将为空：{e}")
+            server_names = []
+        server_items = [{'title': n, 'value': n} for n in server_names]
+
         def cell(content: dict, md: int = 12) -> dict:
             """把一个组件包进统一样式的栅格单元（md 断点下按 md 值自动分栏）。"""
             return {
@@ -894,6 +924,18 @@ class EmbyUnwatchedWash(_PluginBase):
                             hint='开启：按季订阅并把「开始集数」设为该季第一个未看的集（已看集不洗）；关闭：整部剧洗版',
                             **{'persistent-hint': True}),
 
+                    # ---------- 4b. 已观看联动 ----------
+                    section('已观看联动（订阅建好后追看）'),
+                    control('VSwitch', 'cancel_watched', '已观看即取消／收缩洗版订阅', md=6,
+                            hint='开启后，每轮运行会核对洗版订阅对应媒体的观看状态：电影变为已观看则该订阅被取消；'
+                                 '剧集则把订阅「开始集数」推进到第一个未观看的集（已看的集不再洗），'
+                                 '整季都已观看时取消该季订阅。默认关闭',
+                            **{'persistent-hint': True}),
+                    control('VSelect', 'watched_check_servers', '观看状态核对服务器', md=6,
+                            items=server_items, multiple=True, chips=True, clearable=True,
+                            hint='留空表示所有已配置并连接的媒体服务器；可只选其中一个，避免多服务器观看进度不一致时误判',
+                            **{'persistent-hint': True}),
+
                     # ---------- 5. 排除规则 ----------
                     section('排除规则'),
                     control('VSelect', 'exclude_libraries', '排除媒体库', md=6,
@@ -936,6 +978,9 @@ class EmbyUnwatchedWash(_PluginBase):
             "auto_full_show_picker": False,
             "first_run_unlimited": True,
             "notify_skipped_detail": False,
+            # 已观看联动默认关闭：这是「删订阅」的动作，误判代价高，需用户显式开启
+            "cancel_watched": False,
+            "watched_check_servers": [],
             "series_episode_level": True,
             "limit": 0,
             "exclude_libraries": [],
@@ -1533,10 +1578,24 @@ class EmbyUnwatchedWash(_PluginBase):
                     elif status == "skipped":
                         skipped_count += 1
 
+            # ---------- 已观看联动：核对洗版订阅，必要时取消／收缩 ----------
+            # 放在扫描之后：先把该建的订阅建完，再回头收拾「已经看过、不该再洗」的。
+            # 两种运行模式都要跑 —— 手动模式下用户同样会追看已经勾选过的片子。
+            watched_results: Optional[dict] = None
+            if self._cancel_watched:
+                watched_results = {"deleted": 0, "shrunk": 0, "failed": 0, "details": []}
+                self._apply_watched_policy(watched_results)
+
             # 任务完成汇总
             logger.info(f"【未看洗版】========== 扫描完成 ========== | 模式={self._scope_label()} | "
                         f"新建订阅 {washed_count} 个 | 复用已有 {reused_count} 个 | "
                         f"失败 {failed_count} 个 | 跳过（已处理/剧集未开）{skipped_count} 个")
+            if watched_results is not None:
+                logger.info(f"【未看洗版】已观看联动：取消订阅 {watched_results.get('deleted', 0)} 个 | "
+                            f"收缩订阅 {watched_results.get('shrunk', 0)} 个 | "
+                            f"失败 {watched_results.get('failed', 0)} 个")
+                for idx, txt in enumerate((watched_results.get('details') or [])[:30], 1):
+                    logger.info(f"  {idx}. {txt}")
             # 跳过明细：只在真有跳过时打，并把前若干条摊开 —— 「为什么这部没洗」只能靠它回答。
             if skipped_items:
                 logger.info(f"【未看洗版】跳过明细（{len(skipped_items)} 条，"
@@ -1558,6 +1617,12 @@ class EmbyUnwatchedWash(_PluginBase):
                     _detail = '\n'.join(f"· {it.get('label')}" for it in skipped_items[:20])
                     _more = f"\n… 等共 {len(skipped_items)} 条" if len(skipped_items) > 20 else ""
                     _extra += f"\n\n跳过明细（此前已处理）：\n{_detail}{_more}"
+                # 已观看联动结果（只在真的动了订阅时才提，避免每次都刷同一段话）
+                if watched_results and (watched_results.get("deleted") or watched_results.get("shrunk")):
+                    _lines = [f"· {t}" for t in (watched_results.get("details") or [])[:15]]
+                    _extra += (f"\n\n已观看联动：取消 {watched_results.get('deleted', 0)} 个，"
+                               f"收缩 {watched_results.get('shrunk', 0)} 个\n"
+                               + '\n'.join(_lines))
                 if failed_count == 0:
                     self.post_message(
                         title="『未看洗版』任务完成",
@@ -2041,7 +2106,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     title=mediainfo.title,
                     year=mediainfo.year,
                     best_version=True,
-                    username="未看洗版",
+                    username=WASH_USERNAME,
                     exist_ok=True,
                     media_source=MediaSource.TMDB,
                     media_id=str(tid_num),
@@ -2054,7 +2119,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     year=mediainfo.year,
                     tmdbid=tid_num,
                     best_version=True,
-                    username="未看洗版",
+                    username=WASH_USERNAME,
                     exist_ok=True,
                     **extra,
                 )
@@ -2295,6 +2360,536 @@ class EmbyUnwatchedWash(_PluginBase):
             except Exception as e:
                 logger.error(f"【未看洗版】处理媒体服务器 {name} 失败：{e}")
         return result
+
+    def _get_server_names(self) -> List[str]:
+        """
+        只取媒体服务器**名称**，不碰实例、不连服务器。
+
+        供配置页的「观看状态核对服务器」下拉使用：配置页必须能打开，
+        即使某台服务器当前连不上也不该让整个 get_form 失败。
+        """
+        names: List[str] = []
+        try:
+            services = MediaServerHelper().get_services()
+        except Exception:
+            # v3 的 get_services 依赖运行模块实例；未启动时拿不到，退化为读配置
+            try:
+                for stype, name, _ in self._get_server_instances():
+                    if name and name not in names:
+                        names.append(name)
+            except Exception:
+                pass
+            return names
+        for name, info in (services or {}).items():
+            stype = (getattr(info, "type", "") or "").lower()
+            if stype in ("emby", "jellyfin") and name and name not in names:
+                names.append(name)
+        if not names:
+            try:
+                for _stype, name, _inst in self._get_server_instances():
+                    if name and name not in names:
+                        names.append(name)
+            except Exception:
+                pass
+        return names
+
+    # ==================================================================
+    # 已观看联动（v1.36）
+    #
+    # 需求：洗版订阅建好之后，如果这部影视被看了，就不该再继续洗版 ——
+    #   · 电影变为已观看  -> 取消它的洗版订阅
+    #   · 剧集某些集已观看 -> 把这些集从洗版范围里剔除（订阅「开始集数」推进到
+    #                        第一个未观看的集）；整季都看完 -> 取消该季订阅
+    #
+    # 为什么用「推进开始集数」而不是「逐集排除」：MoviePilot 的订阅模型只支持
+    # `start_episode`（从第几集开始搜）这一个范围字段，没有「排除某些集」的概念。
+    # 而本插件建剧集订阅时本来就是「该季第一个未观看集 = start_episode」，
+    # 所以「重算 start_episode」在语义上正好等价于「已看的集不再洗」。
+    #
+    # 判定数据源：直接问媒体服务器（Emby/Jellyfin），不用订阅表里的状态 ——
+    # 订阅表只有「下载/洗版进度」，没有「用户看没看」。
+    # ==================================================================
+
+    def _watched_targets(self) -> List[Tuple[str, str, Any]]:
+        """返回用于核对观看状态的服务器实例；配置了名单则只取名单内的。"""
+        servers = self._get_server_instances()
+        wanted = [s for s in (self._watched_check_servers or []) if s]
+        if not wanted:
+            return servers
+        picked = [x for x in servers if x[1] in wanted]
+        missing = [w for w in wanted if w not in [x[1] for x in servers]]
+        if missing:
+            logger.warning(f"【未看洗版】配置的观看状态核对服务器未连接/不存在，已跳过："
+                           f"{'、'.join(missing)}")
+        return picked
+
+    @staticmethod
+    def _episodes_of_series(inst, series_id: str, user_id: str) -> Optional[Dict[int, Dict[int, bool]]]:
+        """
+        查询某部剧在媒体服务器上的**每一集是否已观看**。
+
+        返回 {季号: {集号: 是否已看}}；查不到返回 None（调用方必须把 None 当「未知」
+        而不是「都没看」—— 否则服务器一抖就会误判成全部未观看，白洗一遍）。
+
+        用 `/Shows/{id}/Episodes?UserId=...`：Emby/Jellyfin 只有带上 UserId 才会在
+        每集上返回 UserData.Played。本机实测（势在必行 Id=21046）：不带 UserId 时
+        Items 里没有 UserData 字段，带上后每集都有 Played。
+        """
+        try:
+            host = getattr(inst, "host", "") or getattr(inst, "_host", "")
+            apikey = getattr(inst, "apikey", "") or getattr(inst, "_apikey", "")
+            if not host or not apikey:
+                return None
+            host = host.rstrip("/")
+            # 统一走 requests，避免依赖某个版本的 SDK 方法签名。
+            # Emby 挂在 /emby 前缀下、Jellyfin 直接挂在根上 —— 用 host 里有没有
+            # /emby 判断前缀，拼出正确的 Episodes 地址。
+            base = host if host.endswith("/emby") else (host + "/emby")
+            url = f"{base}/Shows/{series_id}/Episodes"
+            import requests
+            r = requests.get(url, params={
+                "api_key": apikey,
+                "UserId": user_id,
+                "Fields": "ProviderIds",
+            }, timeout=15)
+            if r.status_code != 200:
+                # Jellyfin 无 /emby 前缀：换根路径再试一次
+                r = requests.get(f"{host}/Shows/{series_id}/Episodes", params={
+                    "api_key": apikey,
+                    "UserId": user_id,
+                    "Fields": "ProviderIds",
+                }, timeout=15)
+            if r.status_code != 200:
+                logger.warning(f"【未看洗版】查询剧集集观看状态失败（HTTP {r.status_code}）："
+                               f"series_id={series_id}")
+                return None
+            items = (r.json() or {}).get("Items") or []
+            out: Dict[int, Dict[int, bool]] = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                season = it.get("ParentIndexNumber")
+                ep = it.get("IndexNumber")
+                if season is None or ep is None:
+                    continue
+                played = bool(((it.get("UserData") or {}).get("Played")))
+                try:
+                    out.setdefault(int(season), {})[int(ep)] = played
+                except (TypeError, ValueError):
+                    continue
+            return out
+        except Exception as e:
+            logger.warning(f"【未看洗版】查询剧集集观看状态异常（series_id={series_id}）：{e}")
+            return None
+
+    @staticmethod
+    def _movie_played(inst, tmdb_id: int, user_id: str) -> Optional[bool]:
+        """
+        查询某部电影是否已观看。返回 True/False；**查不到返回 None（未知）**。
+
+        用 `AnyProviderIdEquals=Tmdb.{id}` 精确定位，避免按标题匹配到同名的另一部。
+        本机实测（东极岛 tmdb=1305653）：返回 Items[0].UserData.Played。
+        """
+        try:
+            host = getattr(inst, "host", "") or getattr(inst, "_host", "")
+            apikey = getattr(inst, "apikey", "") or getattr(inst, "_apikey", "")
+            if not host or not apikey:
+                return None
+            host = host.rstrip("/")
+            import requests
+            r = requests.get(f"{host}/emby/Items", params={
+                "api_key": apikey,
+                "Recursive": "true",
+                "IncludeItemTypes": "Movie",
+                "AnyProviderIdEquals": f"Tmdb.{tmdb_id}",
+                "UserId": user_id,
+                "Fields": "ProviderIds",
+            }, timeout=15)
+            if r.status_code != 200:
+                # Jellyfin 没有 /emby 前缀，退一步再试一次
+                r = requests.get(f"{host}/Items", params={
+                    "api_key": apikey,
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Movie",
+                    "AnyProviderIdEquals": f"Tmdb.{tmdb_id}",
+                    "UserId": user_id,
+                    "Fields": "ProviderIds",
+                }, timeout=15)
+            if r.status_code != 200:
+                return None
+            items = (r.json() or {}).get("Items") or []
+            if not items:
+                # 条目在服务器上找不到（可能被删/挪库）—— 也是未知，不能当「没看过」
+                return None
+            return bool(((items[0].get("UserData") or {}).get("Played")))
+        except Exception as e:
+            logger.warning(f"【未看洗版】查询电影观看状态异常（tmdb={tmdb_id}）：{e}")
+            return None
+
+    @staticmethod
+    def _series_id_of(inst, tmdb_id: int, name: str = "", year: str = "") -> Optional[str]:
+        """
+        在媒体服务器上按 tmdbid（优先）或标题定位剧集的 SeriesId。找不到返回 None。
+        """
+        try:
+            host = getattr(inst, "host", "") or getattr(inst, "_host", "")
+            apikey = getattr(inst, "apikey", "") or getattr(inst, "_apikey", "")
+            if not host or not apikey:
+                return None
+            host = host.rstrip("/")
+            import requests
+            # 1) 按 tmdbid 精确找（最可靠）
+            for prefix in ("/emby", ""):
+                r = requests.get(f"{host}{prefix}/Items", params={
+                    "api_key": apikey,
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Series",
+                    "AnyProviderIdEquals": f"Tmdb.{tmdb_id}",
+                    "Fields": "ProviderIds",
+                }, timeout=15)
+                if r.status_code == 200:
+                    items = (r.json() or {}).get("Items") or []
+                    if items:
+                        return items[0].get("Id")
+                    break
+            # 2) 退化为标题搜索
+            if name:
+                for prefix in ("/emby", ""):
+                    r = requests.get(f"{host}{prefix}/Items", params={
+                        "api_key": apikey,
+                        "Recursive": "true",
+                        "IncludeItemTypes": "Series",
+                        "SearchTerm": name,
+                    }, timeout=15)
+                    if r.status_code == 200:
+                        for it in ((r.json() or {}).get("Items") or []):
+                            if it.get("Name") == name and (
+                                    not year or str(it.get("ProductionYear")) == str(year)):
+                                return it.get("Id")
+                        break
+            return None
+        except Exception as e:
+            logger.warning(f"【未看洗版】定位剧集失败（tmdb={tmdb_id}）：{e}")
+            return None
+
+    def _apply_watched_policy(self, results: Optional[dict] = None) -> None:
+        """
+        已观看联动主流程：核对每个洗版订阅的观看状态，必要时取消订阅或推进开始集数。
+
+        只处理 `username == 未看洗版` 的订阅（本插件自己建的），绝不动用户手动建的订阅。
+        每个订阅独立 try 保护：一条失败不影响其余，也不影响主扫描流程。
+        """
+        if results is None:
+            results = {"deleted": 0, "shrunk": 0, "failed": 0, "details": []}
+        if not self._cancel_watched:
+            return
+        servers = self._watched_targets()
+        if not servers:
+            logger.warning("【未看洗版】已开启「已观看即取消／收缩订阅」，但没有可用的媒体服务器，"
+                           "本轮跳过观看状态核对")
+            return
+        stype, srv_name, inst = servers[0]
+        user_id = self._server_user_id(inst)
+        if not user_id:
+            logger.warning(f"【未看洗版】无法从 {srv_name} 取到用户 ID，本轮跳过观看状态核对")
+            return
+        logger.info(f"【未看洗版】已观看联动：以 {srv_name}({stype}) 用户 {user_id[:8]}… 为准核对 "
+                    f"『未看洗版』订阅")
+        try:
+            subs = self._list_wash_subscriptions()
+        except Exception as e:
+            logger.error(f"【未看洗版】读取洗版订阅失败，本轮跳过观看状态核对：{e}")
+            return
+        if not subs:
+            logger.info("【未看洗版】当前没有『未看洗版』订阅，无需核对")
+            return
+        for sub in subs:
+            try:
+                self._reconcile_one_subscription(sub, inst, user_id, results)
+            except Exception as e:
+                results["failed"] = results.get("failed", 0) + 1
+                logger.error(f"【未看洗版】核对订阅 id={getattr(sub, 'id', '?')} 失败：{e}"
+                             f"\n{traceback.format_exc()}")
+
+    @staticmethod
+    def _server_user_id(inst) -> Optional[str]:
+        """
+        取媒体服务器的用户 ID。
+
+        优先级：实例自带 user 属性 → /Users 列表第一条。之所以需要它：
+        Emby/Jellyfin 只有带上 UserId 才返回 UserData.Played。
+        """
+        try:
+            uid = getattr(inst, "user", None)
+            if uid:
+                return str(uid)
+            host = getattr(inst, "host", "") or getattr(inst, "_host", "")
+            apikey = getattr(inst, "apikey", "") or getattr(inst, "_apikey", "")
+            if not host or not apikey:
+                return None
+            host = host.rstrip("/")
+            import requests
+            for url in (f"{host}/Users", f"{host}/emby/Users"):
+                try:
+                    r = requests.get(url, params={"api_key": apikey}, timeout=15)
+                    if r.status_code == 200:
+                        users = r.json()
+                        if isinstance(users, list) and users:
+                            # 默认取第一个用户；本插件场景下就是管理员自己
+                            return str(users[0].get("Id"))
+                except Exception:
+                    continue
+            return None
+        except Exception:
+            return None
+
+    def _list_wash_subscriptions(self) -> List[Any]:
+        """
+        列出本插件建的洗版订阅（username == '未看洗版'）。
+
+        走 SubscribeChain 的 subscription_repository（v3 组合根注入的只读仓储），
+        而不是旧版 SubscribeOper：后者在本容器里读会抛
+        `RuntimeError: 同步事务执行器尚未配置`（插件进程没有启动期组合根）。
+        """
+        chain = self.subscribechain
+        repo = getattr(chain, "subscription_repository", None)
+        if repo is None:
+            logger.warning("【未看洗版】订阅仓储不可用（v3 组合根未注入），无法核对观看状态")
+            return []
+        try:
+            all_subs = repo.list()
+        except Exception as e:
+            logger.error(f"【未看洗版】列出订阅失败：{e}")
+            return []
+        return [s for s in (all_subs or [])
+                if (getattr(s, "username", "") or "") == WASH_USERNAME]
+
+    def _reconcile_one_subscription(self, sub: Any, inst: Any, user_id: str,
+                                    results: dict) -> None:
+        """
+        核对单个洗版订阅：
+          · 电影已观看           -> 取消订阅
+          · 剧集整季都已观看     -> 取消该季订阅
+          · 剧集部分集已观看     -> 把 start_episode 推进到第一个未观看集
+        """
+        sid = getattr(sub, "id", None)
+        name = getattr(sub, "name", "") or str(sid)
+        mtype = getattr(sub, "type", "")
+        year = getattr(sub, "year", "") or ""
+        media_id = getattr(sub, "media_id", None)
+        try:
+            tmdb_id = int(str(media_id)) if media_id else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+
+        # ---------- 电影：已观看即取消订阅 ----------
+        if mtype == MediaType.MOVIE.value or mtype == "电影":
+            if not tmdb_id:
+                return
+            played = self._movie_played(inst, tmdb_id, user_id)
+            if played is None:
+                logger.info(f"【未看洗版】{name}：观看状态未知（服务器未返回），本轮不动它的订阅")
+                return
+            if not played:
+                return
+            if self._delete_subscription(sid, f"电影已观看：{name}"):
+                results["deleted"] = results.get("deleted", 0) + 1
+                results.setdefault("details", []).append(f"已取消「{name}」（电影已观看）")
+                # 订阅没了，本地留痕也该撤：否则下次运行会因缓存命中而不再处理它
+                self._forget_watch_artifacts(tmdb_id, season=None)
+            else:
+                results["failed"] = results.get("failed", 0) + 1
+            return
+
+        # ---------- 剧集：按季处理 ----------
+        if mtype != MediaType.TV.value and mtype != "电视剧":
+            return
+        if not tmdb_id:
+            return
+        season = getattr(sub, "season", None)
+        series_id = self._series_id_of(inst, tmdb_id, name=name, year=year)
+        if not series_id:
+            logger.info(f"【未看洗版】{name}：在 {getattr(inst, 'host', '媒体服务器')} 上找不到该剧集，"
+                        f"本轮不动它的订阅（可能未入库/已被删除）")
+            return
+        eps_map = self._episodes_of_series(inst, series_id, user_id)
+        if eps_map is None:
+            logger.info(f"【未看洗版】{name}：集观看状态未知，本轮不动它的订阅")
+            return
+        s_map = eps_map.get(int(season)) if season is not None else None
+        if not s_map:
+            if season is not None:
+                logger.info(f"【未看洗版】{name}：媒体服务器上没有第{season}季的集，本轮不动它的订阅")
+                return
+            # 整剧订阅（season=None）：把所有季合并判断
+            combined: Dict[int, bool] = {}
+            for _s, m in eps_map.items():
+                combined.update(m)
+            s_map = combined
+
+        unplayed = sorted(e for e, played in s_map.items() if not played and e > 0)
+        if not unplayed:
+            # 整季/整剧都看完了 -> 取消订阅
+            label = f"第{season}季" if season is not None else "整剧"
+            if self._delete_subscription(sid, f"剧集{label}已全部观看：{name}"):
+                results["deleted"] = results.get("deleted", 0) + 1
+                results.setdefault("details", []).append(
+                    f"已取消「{name}」{label}（该范围内全部已观看）")
+                self._forget_watch_artifacts(tmdb_id, season=season)
+            else:
+                results["failed"] = results.get("failed", 0) + 1
+            return
+
+        new_start = unplayed[0]
+        old_start = getattr(sub, "start_episode", None) or 1
+        if new_start <= old_start:
+            return
+        label = f"第{season}季" if season is not None else ""
+        if self._update_subscription_start(sid, new_start):
+            results["shrunk"] = results.get("shrunk", 0) + 1
+            results.setdefault("details", []).append(
+                f"「{name}」{label} 开始集数 {old_start} → {new_start}（前 {new_start - 1} 集已观看）")
+            logger.info(f"【未看洗版】已收缩洗版订阅：{name} {label} "
+                        f"开始集数 {old_start} → {new_start}"
+                        f"（第 1~{new_start - 1} 集已观看，不再洗版）")
+            # 同步更新本地记录，界面上的「开始集数」才不会与实际订阅脱节
+            self._sync_history_start_episode(tmdb_id, season, new_start)
+        else:
+            results["failed"] = results.get("failed", 0) + 1
+
+    def _delete_subscription(self, sid: Any, reason: str) -> bool:
+        """
+        取消一个洗版订阅。
+
+        走 `chain.sync_subscription_delete_scope()`（v3 官方删除入口，负责
+        单测事务、发布订阅删除事件并同步媒体服务器）。旧版 SubscribeOper.delete
+        在本容器里会抛「同步事务执行器尚未配置」，不可用。
+        """
+        if sid is None:
+            return False
+        scope = getattr(self.subscribechain, "sync_subscription_delete_scope", None)
+        if not callable(scope):
+            logger.error("【未看洗版】订阅删除入口不可用（v3 组合根未注入），无法取消订阅")
+            return False
+        try:
+            from app.application.subscription.delete import SubscribeDeletionActor
+            actor = SubscribeDeletionActor(username=WASH_USERNAME, is_superuser=True)
+        except Exception:
+            actor = None
+        try:
+            with scope() as command:
+                if actor is not None:
+                    ok = command.execute(int(sid), actor)
+                else:
+                    ok = command.execute(int(sid))
+            if ok:
+                logger.info(f"【未看洗版】已取消洗版订阅 (ID={sid})：{reason}")
+            else:
+                logger.warning(f"【未看洗版】取消洗版订阅失败 (ID={sid})：{reason}")
+            return bool(ok)
+        except Exception as e:
+            logger.error(f"【未看洗版】取消洗版订阅异常 (ID={sid})：{e}\n{traceback.format_exc()}")
+            return False
+
+    def _update_subscription_start(self, sid: Any, start_episode: int) -> bool:
+        """
+        把订阅的「开始集数」推进到指定集。
+
+        走 `chain.sync_subscription_mutation_scope()` —— 与官方订阅助手插件
+        BestVersionConverter 完全相同的写法（同一把锁 + 同一套事件发布），
+        确保订阅变更会正常发出 SubscribeModified 事件、被 UI 和搜索队列看到。
+        """
+        if sid is None:
+            return False
+        scope = getattr(self.subscribechain, "sync_subscription_mutation_scope", None)
+        if not callable(scope):
+            logger.error("【未看洗版】订阅变更入口不可用（v3 组合根未注入），无法收缩订阅")
+            return False
+        try:
+            from app.application.subscription.mutation import SubscriptionActor
+            actor = SubscriptionActor(name=WASH_USERNAME, is_superuser=True)
+        except Exception:
+            actor = None
+        try:
+            with scope() as mutation:
+                if actor is not None:
+                    change = mutation.update(int(sid), {"start_episode": int(start_episode)},
+                                             actor, scene="unwatched_wash")
+                else:
+                    change = mutation.update(int(sid), {"start_episode": int(start_episode)})
+            if change:
+                return True
+            logger.warning(f"【未看洗版】收缩订阅失败 (ID={sid})：宿主未返回更新结果")
+            return False
+        except Exception as e:
+            logger.error(f"【未看洗版】收缩订阅异常 (ID={sid})：{e}\n{traceback.format_exc()}")
+            return False
+
+    def _sync_history_start_episode(self, tmdb_id: int, season: Optional[int],
+                                    start_episode: int) -> None:
+        """订阅开始集数变了，本地洗版记录也要跟上，否则详情页显示的还是旧值。"""
+        try:
+            history = self.get_data('history') or []
+            changed = False
+            for h in history:
+                try:
+                    if int(h.get("tmdbid") or -1) != int(tmdb_id):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if (h.get("season") or None) != (season if season is not None else None):
+                    continue
+                if h.get("start_episode") != start_episode:
+                    h["start_episode"] = start_episode
+                    changed = True
+            if changed:
+                self.save_data('history', history)
+        except Exception as e:
+            logger.warning(f"【未看洗版】同步本地记录的开始集数失败（tmdb={tmdb_id}）：{e}")
+
+    def _forget_watch_artifacts(self, tmdb_id: int, season: Optional[int]) -> None:
+        """
+        订阅已被取消，把本地留痕一并撤掉。
+
+        为什么要撤：记录与去重缓存都是「这部已处理过」的凭据。订阅都没了却还留着
+        凭据，用户重新想看时会被缓存挡住（表现为「勾了也没反应」）。
+        电影撤整条 tmdbid 的凭据；剧集只撤该季（key = tmdbid:S{season}）。
+        """
+        try:
+            history = self.get_data('history') or []
+            if season is None:
+                remain = [h for h in history if int(h.get("tmdbid") or -1) != int(tmdb_id)]
+            else:
+                remain = [h for h in history
+                          if not (int(h.get("tmdbid") or -1) == int(tmdb_id)
+                                  and (h.get("season") or None) == season)]
+            if len(remain) != len(history):
+                self.save_data('history', remain)
+                logger.info(f"【未看洗版】已同步清理本地洗版记录 {len(history) - len(remain)} 条"
+                            f"（tmdb={tmdb_id}"
+                            + (f" 第{season}季" if season is not None else "") + "）")
+            # 缓存键：电影 = tid；剧集 = tid:S{season}
+            if season is None:
+                self._remove_cache_keys_for_tid(int(tmdb_id))
+            else:
+                self._remove_cache_key(f"{int(tmdb_id)}:S{season}")
+        except Exception as e:
+            logger.warning(f"【未看洗版】清理本地留痕失败（tmdb={tmdb_id}）：{e}")
+
+    def _remove_cache_key(self, key: str) -> int:
+        """从去重缓存里移除单个 key，返回移除条数。"""
+        try:
+            if not self._cache_path or not self._cache_path.exists():
+                return 0
+            keys = [c for c in self._cache_path.read_text().split("\n") if c]
+            remain = [k for k in keys if k != key]
+            if len(remain) == len(keys):
+                return 0
+            self._cache_path.write_text("\n".join(remain))
+            return len(keys) - len(remain)
+        except Exception as e:
+            logger.warning(f"【未看洗版】清理去重缓存失败（key={key}）：{e}")
+            return 0
 
     def _get_library_options(self) -> List[dict]:
         """
