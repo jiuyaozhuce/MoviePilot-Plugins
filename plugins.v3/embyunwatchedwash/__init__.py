@@ -45,11 +45,11 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.31"
+    plugin_version = "1.32"
     # 插件作者
-    plugin_author = "forked-from-bestfilmversion(wlj)"
+    plugin_author = "jiuyaozhuce"
     # 作者主页
-    author_url = "https://github.com/jxxghp/MoviePilot-Plugins/tree/main/plugins/bestfilmversion"
+    author_url = "https://github.com/jiuyaozhuce/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "embyunwatchedwash_"
     # 加载顺序
