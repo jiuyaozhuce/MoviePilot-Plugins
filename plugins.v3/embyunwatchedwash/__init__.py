@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.29"
+    plugin_version = "1.30"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -853,31 +853,6 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         return {'component': 'div', 'props': {'class': 'grid gap-3 grid-info-card mb-2'}, 'content': cards}
 
-    @staticmethod
-    def _stat_card(label: str, value: str, caption: str = "", color: str = "primary",
-                   icon: Optional[str] = None) -> dict:
-        """
-        概览统计卡：小标题 + 主数值 + 说明。颜色一律取主题色，保证浅色/深色主题都可读。
-        """
-        head = [{'component': 'span', 'props': {'class': 'text-caption text-medium-emphasis'}, 'text': label}]
-        if icon:
-            head.append({'component': 'VIcon', 'props': {'icon': icon, 'size': 'small', 'color': color}})
-        inner = [
-            {'component': 'div', 'props': {'class': 'd-flex align-center justify-space-between'}, 'content': head},
-            {'component': 'div', 'props': {'class': 'text-h6 font-weight-bold mt-1'}, 'text': value},
-        ]
-        if caption:
-            inner.append({
-                'component': 'div',
-                'props': {'class': 'text-caption text-medium-emphasis mt-1'},
-                'text': caption
-            })
-        return {
-            'component': 'VCard',
-            'props': {'variant': 'tonal', 'color': color},
-            'content': [{'component': 'VCardText', 'content': inner}]
-        }
-
     def _history_card(self, history: dict) -> dict:
         """
         洗版历史卡片：海报 + 标题（跳 TMDB）+ 类型/季集/时间，右上角可删除单条记录。
@@ -1078,12 +1053,6 @@ class EmbyUnwatchedWash(_PluginBase):
                     'events': action(api, params)}
 
         selected_count = len(selected_set)
-        if selected_count:
-            hint = (f'已勾选 {selected_count} 部：运行时只对这批影视创建洗版订阅；'
-                    f'点「清空全部」恢复处理全部未观看。')
-        else:
-            hint = ('未勾选任何项时处理全部未观看影视（排除规则命中的除外）；'
-                    '点击条目即勾选，勾选结果会立即保存。')
         hidden_count, hidden_libs = self._hidden_info()
 
         # 抬头一行：总数 + 分页 + 「被排除规则隐去的条数」。
@@ -1115,13 +1084,6 @@ class EmbyUnwatchedWash(_PluginBase):
                     'props': {'class': 'text-caption text-medium-emphasis pb-1'},
                     'text': count_text
                 },
-                {
-                    'component': 'VAlert',
-                    'props': {'type': 'warning' if selected_count else 'info',
-                              'variant': 'tonal', 'density': 'compact',
-                              'class': 'mb-2 text-subtitle-2',
-                              'text': hint}
-                },
                 {'component': 'VDivider'},
                 *body,
                 {'component': 'VDivider'},
@@ -1148,7 +1110,7 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         拼装插件详情页面（数据查看）。
         自上而下按使用逻辑排列：
-        运行概览 → 运行提示 → 媒体库未观看清单（可勾选）→ 洗版历史 → 维护操作。
+        异常/状态提示（按需出现）→ 媒体库未观看清单（可勾选）→ 洗版记录 → 维护操作。
 
         未观看清单排在历史之前：清单是可选可改的「操作区」，而详情页每次点击都会整页
         重载并回到顶部，把它放在靠前的位置可以少滚一点。
@@ -1175,32 +1137,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     '.list-btn-checked .v-icon{opacity:1;}'
         })
 
-        # ---------- 1. 运行概览：5 张统计卡，一屏一行 ----------
-        contents.append(self._section_title('运行概览', '数据来自媒体服务器扫描结果与插件本地记录'))
-        hidden_count, hidden_libs = self._hidden_info()
-        contents.append(self._grid([
-            self._stat_card('未观看候选', f"{len(options)} 部",
-                            (f"已按排除规则隐藏 {hidden_count} 部"
-                             + (f"（{'、'.join(hidden_libs)}）" if hidden_libs else ''))
-                            if hidden_count else '媒体库中未观看的影视',
-                            'primary', 'mdi-movie-open-outline'),
-            self._stat_card('洗版记录', f"{len(history)} 条",
-                            '删除一条会同步取消其勾选', 'success', 'mdi-history'),
-            self._stat_card('洗版范围', '电影 + 剧集' if self._include_series else '仅电影',
-                            ('剧集按未观看集洗版' if self._series_episode_level else '剧集按整部洗版')
-                            if self._include_series else '不处理剧集',
-                            'info', 'mdi-movie-filter'),
-            self._stat_card('试运行', '已开启' if self._dry_run else '已关闭',
-                            '仅输出清单，不创建订阅' if self._dry_run else '按规则正常创建订阅',
-                            'warning' if self._dry_run else 'success', 'mdi-test-tube'),
-            self._stat_card('排除规则', f"{len(self._exclude_libraries)} 个库",
-                            f"关键字 {len(self._exclude_keywords)} 条" if self._exclude_keywords
-                            else '未设置排除关键字',
-                            'warning' if (self._exclude_libraries or self._exclude_keywords) else 'primary',
-                            'mdi-filter-off-outline'),
-        ]))
-
-        # ---------- 2. 运行提示：按需出现，不常驻 ----------
+        # ---------- 1. 运行提示：仅保留异常/状态类，正常态不占版面 ----------
         if self._dry_run:
             contents.append({'component': 'VAlert', 'props': {
                 'type': 'warning', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
@@ -1211,54 +1148,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 'type': 'info', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
                 'prepend-icon': 'mdi-alert-circle-outline',
                 'text': '暂未读取到未观看清单，请检查媒体服务器配置与连通性；下方历史记录不受影响。'}})
-        if selected:
-            extra = ''
-            if options:
-                visible_ids = set()
-                for opt in options:
-                    try:
-                        visible_ids.add(int(opt.get('value')))
-                    except (TypeError, ValueError):
-                        continue
-                excluded_ids = set(getattr(self, '_options_excluded_ids', set()) or set())
-                sel_excluded = [x for x in selected if x in excluded_ids]
-                sel_gone = [x for x in selected
-                            if x not in visible_ids and x not in excluded_ids]
-                if sel_excluded:
-                    extra += (f'其中 {len(sel_excluded)} 部已被排除规则隐藏（不会参与洗版，'
-                              f'如需洗版请先取消对应的排除媒体库）。')
-                if sel_gone:
-                    extra += (f'另有 {len(sel_gone)} 部已不在清单中'
-                              f'（可能已不再未观看），运行时同样会跳过。')
-            contents.append({'component': 'VAlert', 'props': {
-                'type': 'warning', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
-                'prepend-icon': 'mdi-format-list-checks',
-                'text': f'已勾选 {len(selected)} 部影视：运行时只对这批创建洗版订阅，'
-                        f'其余未观看内容会跳过；在下方清单点「清空全部」可恢复处理全部未观看。'
-                        f'已提交过订阅的会以「复用」方式跳过，不再重复创建。'
-                        + extra}})
-        if self._exclude_libraries or self._exclude_keywords:
-            rules = []
-            if self._exclude_libraries:
-                rules.append('排除媒体库：' + '、'.join(self._exclude_libraries))
-            if self._exclude_keywords:
-                rules.append('排除关键字：' + '、'.join(self._exclude_keywords))
-            tail = '（命中即跳过该库，下方清单中也不显示这些条目）'
-            contents.append({'component': 'VAlert', 'props': {
-                'type': 'info', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
-                'prepend-icon': 'mdi-filter-off-outline',
-                'text': '；'.join(rules) + tail}})
 
-        # 两个区域的关系容易混淆，常驻一条说明（这两处数据必须始终一致）
-        contents.append({'component': 'VAlert', 'props': {
-            'type': 'info', 'variant': 'tonal', 'density': 'compact',
-            'class': 'mb-2 text-subtitle-2',
-            'prepend-icon': 'mdi-link-variant',
-            'text': '「清单勾选」与「洗版记录」已联动：勾选 = 已提交过洗版订阅；'
-                    '取消勾选会同步删除它的洗版记录，删除记录也会同步取消勾选；'
-                    '两者都只影响插件本身的清单/留痕，不会删除 MoviePilot 里已创建的订阅。'}})
-
-        # ---------- 3. 媒体库未观看清单（可勾选，点击即保存） ----------
+        # ---------- 2. 媒体库未观看清单（可勾选，点击即保存） ----------
         contents.append(self._section_title(
             '媒体库未观看清单',
             '点条目即勾选并立即保存 · 未勾选任何项则处理全部未观看 · 取消勾选会一并删除其洗版记录'))

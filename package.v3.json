@@ -3,7 +3,7 @@
             "name": "Emby未看洗版",
             "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
             "labels": "媒体库",
-            "version": "1.29",
+            "version": "1.30",
             "icon": "icon.svg",
             "author": "jiuyaozhuce",
             "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
             "system_version": ">=3.0.0",
             "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
             "history": {
+                  "v1.30": "精简详情页版面：移除「运行概览」整块（5 张统计卡）与三条常驻提示（「已勾选 N 部影视…」「排除媒体库/关键字：…」「清单勾选与洗版记录已联动…」），并去掉未观看清单卡片内的同义提示条 —— 这些信息在分区标题的副标与清单抬头里已有体现。现仅保留 Dry-run 已开启、未读取到清单这类按需出现的异常/状态提示。同步删除已无调用方的 _stat_card() 辅助方法",
                   "v1.29": "修正提示性文字字号过大、与清单内容主次颠倒的问题：VAlert 的 text 插槽不带字号类，会落到容器默认的 16px，和分区标题（text-subtitle-1，16px）一样大，比未观看清单里的影视名（12px）还大 33%。现给配置页与详情页全部 7 处 VAlert 统一加 text-subtitle-2（14px），形成清晰层级：分区标题 16px 加粗 > 提示 14px > 清单项 12px；已用无头浏览器实测改动前后实际字号（16px → 14px）",
                   "v1.28": "未观看清单的名称彻底回到中性色：改用宿主 CSS 把已勾选行的按钮文字钉成 rgba(var(--v-theme-on-surface),var(--v-high-emphasis-opacity)) —— 深色主题得到纯白、浅色主题得到纯黑，不再跟随主题 primary/success 染色。勾选态仅靠 tonal 浅底与实心勾选图标表达。此前 v1.27 把紫色换成绿色仍属「彩字」，本次从根上解决；已用无头浏览器实测两种主题下的实际色值",
                   "v1.27": "未观看清单里已勾选项的影视名称不再用主题色 primary 渲染：primary 跟随用户所选主题，本机主题的 primary 是紫色，整片紫字长时间看很刺眼（用户反馈伤眼）。改为 tonal 变体 + success 语义色 —— tonal 只铺一层浅色底，文字保持中性可读，选中态靠浅底加 checkbox-marked 图标表达，不再依赖主题色相",
