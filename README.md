@@ -97,15 +97,23 @@ MoviePilot-Plugins/
 
 ## 日志说明 / Logging
 
-本插件使用 MoviePilot 内置 `logger`，日志统一写入 **MoviePilot 主日志文件 `moviepilot.log`**（位于 `settings.LOG_PATH`，一般即 MoviePilot 数据目录下的 `logs/moviepilot.log`）。
+本插件使用 MoviePilot 内置 `logger`。
 
-> 注意：因为插件目录是 `plugins.v3`（不是 `plugins`），MoviePilot 的日志管理器不会把它识别为「插件」并生成独立插件日志文件，所有输出都进入 `moviepilot.log`。如果你之前没看到日志，很可能是只看了别的位置。
+> 日志落点（2026-09-26 实测修正）：本插件会被 MoviePilot 记为**独立插件日志**，
+> 输出在 `<MoviePilot 数据目录>/config/logs/plugins/embyunwatchedwash.log`
+> （不是 `moviepilot.log`）。排查时直接看这个文件：
+
+```bash
+grep "未看洗版" /volume1/docker/moviepilot2/config/logs/plugins/embyunwatchedwash.log | tail -50
+```
 
 开启 MoviePilot 的 `DEBUG` 模式（`settings.DEBUG`）可看到更细的「跳过原因」等调试日志；默认（INFO）下即可看到完整运行叙事：
 
 - `【未看洗版】========== 开始扫描任务 ==========` —— 每次运行开始
 - `【未看洗版】运行模式：全量扫描 | 包含剧集=… | 媒体服务器=…` 或 `手动选择（指定 N 个 tmdbid 洗版）`
-- `【未看洗版】Emby/Jellyfin 获取到 N 条未观看条目` —— 每个媒体服务器拉取到的数量
+- `【未看洗版】读取到 N 个媒体库：…` —— 库归属是按库拉取的前提（见「注意」）
+- `【未看洗版】Emby/Jellyfin 媒体库「<库名>」未观看条目 N 条` —— 每个库拉取到的数量
+- `【未看洗版】未观看清单已按排除规则隐藏 N 条（媒体库：…）` —— 排除规则实际生效的条数
 - `【未看洗版】<server> 去重后待处理 N 部影视`
 - `【未看洗版】正在处理：<标题> (tmdbid=…)` / `已创建洗版订阅：<标题> (年份) [类型]` —— 每部影视的处理与成功
 - `【未看洗版】创建洗版订阅失败：<标题> - <原因>` / `媒体识别失败` / `获取详情失败` —— 失败原因
