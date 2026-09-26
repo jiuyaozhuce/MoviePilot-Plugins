@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.21"
+    plugin_version = "1.22"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -331,7 +331,7 @@ class EmbyUnwatchedWash(_PluginBase):
         })
 
     def _sorted_options(self) -> List[dict]:
-        """未观看清单按标题排序，保证分页顺序稳定（否则翻页会串行）。"""
+        """未观看清单按标题排序，保证分页顺序稳定（否则翻页会串行）。会按需扫描媒体库。"""
         try:
             options = self._get_library_options() or []
         except Exception as e:
@@ -339,9 +339,25 @@ class EmbyUnwatchedWash(_PluginBase):
             return []
         return sorted(options, key=lambda x: (str(x.get('title') or ''), str(x.get('value') or '')))
 
+    def _cached_options_snapshot(self) -> List[dict]:
+        """
+        返回「不触发媒体库扫描」的未观看清单快照（按标题排序，与详情页分页口径一致）。
+
+        为什么交互端点必须走它：详情页的点击事件由前端渲染器发起，请求会经过浏览器
+        Service Worker 的 NetworkFirst（networkTimeoutSeconds=5）。一旦响应超过 5 秒，
+        SW 就回退到本地缓存，把旧的响应体喂给页面（表现为莫名其妙的报错或页面不刷新）。
+        扫描媒体库动辄十几秒，所以勾选 / 翻页 / 批量这几条「点一下就要立刻返回」的路径
+        只读缓存快照，缓存为空时返回空列表由调用方降级，绝不同步扫描。
+
+        快照内容 == 详情页上一次渲染时用的那份数据，因此分页与屏幕上看到的完全一致
+        （比点击时重新扫描更不会出现「页码跳动」）。真正需要扫描的是打开详情页这一下。
+        """
+        return sorted(list(self._options_cache or []),
+                      key=lambda x: (str(x.get('title') or ''), str(x.get('value') or '')))
+
     def _title_of(self, tid: int) -> str:
-        """按 tmdbid 反查标题，仅用于日志/提示文案。"""
-        for opt in self._sorted_options():
+        """按 tmdbid 反查标题，仅用于日志/提示文案（只读快照，不触发扫描）。"""
+        for opt in self._cached_options_snapshot():
             try:
                 if int(opt.get('value')) == int(tid):
                     return self._clean_title(opt.get('title'))
@@ -395,7 +411,7 @@ class EmbyUnwatchedWash(_PluginBase):
 
     def select_page(self, page: int = 1) -> Dict[str, Any]:
         """API 端点：记住未观看清单页码（GET），供详情页上一页/下一页使用。"""
-        _, page_no, _, _ = self._page_info(self._sorted_options(), page)
+        _, page_no, _, _ = self._page_info(self._cached_options_snapshot(), page)
         self._save_page(page_no)
         return self._api_response(True, f"已切换到第 {page_no} 页", {"page": page_no})
 
@@ -412,7 +428,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 logger.info("【未看洗版】已清空洗版清单，恢复处理全部未观看")
                 return self._api_response(True, "已清空洗版清单，恢复『处理全部未观看』",
                                           {"count": 0})
-            page_items, _, _, _ = self._page_info(self._sorted_options(), page)
+            page_items, _, _, _ = self._page_info(self._cached_options_snapshot(), page)
             page_ids: List[int] = []
             for opt in page_items:
                 try:
