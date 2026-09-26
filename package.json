@@ -3,7 +3,7 @@
     "name": "Emby未看洗版",
     "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
     "labels": "媒体库",
-    "version": "1.0",
+    "version": "1.32",
     "icon": "icon.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,8 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.32": "修正插件详情页的作者信息：plugin_author 由上游 fork 残留的 forked-from-bestfilmversion(wlj) 改为 jiuyaozhuce，author_url 由上游 bestfilmversion 目录改为本仓库地址，与 package.v3.json 中的 author/project_url 对齐",
+      "v1.31": "三处健壮性修复：/medias 标题空括号、select_set 参数校验、手动模式不再整库建任务",
       "v1.0": "初始版本：扫描未观看影视，自动创建洗版订阅升级画质"
     }
   }
