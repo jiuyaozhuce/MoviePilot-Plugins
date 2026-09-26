@@ -487,27 +487,60 @@ class DouBanWatching(_PluginBase):
         }
         mobile = self.is_mobile(kwargs.get('user_agent'))
         attrs = {"refresh": 600, "border": False}
-        elements = [
-            {
-                'component': 'VRow',
-                'props': {
-                },
-                'content': [
-                    {
-                        'component': 'VTimeline',
-                        'props': {
-                            'dot-color': '#AF85FD',
-                            'direction': "vertical",
-                            'style': 'padding: 1rem 1rem 1rem 1rem',
-                            'hide-opposite': True,
-                            'side': 'end',
-                            'align': 'start'
-                        },
-                        "content": self.get_line_item(mobile=mobile)
-                    }
-                ]
-            }
-        ]
+        line_items = self.get_line_item(mobile=mobile)
+        if line_items:
+            elements = [
+                {
+                    'component': 'VRow',
+                    'props': {
+                        'no-gutters': True
+                    },
+                    'content': [
+                        {
+                            'component': 'VTimeline',
+                            'props': {
+                                'dot-color': '#AF85FD',
+                                'direction': "vertical",
+                                'style': 'width:100%; padding: 0.5rem 1rem 0.5rem 1rem',
+                                'hide-opposite': True,
+                                'side': 'end',
+                                'align': 'start',
+                                'truncate': False
+                            },
+                            "content": line_items
+                        }
+                    ]
+                }
+            ]
+        else:
+            # 空状态：不渲染时间线，给出一行提示，避免白板
+            elements = [
+                {
+                    'component': 'VRow',
+                    'props': {
+                        'no-gutters': True
+                    },
+                    'content': [
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12
+                            },
+                            'content': [
+                                {
+                                    'component': 'VAlert',
+                                    'props': {
+                                        'type': 'info',
+                                        'variant': 'tonal',
+                                        'density': 'compact',
+                                        'text': '暂无观影记录，播放媒体后将自动同步到豆瓣书影音档案'
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
 
         return cols, attrs, elements
 
@@ -591,6 +624,7 @@ class DouBanWatching(_PluginBase):
                                 {
                                     'component': 'VRow',
                                     'props': {
+                                        'no-gutters': True,
                                         'style': 'padding: 0rem 0rem 0rem 0rem'
                                     },
                                     'content': []
@@ -608,6 +642,7 @@ class DouBanWatching(_PluginBase):
                     'href': 'https://www.douban.com/doubanapp/dispatch?uri=/movie/' + val.get(
                         'subject_id') + '?from=mdouban&open=app',
                     'target': '_blank',
+                    'title': val.get('subject_name'),
                     # 图片卡片间的间距 上 右 下 左
                     # 'style': 'padding: 1rem 0.5rem 1rem 0.5rem'
                     'style': 'padding: 0.2rem'
@@ -616,7 +651,7 @@ class DouBanWatching(_PluginBase):
                     {
                         "component": "VCard",
                         "props": {
-                            "class": "elevation-4"
+                            "class": "elevation-4 rounded-lg"
                         },
                         "content": [
                             {
@@ -624,7 +659,8 @@ class DouBanWatching(_PluginBase):
                                 "props": {
                                     "src": poster_path.replace("/original/", "/w200/"),
                                     "style": "width:44px; height: 66px;" if mobile else "width:66px; height: 99px;",
-                                    "aspect-ratio": "2/3"
+                                    "aspect-ratio": "2/3",
+                                    "cover": True
                                 }
                             }
                         ]
