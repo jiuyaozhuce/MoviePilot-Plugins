@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "1.9.9"
+    plugin_version = "v1.9.10"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -489,27 +489,15 @@ class DouBanWatching(_PluginBase):
         attrs = {"refresh": 600, "border": False}
         line_items = self.get_line_item(mobile=mobile)
         if line_items:
+            # 海报墙：顶层 VRow 自动换行，no-gutters 防止负 margin 溢出容器
             elements = [
                 {
                     'component': 'VRow',
                     'props': {
-                        'no-gutters': True
+                        'no-gutters': True,
+                        'align-content': 'start'
                     },
-                    'content': [
-                        {
-                            'component': 'VTimeline',
-                            'props': {
-                                'dot-color': '#AF85FD',
-                                'direction': "vertical",
-                                'style': 'width:100%; padding: 0.5rem 1rem 0.5rem 1rem',
-                                'hide-opposite': True,
-                                'side': 'end',
-                                'align': 'start',
-                                'truncate': False
-                            },
-                            "content": line_items
-                        }
-                    ]
+                    'content': line_items
                 }
             ]
         else:
@@ -546,106 +534,68 @@ class DouBanWatching(_PluginBase):
 
     def get_line_item(self, mobile: bool = False):
         """
-        processed_items[f"{title}"] = {
-                        "subject_id": subject_id,
-                        "subject_name": subject_name,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
+        海报墙布局：全部海报按观看时间从新到旧、从左到右平铺，自动换行；
+        跨月处插入一张与海报同尺寸的“月份卡”（显示月份与当月观看总数）。
         """
         data: Dict = self.get_data('data') or {}
         content = []
 
-        # 按月分组
-        last_month = None
-        current_month_item = None
         # 限制显示月数
         limit_month = self._mobile_month if mobile else self._pc_month
-        limit_month -= 1
         # 限制每月最多显示数
         limit_num = self._mobile_num if mobile else self._pc_num
 
-        # 将字典按照 timestamp 排序
-        sorted_data = sorted(data.items(),
-                             key=lambda item: datetime.strptime(item[1]['timestamp'], "%Y-%m-%d %H:%M:%S"))
+        card_w = "44px" if mobile else "66px"
+        card_h = "66px" if mobile else "99px"
+        month_text_class = "text-subtitle-2 font-weight-bold" if mobile else "text-subtitle-1 font-weight-bold"
+        num_text_class = "text-caption"
 
-        for key, val in sorted_data[::-1]:
-            if not isinstance(val, dict):
-                continue
-            if not val.get('poster_path', ''):
-                meta = MetaInfo(val.get("subject_name"))
-                meta.type = MediaType("电视剧" if not val.get("type", '') else val.get("type"))
-                # 识别媒体信息
-                mediainfo: MediaInfo = MediaChain().recognize_media(meta=meta, mtype=meta.type,
-                                                                    cache=True)
-                if mediainfo:
-                    poster_path = mediainfo.poster_path
-                else:
-                    continue
-            else:
-                poster_path = val.get('poster_path')
-
-            time_object = datetime.strptime(val.get('timestamp'), "%Y-%m-%d %H:%M:%S")
-
-            if time_object.month != last_month or last_month is None:
-                if limit_month < 1:
-                    break
-                if last_month:
-                    num_movies = len(current_month_item["content"][0]["content"][1]["content"])
-                    current_month_item["content"][0]["content"][0][
-                        "html"] += f"<span class='text-sm font-normal'>看过{num_movies}部</span>"
-                    # 截取limit_num
-                    current_month_item["content"][0]["content"][1]["content"] = \
-                        current_month_item["content"][0]["content"][1]["content"][:limit_num]
-                    content.append(current_month_item)
-                    limit_month -= 1
-
-                # 新的一月
-                # 初始化 current_month_item 模板
-                current_month_item = {
-                    "component": "VTimelineItem",
-                    "props": {
-                        "size": "x-small",
-                    },
-                    "content": [
-                        {
-                            "component": "VCol",
-                            'props': {
-                                'style': 'padding: 0rem 0rem 0rem 0rem'
-                            },
-                            'content': [
-                                {
-                                    'component': 'h1',
-                                    'props': {
-                                        'style': 'padding:0rem 0rem 1rem 0rem;font-weight: bold;',
-                                        'class': 'text-base'
-                                    },
-                                    'html': f"{time_object.month}月 ",
+        def month_card(label: int, total: int) -> dict:
+            """与海报同尺寸的月份卡：显示“X月 / 看过N部”。"""
+            return {
+                "component": "VCard",
+                "props": {
+                    "variant": "tonal",
+                    "color": "#AF85FD",
+                    "class": "rounded-lg",
+                    "style": f"width:{card_w}; height:{card_h}; flex-shrink: 0;"
+                },
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {
+                            "style": "height:100%; display:flex; flex-direction:column;"
+                                     "align-items:center; justify-content:center; padding:0;"
+                        },
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": month_text_class
                                 },
-                                {
-                                    'component': 'VRow',
-                                    'props': {
-                                        'no-gutters': True,
-                                        'style': 'padding: 0rem 0rem 0rem 0rem'
-                                    },
-                                    'content': []
-                                }
-                            ]
-                        }
-                    ]
-                }
-                last_month = time_object.month
-            if not poster_path or (poster_path.count('original') < 1):
-                continue
-            current_month_item["content"][0]["content"][1]["content"].append({
+                                "html": f"{label}月"
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": num_text_class
+                                },
+                                "html": f"{total}部"
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        def poster_item(poster: str, val: dict) -> dict:
+            return {
                 "component": "a",
-                'props': {
-                    'href': 'https://www.douban.com/doubanapp/dispatch?uri=/movie/' + val.get(
-                        'subject_id') + '?from=mdouban&open=app',
-                    'target': '_blank',
-                    'title': val.get('subject_name'),
-                    # 图片卡片间的间距 上 右 下 左
-                    # 'style': 'padding: 1rem 0.5rem 1rem 0.5rem'
-                    'style': 'padding: 0.2rem'
+                "props": {
+                    "href": "https://www.douban.com/doubanapp/dispatch?uri=/movie/" + val.get(
+                        "subject_id") + "?from=mdouban&open=app",
+                    "target": "_blank",
+                    "title": val.get("subject_name"),
+                    "style": "padding: 0.2rem"
                 },
                 "content": [
                     {
@@ -657,8 +607,8 @@ class DouBanWatching(_PluginBase):
                             {
                                 "component": "VImg",
                                 "props": {
-                                    "src": poster_path.replace("/original/", "/w200/"),
-                                    "style": "width:44px; height: 66px;" if mobile else "width:66px; height: 99px;",
+                                    "src": poster.replace("/original/", "/w200/"),
+                                    "style": f"width:{card_w}; height:{card_h};",
                                     "aspect-ratio": "2/3",
                                     "cover": True
                                 }
@@ -666,15 +616,62 @@ class DouBanWatching(_PluginBase):
                         ]
                     }
                 ]
-            })
+            }
 
-        if current_month_item:
-            num_movies = len(current_month_item["content"][0]["content"][1]["content"])
-            current_month_item["content"][0]["content"][0][
-                "html"] += f"<span class='text-sm font-normal'>看过{num_movies}部</span>"
-            current_month_item["content"][0]["content"][1]["content"] = \
-                current_month_item["content"][0]["content"][1]["content"][:limit_num]
-            content.append(current_month_item)
+        # 将字典按照 timestamp 排序（从新到旧）
+        sorted_data = sorted(data.items(),
+                             key=lambda item: datetime.strptime(item[1]['timestamp'], "%Y-%m-%d %H:%M:%S"))
+
+        def resolve_poster(val: dict):
+            """返回条目的有效海报路径（original 尺寸），无效返回 None。"""
+            if not val.get('poster_path', ''):
+                meta = MetaInfo(val.get("subject_name"))
+                meta.type = MediaType("电视剧" if not val.get("type", '') else val.get("type"))
+                # 识别媒体信息（cache=True，主循环再次调用时命中缓存）
+                mediainfo: MediaInfo = MediaChain().recognize_media(meta=meta, mtype=meta.type,
+                                                                    cache=True)
+                if not mediainfo:
+                    return None
+                return mediainfo.poster_path
+            return val.get('poster_path')
+
+        # 预扫描：统计每月观看总数（月份卡需要提前知道“看过N部”）
+        month_totals: Dict[int, int] = {}
+        for key, val in sorted_data[::-1]:
+            if not isinstance(val, dict):
+                continue
+            poster = resolve_poster(val)
+            if not poster or (poster.count('original') < 1):
+                continue
+            m = datetime.strptime(val.get('timestamp'), "%Y-%m-%d %H:%M:%S").month
+            month_totals[m] = month_totals.get(m, 0) + 1
+
+        last_month = None
+        month_shown = 0   # 当月已展示海报数（受 limit_num 限制）
+
+        for key, val in sorted_data[::-1]:
+            if not isinstance(val, dict):
+                continue
+            poster_path = resolve_poster(val)
+            if not poster_path or (poster_path.count('original') < 1):
+                continue
+
+            time_object = datetime.strptime(val.get('timestamp'), "%Y-%m-%d %H:%M:%S")
+
+            # 跨月：在组头插入月份卡
+            if time_object.month != last_month:
+                if last_month is not None:
+                    limit_month -= 1
+                    if limit_month < 1:
+                        break
+                last_month = time_object.month
+                month_shown = 0
+                content.append(month_card(time_object.month, month_totals.get(time_object.month, 0)))
+
+            if month_shown < limit_num:
+                month_shown += 1
+                content.append(poster_item(poster_path, val))
+
         return content
 
     @staticmethod
