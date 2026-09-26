@@ -25,7 +25,7 @@ except ImportError:
     # MoviePilot v2
     from app.helper.mediaserver import MediaServerHelper
 from app.plugins import _PluginBase
-from app.schemas.types import MediaType, EventType
+from app.schemas.types import MediaType, EventType, SystemConfigKey
 try:
     from app.schemas.types import MediaSource
 except ImportError:
@@ -56,7 +56,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.38"
+    plugin_version = "1.39"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -76,6 +76,9 @@ class EmbyUnwatchedWash(_PluginBase):
     _exclude_libraries: List[str] = []
     _exclude_keywords: List[str] = []
     _dry_run: bool = False
+    # 洗版过滤规则组（v1.39）：设置页可选，留空回落到内置默认（电影洗版/电视剧洗版）
+    _filter_group_movie: str = ""
+    _filter_group_tv: str = ""
     # 媒体库未观看选项的 TTL 缓存（配置页/详情页频繁调用，避免每次全量扫描）
     _options_cache: List[dict] = []
     _options_cache_time: float = 0.0
@@ -177,6 +180,9 @@ class EmbyUnwatchedWash(_PluginBase):
                 self._exclude_libraries = self._normalize_str_list(config.get("exclude_library_names", []))
             self._exclude_keywords = self._normalize_str_list(config.get("exclude_keywords", []))
             self._dry_run = bool(config.get("dry_run", False))
+            # 洗版过滤规则组（v1.39）：留空回落到内置默认，保持与 v1.38 行为一致
+            self._filter_group_movie = str(config.get("filter_group_movie") or "").strip()
+            self._filter_group_tv = str(config.get("filter_group_tv") or "").strip()
 
         # 配置自愈：洗版记录与勾选列表必须一致（详见方法注释）
         self._repair_selection()
@@ -199,6 +205,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 "exclude_libraries": self._exclude_libraries,
                 "exclude_keywords": self._exclude_keywords,
                 "dry_run": self._dry_run,
+                "filter_group_movie": self._filter_group_movie,
+                "filter_group_tv": self._filter_group_tv,
                 "exclude_library_names": self._exclude_libraries,
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -499,8 +507,30 @@ class EmbyUnwatchedWash(_PluginBase):
             "exclude_libraries": self._exclude_libraries,
             "exclude_keywords": self._exclude_keywords,
             "dry_run": self._dry_run,
+            "filter_group_movie": self._filter_group_movie,
+            "filter_group_tv": self._filter_group_tv,
             "exclude_library_names": self._exclude_libraries,
         })
+
+    def _get_rule_group_options(self) -> List[dict]:
+        """
+        读取 MoviePilot「过滤规则」里用户自定义的规则组名（供设置页下拉选择）。
+        数据源 = systemconfig 的 UserFilterRuleGroups（[{name, rule_string, media_type}, ...]）。
+        读取失败返回空列表：下拉为空但不影响配置页打开与插件运行，
+        运行时留空会回落到内置默认（电影洗版/电视剧洗版）。
+        """
+        try:
+            groups = self.systemconfig.get(SystemConfigKey.UserFilterRuleGroups) or []
+        except Exception as e:
+            logger.warning(f"【未看洗版】读取过滤规则组失败，设置页下拉将为空：{e}")
+            return []
+        names = []
+        for g in groups:
+            if isinstance(g, dict):
+                name = str(g.get("name") or "").strip()
+                if name and name not in names:
+                    names.append(name)
+        return [{'title': n, 'value': n} for n in names]
 
     def _sorted_options(self) -> List[dict]:
         """未观看清单按标题排序，保证分页顺序稳定（否则翻页会串行）。会按需扫描媒体库。"""
@@ -835,6 +865,9 @@ class EmbyUnwatchedWash(_PluginBase):
             server_names = []
         server_items = [{'title': n, 'value': n} for n in server_names]
 
+        # 过滤规则组清单供「电影/剧集洗版规则组」选择（只读 systemconfig，不扫媒体库）
+        rule_group_items = self._get_rule_group_options()
+
         def cell(content: dict, md: int = 12) -> dict:
             """把一个组件包进统一样式的栅格单元（md 断点下按 md 值自动分栏）。"""
             return {
@@ -920,6 +953,16 @@ class EmbyUnwatchedWash(_PluginBase):
                     control('VSwitch', 'series_episode_level', '剧集按未观看集洗版', md=6,
                             hint='开启：按季订阅并把「开始集数」设为该季第一个未看的集（已看集不洗）；关闭：整部剧洗版',
                             **{'persistent-hint': True}),
+                    control('VSelect', 'filter_group_movie', '电影洗版规则组', md=6,
+                            items=rule_group_items, clearable=True,
+                            hint='选项来自 MoviePilot「过滤规则」中的规则组，留空用内置「电影洗版」；'
+                                 '组内每级条件含 FREE 时即只下载免费资源',
+                            **{'persistent-hint': True}),
+                    control('VSelect', 'filter_group_tv', '剧集洗版规则组', md=6,
+                            items=rule_group_items, clearable=True,
+                            hint='留空用内置「电视剧洗版」；显式指定后订阅只挂这一组，'
+                                 '不会被系统「电影洗版+电视剧洗版」两组叠加过滤',
+                            **{'persistent-hint': True}),
 
                     # ---------- 4b. 已观看联动 ----------
                     section('已观看联动（订阅建好后追看）'),
@@ -976,6 +1019,8 @@ class EmbyUnwatchedWash(_PluginBase):
             "limit": 0,
             "exclude_libraries": [],
             "exclude_keywords": [],
+            "filter_group_movie": "",
+            "filter_group_tv": "",
             "dry_run": False,
             "exclude_library_names": []  # 兼容旧版：UI 选择时存储的库名列表
         }
@@ -2050,12 +2095,14 @@ class EmbyUnwatchedWash(_PluginBase):
             extra["season"] = season
         if start_episode is not None:
             extra["start_episode"] = start_episode
-        # 显式绑定洗版规则组（v1.38）：电影=「电影洗版」、剧集=「电视剧洗版」。
-        # chain.add 会把它并入订阅的 filter_groups 落库；运行时 MP 用
+        # 显式绑定洗版规则组（v1.38，v1.39 起可在设置页选择）：电影默认「电影洗版」、
+        # 剧集默认「电视剧洗版」；设置页 filter_group_movie / filter_group_tv 选了组则优先，
+        # 留空回落内置默认。chain.add 会把它并入订阅的 filter_groups 落库；运行时 MP 用
         # 「订阅自身 filter_groups 优先，空才回退系统洗版规则组」的语义，
         # 显式绑定后剧集不再被「电影洗版+电视剧洗版」两组串行 AND 过滤。
         extra["filter_groups"] = [
-            WASH_FILTER_GROUP_TV if mediainfo.type == MediaType.TV else WASH_FILTER_GROUP_MOVIE
+            (self._filter_group_tv or WASH_FILTER_GROUP_TV) if mediainfo.type == MediaType.TV
+            else (self._filter_group_movie or WASH_FILTER_GROUP_MOVIE)
         ]
 
         # 创建洗版（best_version=True）订阅，兼容 v3（media_source/media_id）与 v2（tmdbid）
