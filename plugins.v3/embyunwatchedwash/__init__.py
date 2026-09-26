@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.28"
+    plugin_version = "1.29"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -747,6 +747,7 @@ class EmbyUnwatchedWash(_PluginBase):
                         'props': {
                             'type': 'info',
                             'variant': 'tonal',
+                            'class': 'text-subtitle-2',
                             'text': '扫描媒体服务器中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级为更高画质版本。'
                                     '已处理的条目会写入缓存，不会重复订阅；建议先开启「Dry-run 预览」试跑确认，再正式运行。'
                         }
@@ -1117,7 +1118,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 {
                     'component': 'VAlert',
                     'props': {'type': 'warning' if selected_count else 'info',
-                              'variant': 'tonal', 'density': 'compact', 'class': 'mb-2',
+                              'variant': 'tonal', 'density': 'compact',
+                              'class': 'mb-2 text-subtitle-2',
                               'text': hint}
                 },
                 {'component': 'VDivider'},
@@ -1201,11 +1203,12 @@ class EmbyUnwatchedWash(_PluginBase):
         # ---------- 2. 运行提示：按需出现，不常驻 ----------
         if self._dry_run:
             contents.append({'component': 'VAlert', 'props': {
-                'type': 'warning', 'variant': 'tonal', 'class': 'mb-2', 'prepend-icon': 'mdi-test-tube',
+                'type': 'warning', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
+                'prepend-icon': 'mdi-test-tube',
                 'text': 'Dry-run 预览已开启：运行只会把待洗版清单写入日志，不会创建订阅。'}})
         if not options:
             contents.append({'component': 'VAlert', 'props': {
-                'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
+                'type': 'info', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
                 'prepend-icon': 'mdi-alert-circle-outline',
                 'text': '暂未读取到未观看清单，请检查媒体服务器配置与连通性；下方历史记录不受影响。'}})
         if selected:
@@ -1228,7 +1231,7 @@ class EmbyUnwatchedWash(_PluginBase):
                     extra += (f'另有 {len(sel_gone)} 部已不在清单中'
                               f'（可能已不再未观看），运行时同样会跳过。')
             contents.append({'component': 'VAlert', 'props': {
-                'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
+                'type': 'warning', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
                 'prepend-icon': 'mdi-format-list-checks',
                 'text': f'已勾选 {len(selected)} 部影视：运行时只对这批创建洗版订阅，'
                         f'其余未观看内容会跳过；在下方清单点「清空全部」可恢复处理全部未观看。'
@@ -1242,13 +1245,14 @@ class EmbyUnwatchedWash(_PluginBase):
                 rules.append('排除关键字：' + '、'.join(self._exclude_keywords))
             tail = '（命中即跳过该库，下方清单中也不显示这些条目）'
             contents.append({'component': 'VAlert', 'props': {
-                'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
+                'type': 'info', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
                 'prepend-icon': 'mdi-filter-off-outline',
                 'text': '；'.join(rules) + tail}})
 
         # 两个区域的关系容易混淆，常驻一条说明（这两处数据必须始终一致）
         contents.append({'component': 'VAlert', 'props': {
-            'type': 'info', 'variant': 'tonal', 'density': 'compact', 'class': 'mb-2',
+            'type': 'info', 'variant': 'tonal', 'density': 'compact',
+            'class': 'mb-2 text-subtitle-2',
             'prepend-icon': 'mdi-link-variant',
             'text': '「清单勾选」与「洗版记录」已联动：勾选 = 已提交过洗版订阅；'
                     '取消勾选会同步删除它的洗版记录，删除记录也会同步取消勾选；'
