@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.24"
+    plugin_version = "1.25"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -1005,10 +1005,16 @@ class EmbyUnwatchedWash(_PluginBase):
                         visible_ids.add(int(opt.get('value')))
                     except (TypeError, ValueError):
                         continue
-                out_of_list = [x for x in selected if x not in visible_ids]
-                if out_of_list:
-                    extra = (f'其中 {len(out_of_list)} 部已不在下方清单里'
-                             f'（所属媒体库被排除，或已不再未观看），运行时同样会跳过。')
+                excluded_ids = set(getattr(self, '_options_excluded_ids', set()) or set())
+                sel_excluded = [x for x in selected if x in excluded_ids]
+                sel_gone = [x for x in selected
+                            if x not in visible_ids and x not in excluded_ids]
+                if sel_excluded:
+                    extra += (f'其中 {len(sel_excluded)} 部已被排除规则隐藏（不会参与洗版，'
+                              f'如需洗版请先取消对应的排除媒体库）。')
+                if sel_gone:
+                    extra += (f'另有 {len(sel_gone)} 部已不在清单中'
+                              f'（可能已不再未观看），运行时同样会跳过。')
             contents.append({'component': 'VAlert', 'props': {
                 'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
                 'prepend-icon': 'mdi-format-list-checks',
@@ -1973,34 +1979,44 @@ class EmbyUnwatchedWash(_PluginBase):
                     lib_name = (it.get('LibraryName') or '').strip()
                     if lib_name:
                         library_names.add(lib_name)
-                    if not item_name or item_name in seen:
+                    if not item_name:
                         continue
                     t = it.get('Type')
                     if t not in ('Movie', 'Series'):
-                        continue
-                    # 命中「排除媒体库 / 排除关键字」的条目直接从清单里隐去：
-                    # 它们在运行阶段本来就会被 `_build_wash_tasks` 跳过，
-                    # 留在清单里只会造成「能勾选、勾了却没反应」的误导。
-                    if self._is_excluded_item(it):
-                        hidden += 1
-                        if lib_name:
-                            hidden_libs.add(lib_name)
-                        tid_hidden = self._tmdbid_of_item(it)
-                        if tid_hidden:
-                            excluded_ids.add(tid_hidden)
                         continue
                     if t == 'Series' and not self._include_series:
                         continue
                     pid = (it.get('ProviderIds') or {}).get('Tmdb')
                     if not pid:
                         continue
+                    try:
+                        tid = int(pid)
+                    except (TypeError, ValueError):
+                        continue
+                    # 命中「排除媒体库 / 排除关键字」的条目直接从清单里隐去：
+                    # 它们在运行阶段本来就会被 `_build_wash_tasks` 跳过，
+                    # 留在清单里只会造成「能勾选、勾了却没反应」的误导。
+                    #
+                    # ⚠️ 统计口径必须放在「已取到 tmdbid」之后：只有本来就进得了清单的条目
+                    # 才算「被隐藏」。若放在前面，会把一堆没有 tmdbid、根本不参与候选的条目
+                    # 也算进去（本机实测数字会从 7 虚高到 11）。
+                    if self._is_excluded_item(it):
+                        hidden += 1
+                        if lib_name:
+                            hidden_libs.add(lib_name)
+                        excluded_ids.add(tid)
+                        continue
+                    # 同名条目只保留第一条（跨库同名时按拉取顺序先到先得）；
+                    # 被排除的条目**不进 seen**，免得它把别的库里同名条目也顶掉。
+                    if item_name in seen:
+                        continue
+                    seen.add(item_name)
                     year = it.get('ProductionYear') or ''
                     typelabel = '电影' if t == 'Movie' else '剧集'
                     options.append({
                         'title': f"{item_name} ({year}) [{typelabel}]",
-                        'value': int(pid),
+                        'value': tid,
                     })
-                    seen.add(item_name)
                     if len(options) >= cap:
                         logger.info(f"EmbyUnwatchedWash 媒体库选项已截断至 {cap} 条")
                         break
