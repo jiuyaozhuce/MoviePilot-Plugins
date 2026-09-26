@@ -56,7 +56,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.39"
+    plugin_version = "1.40"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -1766,28 +1766,42 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.warning(f"【未看洗版】读取媒体库以定位未观看集失败（将按整部洗版）：{e}")
         return result
 
-    def _is_excluded_item(self, item: dict) -> bool:
+    def _is_excluded_library(self, lib_name: str) -> bool:
         """
-        按「排除媒体库 / 排除关键字」判断某条未观看条目是否要跳过。
-        基于条目的 LibraryName（库名）：
+        判断某个媒体库名是否整库命中「排除媒体库 / 排除关键字」：
         - exclude_libraries：库名精确匹配（去空格、忽略大小写）
         - exclude_keywords：库名子串匹配（忽略大小写）
-        没有配置任何排除规则时返回 False（不排除）。
+        没有配置任何排除规则、或库名为空时返回 False（不排除）。
+        供拉取阶段整库预排除使用——被排除的库不再发起任何分页请求，
+        免得把音乐/儿童这类库的成百上千条未观看全拉回来再逐条丢弃。
         """
         if not self._exclude_libraries and not self._exclude_keywords:
             return False
-        lib = (item.get("LibraryName") or "").strip()
+        lib = (lib_name or "").strip()
         if not lib:
             return False
         lib_lc = lib.lower()
-        for lib_name in self._exclude_libraries:
-            if lib_name and lib_name.strip().lower() == lib_lc:
-                logger.debug(f"【未看洗版】命中排除媒体库，跳过：{item.get('Name')} (库={lib})")
+        for cfg_name in self._exclude_libraries:
+            if cfg_name and cfg_name.strip().lower() == lib_lc:
                 return True
         for kw in self._exclude_keywords:
             if kw and kw.strip().lower() in lib_lc:
-                logger.debug(f"【未看洗版】命中排除关键字 '{kw}'，跳过：{item.get('Name')} (库={lib})")
                 return True
+        return False
+
+    def _is_excluded_item(self, item: dict) -> bool:
+        """
+        按「排除媒体库 / 排除关键字」判断某条未观看条目是否要跳过。
+        基于条目的 LibraryName（库名）委托给 `_is_excluded_library` 判定。
+        拉取阶段已做整库预排除（v1.40），这里是条目级双保险
+        （例如缓存里的旧条目、或后续新增的排除配置）。
+        """
+        lib = (item.get("LibraryName") or "").strip()
+        if not lib:
+            return False
+        if self._is_excluded_library(lib):
+            logger.debug(f"【未看洗版】命中排除规则，跳过条目：{item.get('Name')} (库={lib})")
+            return True
         return False
 
     def _library_entries(self, instance, stype: str = 'emby') -> List[dict]:
@@ -2208,6 +2222,11 @@ class EmbyUnwatchedWash(_PluginBase):
             all_items = []
             limit = 500
             for lib_name, parent_id in targets:
+                # 整库预排除（v1.40）：被排除的库连分页请求都不发起，
+                # 免得把儿童库这类成百上千条未观看全拉回来再逐条丢弃。
+                if lib_name and self._is_excluded_library(lib_name):
+                    logger.info(f"【未看洗版】媒体库「{lib_name}」已被排除，整库跳过不扫描")
+                    continue
                 lib_count = 0
                 for user in users:
                     # 分页拉全：按加入日期降序，仅取未观看
@@ -2270,6 +2289,11 @@ class EmbyUnwatchedWash(_PluginBase):
             all_items = []
             limit = 500
             for lib_name, parent_id in targets:
+                # 整库预排除（v1.40）：被排除的库连分页请求都不发起，
+                # 免得把音乐库这类成百上千条未观看全拉回来再逐条丢弃。
+                if lib_name and self._is_excluded_library(lib_name):
+                    logger.info(f"【未看洗版】媒体库「{lib_name}」已被排除，整库跳过不扫描")
+                    continue
                 lib_count = 0
                 for user in users:
                     # 分页拉全：按加入日期降序，仅取未观看
