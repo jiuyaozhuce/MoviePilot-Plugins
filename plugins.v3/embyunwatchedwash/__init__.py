@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.32"
+    plugin_version = "1.33"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -99,6 +99,15 @@ class EmbyUnwatchedWash(_PluginBase):
     _only_once: bool = False
     _include_series: bool = True
     _selected_items: List[int] = []
+    # 自动化模式：开启后忽略勾选清单，直接对全部（未排除的）媒体库未观看影视洗版。
+    # 适合「新片入库后自动洗版」的场景 —— 配合 cron 定期运行即可，无需手动勾选。
+    # 关闭 = 手动选择模式：只处理详情页清单里勾选的条目。
+    # 注意优先级：本开关为真时**高于** selected_items（见 _is_auto_full 的说明）。
+    _auto_full: bool = False
+    # 是否在自动化模式下依然保留「手动选择」入口（详情页清单）。
+    # 关闭（默认）= 自动化模式隐藏清单，界面更简洁；
+    # 开启 = 自动化模式仍显示清单，便于临时增补（清单会与全量结果合并，不会覆盖）。
+    _auto_full_show_picker: bool = False
     # 剧集按「未观看集」精确定位：只从该季第一个未看的集开始洗版（设置订阅的开始集数）
     _series_episode_level: bool = True
     # 单次运行最多处理的影视数量（0 = 不限），用于避免大库一次性建过多订阅
@@ -119,6 +128,9 @@ class EmbyUnwatchedWash(_PluginBase):
             self._only_once = config.get("only_once")
             self._include_series = config.get("include_series")
             self._selected_items = config.get("selected_items") or []
+            # 默认 False：升级后行为与旧版一致（不开启即保持原样），不会突然全库洗版
+            self._auto_full = bool(config.get("auto_full", False))
+            self._auto_full_show_picker = bool(config.get("auto_full_show_picker", False))
             self._series_episode_level = config.get("series_episode_level")
             if self._series_episode_level is None:
                 self._series_episode_level = True
@@ -146,6 +158,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 "only_once": self._only_once,
                 "include_series": self._include_series,
                 "selected_items": self._selected_items,
+                "auto_full": self._auto_full,
+                "auto_full_show_picker": self._auto_full_show_picker,
                 "series_episode_level": self._series_episode_level,
                 "limit": self._limit,
                 "exclude_libraries": self._exclude_libraries,
@@ -379,6 +393,25 @@ class EmbyUnwatchedWash(_PluginBase):
                 out.append(tid)
         return out
 
+    def _is_auto_full(self) -> bool:
+        """
+        是否按「自动化模式」运行 —— 忽略勾选清单，直接对全部（未排除的）媒体库洗版。
+
+        判定优先级（高 -> 低）：
+          1. auto_full 开关为真            -> 自动化（新片入库后自动洗版）；
+          2. 勾选清单非空                   -> 手动选择模式；
+          3. 勾选清单为空                   -> 回落到旧的「全量扫描」行为（向后兼容）。
+
+        之所以抽成方法而不是散落各处判断 `self._auto_full`，是因为「是否全量」这个
+        结论被 sync()、_build_plan()、get_page()、_repair_selection() 四处共用；
+        集中判定可以保证「界面显示的模式」与「实际跑的模式」永远一致，
+        不会出现界面说手动、实际跑了全量的错位。
+        """
+        if self._auto_full:
+            return True
+        # 旧兼容：勾选清单为空时沿用旧语义（处理全部未观看）
+        return not self._normalized_selected()
+
     def _persist_selected(self, items: List[int]) -> None:
         """
         把勾选结果写回插件配置。
@@ -392,6 +425,8 @@ class EmbyUnwatchedWash(_PluginBase):
             "only_once": False,
             "include_series": self._include_series,
             "selected_items": items,
+            "auto_full": self._auto_full,
+            "auto_full_show_picker": self._auto_full_show_picker,
             "series_episode_level": self._series_episode_level,
             "limit": self._limit,
             "exclude_libraries": self._exclude_libraries,
@@ -552,7 +587,12 @@ class EmbyUnwatchedWash(_PluginBase):
         `selected_items` 为空有特殊含义 ——「不勾选任何项 = 处理全部未观看」，
         所以只要存在洗版记录，勾选清单就**不能**为空，否则会被当成「全量模式」，
         把整个媒体库重新洗一遍。旧版本删历史不联动勾选，正是踩了这个坑。
+
+        自动化模式（auto_full）下必须跳过：该模式下清单本就不参与判定，
+        补勾选既无意义，还会在用户日后关掉开关时凭空多出一堆勾选项。
         """
+        if self._auto_full:
+            return
         try:
             history = self.get_data('history') or []
         except Exception as e:
@@ -779,7 +819,17 @@ class EmbyUnwatchedWash(_PluginBase):
                             hint='大库建议先设 5~20 试跑，确认无误后再放开，避免一次创建上千订阅',
                             **{'persistent-hint': True}),
 
-                    # ---------- 3. 洗版范围 ----------
+                    # ---------- 3. 运行模式 ----------
+                    section('运行模式'),
+                    control('VSwitch', 'auto_full', '自动化洗版（新入库自动订阅）', md=6,
+                            hint='开启：忽略下方清单，对全部（未排除的）媒体库未观看影视洗版；配合执行周期即可实现「新片入库后自动洗版」。'
+                                 '关闭：仅处理详情页清单里勾选的条目',
+                            **{'persistent-hint': True}),
+                    control('VSwitch', 'auto_full_show_picker', '自动化模式仍显示勾选清单', md=6,
+                            hint='仅在上方开关开启时生效。开启后详情页继续显示清单，可临时勾选补充；默认关闭，界面更简洁',
+                            **{'persistent-hint': True}),
+
+                    # ---------- 4. 洗版范围 ----------
                     section('洗版范围'),
                     control('VSwitch', 'include_series', '包含剧集', md=6,
                             hint='关闭则仅对电影洗版',
@@ -788,7 +838,7 @@ class EmbyUnwatchedWash(_PluginBase):
                             hint='开启：按季订阅并把「开始集数」设为该季第一个未看的集（已看集不洗）；关闭：整部剧洗版',
                             **{'persistent-hint': True}),
 
-                    # ---------- 4. 排除规则 ----------
+                    # ---------- 5. 排除规则 ----------
                     section('排除规则'),
                     control('VSelect', 'exclude_libraries', '排除媒体库', md=6,
                             items=library_items, multiple=True, chips=True, clearable=True,
@@ -801,7 +851,7 @@ class EmbyUnwatchedWash(_PluginBase):
                             hint='对库名做子串匹配（忽略大小写），命中即跳过该库',
                             **{'persistent-hint': True}),
 
-                    # ---------- 5. 试运行与手动触发 ----------
+                    # ---------- 6. 试运行与手动触发 ----------
                     section('试运行与手动触发'),
                     control('VSwitch', 'dry_run', 'Dry-run 预览模式', md=6,
                             hint='只打印待洗版清单，不真正创建订阅，适合正式运行前试跑',
@@ -820,6 +870,9 @@ class EmbyUnwatchedWash(_PluginBase):
             # 兼容旧配置：手动指定清单的配置项已从配置页移除（未观看清单统一在
             # 「数据查看」页查看），此处保留键位以免历史配置读出异常。
             "selected_items": [],
+            # 默认关闭：升级后行为与旧版一致，不会突然对全库建订阅
+            "auto_full": False,
+            "auto_full_show_picker": False,
             "series_episode_level": True,
             "limit": 0,
             "exclude_libraries": [],
@@ -1153,17 +1206,28 @@ class EmbyUnwatchedWash(_PluginBase):
                 'type': 'warning', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
                 'prepend-icon': 'mdi-test-tube',
                 'text': 'Dry-run 预览已开启：运行只会把待洗版清单写入日志，不会创建订阅。'}})
-        if not options:
+        if not options and not (self._auto_full and not self._auto_full_show_picker):
             contents.append({'component': 'VAlert', 'props': {
                 'type': 'info', 'variant': 'tonal', 'class': 'mb-2 text-subtitle-2',
                 'prepend-icon': 'mdi-alert-circle-outline',
                 'text': '暂未读取到未观看清单，请检查媒体服务器配置与连通性；下方历史记录不受影响。'}})
 
-        # ---------- 2. 媒体库未观看清单（可勾选，点击即保存） ----------
-        contents.append(self._section_title(
-            '媒体库未观看清单',
-            '点条目即勾选并立即保存 · 未勾选任何项则处理全部未观看 · 取消勾选会一并删除其洗版记录'))
-        contents.append(self._unwatched_card(options, page=self._saved_page()))
+        # ---------- 2. 自动化模式提示 / 媒体库未观看清单（可勾选，点击即保存） ----------
+        if self._auto_full and not self._auto_full_show_picker:
+            # 自动化模式：清单不参与运行，用提示卡代替，避免用户误以为还要手动勾选
+            contents.append(self._section_title('运行模式', '自动化洗版 · 清单不参与'))
+            contents.append({'component': 'VAlert', 'props': {
+                'type': 'success', 'variant': 'tonal', 'class': 'mb-3 text-subtitle-2',
+                'prepend-icon': 'mdi-auto-fix',
+                'text': '已开启「自动化洗版」：每次运行会对全部（未排除的）媒体库未观看影视建洗版订阅，'
+                        '无需手动勾选。新电影 / 剧集入库后，将在下一个执行周期自动处理。'
+                        '如需改回手动选择，请在「插件配置 → 运行模式」中关闭该开关。'}})
+        else:
+            picker_hint = ('点条目即勾选并立即保存 · 未勾选任何项则处理全部未观看 · 取消勾选会一并删除其洗版记录'
+                           if not self._auto_full else
+                           '自动化模式下清单可留空；勾选与否都不影响全量洗版结果，仅作临时补充之用')
+            contents.append(self._section_title('媒体库未观看清单', picker_hint))
+            contents.append(self._unwatched_card(options, page=self._saved_page()))
 
         # ---------- 4. 洗版历史 ----------
         contents.append(self._section_title(
@@ -1304,10 +1368,13 @@ class EmbyUnwatchedWash(_PluginBase):
                 logger.info(f"【未看洗版】去重依据：洗版记录 {len(recorded_keys)} 条"
                             f"（与缓存取并集，记录内的条目不会重复提交）")
 
-            # 手动选择模式
+            # 手动选择模式 / 自动化全量模式
             selected = [str(x) for x in (self._selected_items or [])]
+            # 自动化模式（auto_full）优先于清单：开了开关就整库洗，清单不参与。
+            # 注意 selected 仍原样保留 —— _plan_by_tmdb 之类需要它做过滤的场景不受影响。
+            auto_mode = self._auto_full
 
-            if selected:
+            if selected and not auto_mode:
                 logger.info(f"【未看洗版】运行模式：手动选择（指定 {len(selected)} 个 tmdbid 洗版）")
                 # 开启剧集集粒度时，读取媒体库以定位所选剧集「未观看的集」（只算勾选的 tmdbid）
                 plan_by_tmdb: Dict[str, List[dict]] = {}
@@ -1341,7 +1408,8 @@ class EmbyUnwatchedWash(_PluginBase):
                             skipped_count += 1
             else:
                 servers = self._get_server_instances()
-                logger.info(f"【未看洗版】运行模式：全量扫描 | 包含剧集={self._include_series} | "
+                mode_label = "全量扫描（自动化开关已开启）" if auto_mode else "全量扫描"
+                logger.info(f"【未看洗版】运行模式：{mode_label} | 包含剧集={self._include_series} | "
                             f"剧集集粒度={self._series_episode_level} | 单次上限={self._limit or '不限'} | "
                             f"媒体服务器={','.join(n for _, n, _ in servers) or '未检测到已配置服务器'}")
                 # 全量模式：扫描媒体库未观看影视
@@ -1461,7 +1529,8 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         try:
             selected = [str(x) for x in (self._selected_items or [])]
-            if selected:
+            # 自动化模式优先：开关开了就整库建计划，忽略勾选清单（与 sync() 判定一致）
+            if selected and not self._auto_full:
                 # 手动模式：读取媒体库定位剧集未观看的季/集（只算被勾选的，别全库建任务）
                 plan_by_tmdb: Dict[str, List[dict]] = {}
                 if self._include_series and self._series_episode_level:
