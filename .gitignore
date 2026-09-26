@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# 本地临时部署/校验脚本（_ 前缀），不入库
+_*.sh
+_*.py
