@@ -3,7 +3,7 @@
     "name": "Emby未看洗版",
     "description": "扫描 Emby/Jellyfin 中未观看（IsUnplayed）的影视，自动创建「洗版」订阅以升级更高画质版本。基于官方 bestfilmversion 改造，仅将筛选条件从收藏改为未观看。",
     "labels": "媒体库",
-    "version": "1.40",
+    "version": "1.41",
     "icon": "icon.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -12,6 +12,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.41": "洗版后清理：监听 MoviePilot「订阅完成」事件，延迟核对（默认 10 分钟，可配）后删除被洗版的低质量旧条目——只调 Emby/Jellyfin 删除接口（软链接库结构下仅删软链），不碰下载器种子与原始文件；同一电影/同一集多版本时保留画质最高者，画质信息不全的条目永不删除，Dry-run 只记录不删；删除任务持久化（跨重启不丢），事件调度不可用时由每轮扫描兜底；设置页新增「洗版后清理」分区，默认关闭",
       "v1.40": "整库预排除：拉取未观看清单时先按「排除媒体库/排除关键字」判定库名，被排除的媒体库直接跳过、不再发起任何分页请求（此前是全量拉回再逐条丢弃，音乐/儿童这类大库白白消耗 API 往返与带宽）。新增 _is_excluded_library 库名级判定，条目级 _is_excluded_item 重构为委托调用、保留作双保险；设置页下拉选项仍列出全部库名，排除配置的勾选与保存行为不变",
       "v1.39": "洗版规则组可配置：设置页「洗版范围」新增「电影洗版规则组」「剧集洗版规则组」两个下拉，选项动态读取 MoviePilot「过滤规则」里用户自定义的规则组（systemconfig.UserFilterRuleGroups），留空回落内置默认（电影=电影洗版、剧集=电视剧洗版）。创建洗版订阅时按所选组显式写入订阅的 filter_groups（延续 v1.38：剧集只挂单组，不被系统「电影洗版+电视剧洗版」两组串行 AND 过滤）；两组配置均补进 init_plugin 与 _persist_selected 的整份回写，避免勾选保存时丢键",
       "v1.38": "洗版订阅显式绑定过滤规则组：电影挂「电影洗版」、剧集挂「电视剧洗版」（v1.38）。此前插件创建订阅不传 filter_groups：电影靠「默认电影订阅配置」带入「电影洗版」，剧集则 filter_groups 为空，MP 运行时回退到系统「洗版过滤规则组」（电影洗版+电视剧洗版），导致剧集种子要同时满足两组规则（串行 AND）才下载。现在创建订阅时按类型显式传入对应规则组，剧集只按「电视剧洗版」单组过滤（每级仍要求 FREE，即只下免费），不再被电影组叠加过滤；运行日志附带「规则组=」字段便于核对",

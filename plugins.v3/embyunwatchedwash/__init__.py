@@ -56,7 +56,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.40"
+    plugin_version = "1.41"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -79,6 +79,9 @@ class EmbyUnwatchedWash(_PluginBase):
     # 洗版过滤规则组（v1.39）：设置页可选，留空回落到内置默认（电影洗版/电视剧洗版）
     _filter_group_movie: str = ""
     _filter_group_tv: str = ""
+    # 洗版后清理（v1.41）：订阅完成后删除被洗版的低质量旧条目（只调 Emby 删除接口删软链）
+    _delete_washed_old: bool = False
+    _delete_delay_minutes: int = 10
     # 媒体库未观看选项的 TTL 缓存（配置页/详情页频繁调用，避免每次全量扫描）
     _options_cache: List[dict] = []
     _options_cache_time: float = 0.0
@@ -183,6 +186,12 @@ class EmbyUnwatchedWash(_PluginBase):
             # 洗版过滤规则组（v1.39）：留空回落到内置默认，保持与 v1.38 行为一致
             self._filter_group_movie = str(config.get("filter_group_movie") or "").strip()
             self._filter_group_tv = str(config.get("filter_group_tv") or "").strip()
+            # 洗版后清理（v1.41）：默认关闭——这是「删除」动作，误删代价高，需用户显式开启
+            self._delete_washed_old = bool(config.get("delete_washed_old", False))
+            try:
+                self._delete_delay_minutes = max(1, int(config.get("delete_delay_minutes") or 10))
+            except (TypeError, ValueError):
+                self._delete_delay_minutes = 10
 
         # 配置自愈：洗版记录与勾选列表必须一致（详见方法注释）
         self._repair_selection()
@@ -207,6 +216,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 "dry_run": self._dry_run,
                 "filter_group_movie": self._filter_group_movie,
                 "filter_group_tv": self._filter_group_tv,
+                "delete_washed_old": self._delete_washed_old,
+                "delete_delay_minutes": self._delete_delay_minutes,
                 "exclude_library_names": self._exclude_libraries,
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -509,6 +520,8 @@ class EmbyUnwatchedWash(_PluginBase):
             "dry_run": self._dry_run,
             "filter_group_movie": self._filter_group_movie,
             "filter_group_tv": self._filter_group_tv,
+            "delete_washed_old": self._delete_washed_old,
+            "delete_delay_minutes": self._delete_delay_minutes,
             "exclude_library_names": self._exclude_libraries,
         })
 
@@ -989,6 +1002,17 @@ class EmbyUnwatchedWash(_PluginBase):
                             hint='对库名做子串匹配（忽略大小写），命中即跳过该库',
                             **{'persistent-hint': True}),
 
+                    # ---------- 5b. 洗版后清理 ----------
+                    section('洗版后清理'),
+                    control('VSwitch', 'delete_washed_old', '洗版完成后删除旧版本', md=6,
+                            hint='洗版订阅完成后，自动删除该电影/该集的低质量旧条目：只调 Emby 删除接口，'
+                                 '删的是软链接，不碰下载器种子与原始文件；同一内容有多个版本时保留画质最高的一个。默认关闭',
+                            **{'persistent-hint': True}),
+                    control('VTextField', 'delete_delay_minutes', '删除前延迟（分钟）', md=6,
+                            placeholder='默认 10',
+                            hint='收到「订阅完成」事件后延迟 N 分钟再核对删除，等待新版入库与媒体库刷新，避免误删',
+                            **{'persistent-hint': True}),
+
                     # ---------- 6. 试运行与手动触发 ----------
                     section('试运行与手动触发'),
                     control('VSwitch', 'dry_run', 'Dry-run 预览模式', md=6,
@@ -1021,6 +1045,8 @@ class EmbyUnwatchedWash(_PluginBase):
             "exclude_keywords": [],
             "filter_group_movie": "",
             "filter_group_tv": "",
+            "delete_washed_old": False,
+            "delete_delay_minutes": 10,
             "dry_run": False,
             "exclude_library_names": []  # 兼容旧版：UI 选择时存储的库名列表
         }
@@ -1467,6 +1493,13 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.warning("【未看洗版】获取任务锁超时，已有实例在运行，本次跳过")
             return
         try:
+            # ---------- 洗版后清理（v1.41）：先处理到期的旧版本删除任务 ----------
+            # 兜底机制：事件触发的一次性核对若因插件重启丢失，最迟下一轮扫描也会补上。
+            # 异常只记日志，绝不影响主洗版流程。
+            try:
+                self._process_delete_tasks()
+            except Exception as _del_err:
+                logger.error(f"【未看洗版】处理洗版后清理任务异常（不影响本轮洗版）：{_del_err}")
             logger.info("【未看洗版】========== 开始扫描任务 ==========")
             # ---------- Dry-run 预览模式：只列出计划，不创建订阅 ----------
             if self._dry_run:
@@ -2193,6 +2226,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 "season": season,
                 "start_episode": start_episode,
                 "key": key,
+                # v1.41：记录订阅 ID，供「订阅完成」事件精确匹配洗版来源（旧记录无此字段，走兜底匹配）
+                "subscribe_id": sid,
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
             # 历史记录上限：超过 500 条时按时间淘汰最旧的，避免 plugindata 无限膨胀
@@ -2681,6 +2716,368 @@ class EmbyUnwatchedWash(_PluginBase):
             return None
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # 洗版后清理（v1.41）：删除被洗版的低质量旧条目
+    # ------------------------------------------------------------------
+    # 背景：媒体库是 MoviePilot 整理后的软链接结构，洗版是「新增高画质文件」而非
+    # 覆盖，完成后同一电影/同一集会新旧两个条目并存。本组逻辑在订阅完成事件后
+    # 核对并删除低质量旧条目——只调 Emby 删除接口（删的是软链接），
+    # 绝不触碰下载器种子与原始文件。
+
+    @staticmethod
+    def _server_http_base(inst) -> Optional[Tuple[str, str]]:
+        """
+        取媒体服务器的 (base_url, apikey)：Emby 挂 /emby 前缀、Jellyfin 挂根路径，
+        返回以 /emby 结尾的 base（调用方对 Jellyfin 失败时自行回退根路径重试）。
+        """
+        host = getattr(inst, "host", "") or getattr(inst, "_host", "")
+        apikey = getattr(inst, "apikey", "") or getattr(inst, "_apikey", "")
+        if not host or not apikey:
+            return None
+        host = host.rstrip("/")
+        base = host if host.endswith("/emby") else (host + "/emby")
+        return base, apikey
+
+    @staticmethod
+    def _quality_key(item: dict) -> Tuple[int, int, int]:
+        """
+        条目画质排序键 (视频高度, 视频宽度, 总字节)。
+        从 MediaSources.MediaStreams 里的视频流取最大宽高；取不到时全 0。
+        全 0 表示识别信息不全——这类条目**永远不参与删除**（宁漏勿误删）。
+        """
+        w = h = 0
+        size = 0
+        for ms in (item.get("MediaSources") or []):
+            if not isinstance(ms, dict):
+                continue
+            try:
+                size += int(ms.get("Size") or 0)
+            except (TypeError, ValueError):
+                pass
+            for st in (ms.get("MediaStreams") or []):
+                if not isinstance(st, dict) or st.get("Type") != "Video":
+                    continue
+                try:
+                    w = max(w, int(st.get("Width") or 0))
+                    h = max(h, int(st.get("Height") or 0))
+                except (TypeError, ValueError):
+                    continue
+        return (h, w, size)
+
+    def _movie_versions(self, inst, tmdb_id: int) -> Optional[List[dict]]:
+        """
+        按 tmdbid 查媒体服务器上该电影的**全部**条目（多版本 = 多条目）。
+        复用 _movie_played 验证过的 AnyProviderIdEquals 精确定位，Fields 追加
+        Path/MediaSources/DateCreated 供画质对比与日志。失败返回 None（未知，不删）。
+        """
+        info = self._server_http_base(inst)
+        if not info:
+            return None
+        base, apikey = info
+        import requests as _rq
+        params = {
+            "api_key": apikey,
+            "Recursive": "true",
+            "IncludeItemTypes": "Movie",
+            "AnyProviderIdEquals": f"Tmdb.{tmdb_id}",
+            "Fields": "Path,MediaSources,DateCreated",
+        }
+        try:
+            r = _rq.get(f"{base}/Items", params=params, timeout=15)
+            if r.status_code != 200:
+                # Jellyfin 无 /emby 前缀：回退根路径重试
+                r = _rq.get(f"{base[:-5]}/Items", params=params, timeout=15)
+            if r.status_code != 200:
+                logger.warning(f"【未看洗版】查询电影版本条目失败（HTTP {r.status_code}）：tmdb={tmdb_id}")
+                return None
+            items = [it for it in ((r.json() or {}).get("Items") or []) if isinstance(it, dict)]
+            return items
+        except Exception as e:
+            logger.warning(f"【未看洗版】查询电影版本条目异常（tmdb={tmdb_id}）：{e}")
+            return None
+
+    def _episode_versions(self, inst, series_id: str, season: int, episode: int) -> Optional[List[dict]]:
+        """
+        查询某剧某季某集的**全部**条目（同集号多版本 = 多条目并存）。
+        复用 _episodes_of_series 验证过的 /Shows/{id}/Episodes 端点。失败返回 None。
+        """
+        info = self._server_http_base(inst)
+        if not info:
+            return None
+        base, apikey = info
+        import requests as _rq
+        params = {
+            "api_key": apikey,
+            "Fields": "Path,MediaSources,DateCreated",
+        }
+        try:
+            r = _rq.get(f"{base}/Shows/{series_id}/Episodes", params=params, timeout=15)
+            if r.status_code != 200:
+                r = _rq.get(f"{base[:-5]}/Shows/{series_id}/Episodes", params=params, timeout=15)
+            if r.status_code != 200:
+                logger.warning(f"【未看洗版】查询剧集集条目失败（HTTP {r.status_code}）：series_id={series_id}")
+                return None
+            items = []
+            for it in ((r.json() or {}).get("Items") or []):
+                if not isinstance(it, dict):
+                    continue
+                try:
+                    if int(it.get("ParentIndexNumber") or -1) == int(season) \
+                            and int(it.get("IndexNumber") or -1) == int(episode):
+                        items.append(it)
+                except (TypeError, ValueError):
+                    continue
+            return items
+        except Exception as e:
+            logger.warning(f"【未看洗版】查询剧集集条目异常（series_id={series_id}）：{e}")
+            return None
+
+    def _delete_server_item(self, inst, item: dict) -> bool:
+        """
+        调用 Emby/Jellyfin 删除接口移除单个条目（DELETE /Items/{id}）。
+        只删媒体服务器条目（软链接场景下即删软链），不触碰下载器与原始文件。
+        """
+        info = self._server_http_base(inst)
+        if not info:
+            return False
+        base, apikey = info
+        import requests as _rq
+        item_id = str(item.get("Id") or "")
+        if not item_id:
+            return False
+        params = {"api_key": apikey}
+        try:
+            r = _rq.delete(f"{base}/Items/{item_id}", params=params, timeout=15)
+            if r.status_code not in (200, 204):
+                # Jellyfin 无 /emby 前缀：回退根路径重试
+                r = _rq.delete(f"{base[:-5]}/Items/{item_id}", params=params, timeout=15)
+            if r.status_code in (200, 204):
+                return True
+            logger.error(f"【未看洗版】删除条目失败（HTTP {r.status_code}）："
+                         f"{item.get('Name')} / {item.get('Path')} —— "
+                         f"请检查媒体服务器是否允许 API 删除媒体")
+            return False
+        except Exception as e:
+            logger.error(f"【未看洗版】删除条目异常：{item.get('Name')} - {e}")
+            return False
+
+    def _subinfo_get(self, info: dict, *names):
+        """从订阅快照里按多个候选键名取值（v3 快照字段名随版本有差异）。"""
+        for n in names:
+            v = info.get(n)
+            if v is not None:
+                return v
+        return None
+
+    @eventmanager.register(EventType.SubscribeComplete)
+    def subscribe_complete_handler(self, event):
+        """
+        订阅完成事件 → 匹配本插件洗版记录 → 排入「删除旧版本」待办任务。
+
+        匹配规则：
+        1) 优先按 subscribe_id 精确匹配（v1.41 起创建订阅时会记进 history）；
+        2) 兜底：订阅快照 username == '未看洗版' 且 tmdbid 匹配（兼容旧记录）。
+        匹配不到 = 不是本插件创建的订阅，直接忽略。
+        """
+        try:
+            if not self._enabled or not self._delete_washed_old:
+                return
+            ed = getattr(event, "event_data", None) or {}
+            sid = ed.get("subscribe_id")
+            sub_info = ed.get("subscribe_info") or {}
+            history = self.get_data('history') or []
+            hit = None
+            if sid is not None:
+                for h in history:
+                    if h.get("subscribe_id") is not None \
+                            and str(h.get("subscribe_id")) == str(sid):
+                        hit = h
+                        break
+            if hit is None:
+                # 兜底：确认这是本插件账号的订阅，再按 tmdbid 匹配旧记录
+                if str(self._subinfo_get(sub_info, "username", "user", "user_name") or "") != WASH_USERNAME:
+                    return
+                sub_tmdb = self._subinfo_get(sub_info, "tmdbid", "tmdb_id", "media_id")
+                try:
+                    sub_tmdb = int(str(sub_tmdb))
+                except (TypeError, ValueError):
+                    return
+                for h in history:
+                    if h.get("tmdbid") is not None and int(h.get("tmdbid")) == sub_tmdb:
+                        hit = h
+                        break
+            if hit is None:
+                return
+            self._queue_delete_task(hit, sid)
+        except Exception as e:
+            logger.error(f"【未看洗版】处理订阅完成事件异常：{e}\n{traceback.format_exc()}")
+
+    def _queue_delete_task(self, hit: dict, subscribe_id) -> None:
+        """
+        把一条「洗版完成」记录排队为删除任务（持久化，跨重启不丢），
+        并安排一次性核对（插件自有调度器不可用时靠每轮 sync 兜底）。
+        """
+        tasks = self.get_data('delete_tasks') or {}
+        # 同一订阅只排一次（事件可能重复投递）
+        sig = str(subscribe_id or f"{hit.get('tmdbid')}:{hit.get('season')}:{hit.get('start_episode')}")
+        for t in tasks.values():
+            if t.get("sig") == sig and t.get("status") == "pending":
+                return
+        now = datetime.now()
+        exec_at = now + timedelta(minutes=self._delete_delay_minutes)
+        task_id = now.strftime("%Y%m%d%H%M%S") + f"_{int(now.timestamp() * 1000) % 100000}"
+        tasks[task_id] = {
+            "sig": sig,
+            "title": hit.get("title"),
+            "year": hit.get("year"),
+            "tmdbid": hit.get("tmdbid"),
+            "type": hit.get("type"),
+            "season": hit.get("season"),
+            "start_episode": hit.get("start_episode"),
+            "subscribe_id": subscribe_id,
+            "status": "pending",
+            "retry": 0,
+            "created": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "execute_at": exec_at.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.save_data('delete_tasks', tasks)
+        logger.info(f"【未看洗版】洗版完成，已排队删除旧版本（延迟 {self._delete_delay_minutes} 分钟核对）："
+                    f"{hit.get('title')}（{hit.get('type')}，tmdb={hit.get('tmdbid')}，"
+                    f"季={hit.get('season')}，开始集={hit.get('start_episode')}）")
+        # 一次性调度：到期即刻核对（调度器不可用时由每轮 sync 兜底）
+        try:
+            if self._scheduler is None:
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            if not self._scheduler.running:
+                self._scheduler.start()
+            self._scheduler.add_job(
+                self._process_delete_tasks, 'date',
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(minutes=self._delete_delay_minutes),
+                id=f"wash_delete_{task_id}",
+                name="未看洗版·删除旧版本核对",
+                replace_existing=True,
+            )
+        except Exception as e:
+            logger.warning(f"【未看洗版】一次性核对调度不可用（将由每轮扫描兜底处理）：{e}")
+
+    def _process_delete_tasks(self) -> None:
+        """
+        核对并执行到期的删除任务。入口有三：订阅完成事件的一次性调度、
+        每轮 sync 的兜底调用、本方法内失败重试。全部安全优先：
+        Dry-run 只记录不删；画质参数不全的条目永不删除；异常最多重试 3 次。
+        """
+        if not self._delete_washed_old:
+            return
+        tasks = self.get_data('delete_tasks') or {}
+        if not tasks:
+            return
+        now = datetime.now()
+        changed = False
+        for task_id, t in list(tasks.items()):
+            if t.get("status") != "pending":
+                continue
+            try:
+                exec_at = datetime.strptime(str(t.get("execute_at")), "%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                t["status"], t["error"] = "failed", "execute_at 无法解析"
+                changed = True
+                continue
+            if exec_at > now:
+                continue
+            try:
+                self._do_delete_old_versions(t)
+                t["status"] = "done"
+                t["finished"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception as e:
+                t["retry"] = int(t.get("retry") or 0) + 1
+                t["error"] = str(e)
+                logger.warning(f"【未看洗版】删除旧版本核对失败（第 {t['retry']} 次）："
+                               f"{t.get('title')} - {e}")
+                if t["retry"] >= 3:
+                    t["status"] = "failed"
+                    logger.error(f"【未看洗版】删除旧版本任务失败放弃：{t.get('title')} - {e}")
+            changed = True
+        # 清理 7 天前已结束的任务，避免 plugindata 膨胀
+        cutoff = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        for task_id in list(tasks.keys()):
+            t = tasks[task_id]
+            if t.get("status") in ("done", "failed") and str(t.get("finished") or t.get("created") or "") < cutoff:
+                del tasks[task_id]
+        if changed:
+            self.save_data('delete_tasks', tasks)
+
+    def _do_delete_old_versions(self, task: dict) -> None:
+        """
+        执行单个删除任务：在每台已连接媒体服务器上查该内容的全部版本条目，
+        保留画质最高的一个，删除其余低质量旧条目。
+        安全规则：
+        · 仅剩 1 个版本（旧版可能已被覆盖/替换）→ 不动作
+        · 画质参数不全（宽高字节全 0）的条目永不删除
+        · 只删画质**严格低于**保留者；并列/更高一律跳过
+        · Dry-run 模式只打印将删清单，不真删
+        """
+        tmdb = task.get("tmdbid")
+        try:
+            tmdb = int(tmdb)
+        except (TypeError, ValueError):
+            logger.warning(f"【未看洗版】删除任务 tmdbid 无效，跳过：{task.get('title')}")
+            return
+        is_tv = str(task.get("type")) == MediaType.TV.value
+        servers = self._get_server_instances()
+        if not servers:
+            raise RuntimeError("无已连接的媒体服务器")
+        for stype, srv_name, inst in servers:
+            if is_tv:
+                series_id = self._series_id_of(inst, tmdb,
+                                               name=str(task.get("title") or ""),
+                                               year=str(task.get("year") or ""))
+                if not series_id:
+                    logger.info(f"【未看洗版】[{srv_name}] 未找到剧集条目（可能尚未入库），跳过删除：{task.get('title')}")
+                    continue
+                season = task.get("season")
+                episode = task.get("start_episode")
+                if season is None or episode is None:
+                    logger.info(f"【未看洗版】[{srv_name}] 删除任务缺季/集信息（整部洗版记录），跳过：{task.get('title')}")
+                    continue
+                versions = self._episode_versions(inst, series_id, int(season), int(episode))
+                label = f"S{season}E{episode}"
+            else:
+                versions = self._movie_versions(inst, tmdb)
+                label = "电影"
+            if versions is None:
+                raise RuntimeError(f"[{srv_name}] 查询版本条目失败")
+            if len(versions) <= 1:
+                logger.info(f"【未看洗版】[{srv_name}] {task.get('title')} {label} 仅 {len(versions)} 个版本"
+                            f"（旧版可能已被覆盖替换），无需删除")
+                continue
+            # 画质对比：最高者保留，其余删除
+            versions.sort(key=self._quality_key, reverse=True)
+            keep = versions[0]
+            keep_key = self._quality_key(keep)
+            logger.info(f"【未看洗版】[{srv_name}] {task.get('title')} {label} 共 {len(versions)} 个版本，"
+                        f"保留最高画质：{keep.get('Name')}（{keep_key[0]}x{keep_key[1]}，"
+                        f"{keep_key[2] / 1024 / 1024:.0f}MB）{keep.get('Path') or ''}")
+            for old in versions[1:]:
+                old_key = self._quality_key(old)
+                if old_key == (0, 0, 0):
+                    logger.warning(f"【未看洗版】[{srv_name}] 跳过删除（画质信息不全，宁漏勿误删）："
+                                   f"{old.get('Name')} / {old.get('Path')}")
+                    continue
+                if old_key >= keep_key:
+                    logger.warning(f"【未看洗版】[{srv_name}] 跳过删除（画质不低于保留版本，疑似未识别的新版）："
+                                   f"{old.get('Name')}（{old_key[0]}x{old_key[1]}）")
+                    continue
+                if self._dry_run:
+                    logger.info(f"【未看洗版】[{srv_name}] [Dry-run] 将删除旧版本："
+                                f"{old.get('Name')}（{old_key[0]}x{old_key[1]}，"
+                                f"{old_key[2] / 1024 / 1024:.0f}MB）{old.get('Path') or ''}")
+                    continue
+                if self._delete_server_item(inst, old):
+                    logger.info(f"【未看洗版】[{srv_name}] 已删除被洗版旧条目："
+                                f"{old.get('Name')}（{old_key[0]}x{old_key[1]}）{old.get('Path') or ''}")
+                else:
+                    logger.error(f"【未看洗版】[{srv_name}] 删除旧条目失败：{old.get('Name')}")
 
     def _list_wash_subscriptions(self) -> List[Any]:
         """
