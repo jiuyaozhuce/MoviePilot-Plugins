@@ -37,6 +37,13 @@ lock = RLock()
 # 已观看联动只会动 username 等于这个值的订阅，绝不碰用户手动建的订阅。
 WASH_USERNAME = "未看洗版"
 
+# 洗版订阅显式绑定的过滤规则组（组名须与 MoviePilot「过滤规则」中的规则组一致，v1.38）：
+# 电影挂「电影洗版」、剧集挂「电视剧洗版」。不显式绑定的话，剧集订阅 filter_groups 为空，
+# MP 运行时会回退到系统「洗版过滤规则组」（电影洗版+电视剧洗版两组串行 AND，条件过严）；
+# 电影订阅虽然也会从「默认电影订阅配置」带入「电影洗版」，但显式传入更稳（不依赖默认配置）。
+WASH_FILTER_GROUP_MOVIE = "电影洗版"
+WASH_FILTER_GROUP_TV = "电视剧洗版"
+
 # 详情页「媒体库未观看清单」每页条数。
 # 详情页的点击事件由官方渲染器处理：每次动作都会重载整页并回到顶部，因此这里
 # 用「服务端记住页码 + 固定每页条数」的方式，让勾选后仍停留在同一页、同一屏内。
@@ -49,7 +56,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.37"
+    plugin_version = "1.38"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -2043,6 +2050,13 @@ class EmbyUnwatchedWash(_PluginBase):
             extra["season"] = season
         if start_episode is not None:
             extra["start_episode"] = start_episode
+        # 显式绑定洗版规则组（v1.38）：电影=「电影洗版」、剧集=「电视剧洗版」。
+        # chain.add 会把它并入订阅的 filter_groups 落库；运行时 MP 用
+        # 「订阅自身 filter_groups 优先，空才回退系统洗版规则组」的语义，
+        # 显式绑定后剧集不再被「电影洗版+电视剧洗版」两组串行 AND 过滤。
+        extra["filter_groups"] = [
+            WASH_FILTER_GROUP_TV if mediainfo.type == MediaType.TV else WASH_FILTER_GROUP_MOVIE
+        ]
 
         # 创建洗版（best_version=True）订阅，兼容 v3（media_source/media_id）与 v2（tmdbid）
         try:
@@ -2093,6 +2107,9 @@ class EmbyUnwatchedWash(_PluginBase):
             _extra_log += f" 第{season}季"
         if start_episode is not None:
             _extra_log += f" 开始集数={start_episode}"
+        _fg = extra.get("filter_groups")
+        if _fg:
+            _extra_log += f" 规则组={_fg[0]}"
         logger.info(f"【未看洗版】{'已创建洗版订阅' if is_new else '复用已有洗版订阅'}："
                     f"{mediainfo.title} ({mediainfo.year})[{mediainfo.type.value}]{_extra_log}")
 
