@@ -58,7 +58,7 @@
     "name": "豆瓣书影音档案",
     "description": "将剧集在看、看完状态同步到豆瓣书影音档案。",
     "labels": "豆瓣",
-    "version": "1.9.7",
+    "version": "1.9.8",
     "icon": "douban.png",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -67,6 +67,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.9.8": "插件来源合并至本仓库（jiuyaozhuce/MoviePilot-Plugins），载荷与 v1.9.7 相同（v3 recognize_media 适配 + get_subject_id 解包修复）",
       "v1.9.7": "适配 MoviePilot v3 的 recognize_media 新 API（media_source/media_id），修复播放事件同步报错。",
       "v1.9.6": "待cookie有效后，对同步失败的档案进行同步。",
       "v1.9.3": "修复了一些问题，新版本可以设定显示数量。",
