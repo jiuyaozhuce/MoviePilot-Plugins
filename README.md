@@ -1,10 +1,10 @@
 # EmbyUnwatchedWash（未看洗版 / Unwatched Wash）
 
 扫描 Emby / Jellyfin 中**未观看（IsUnplayed）**的影视，自动创建「洗版」订阅，让 MoviePilot 下载更高画质版本替换旧版。
-支持**手动指定只洗版部分影视**：在配置页从媒体库未观看列表中勾选即可；不选则默认对全部未观看影视洗版。
+支持**手动指定只洗版部分影视**：在插件「数据查看」页从未观看清单中勾选即可；不选则默认对全部未观看影视洗版。
 
 Scan Emby / Jellyfin for **unplayed** movies/series and auto-create "best-version" (wash) subscriptions so MoviePilot upgrades them to higher-quality releases.
-You can also **manually pick** which items to wash from a multi-select populated with your library's unwatched items; if nothing is selected, all unwatched items are washed by default.
+You can also **manually pick** which items to wash by ticking them in the plugin's *Data* page; if nothing is selected, all unwatched items are washed by default.
 
 ## 实现来源（重要 / Source）
 
@@ -66,7 +66,9 @@ MoviePilot-Plugins/
 - **包含剧集 / Include series**：开 → 对 `Series`（电视剧）也创建洗版订阅；关 → 仅电影
 - **剧集按未观看集洗版 / Episode level**（默认开）：剧集**不再整部洗版**——按季建订阅，并把订阅的「开始集数」设为**该季第一个未观看的集**，已看过的集不会被洗版；关 → 退回整部剧洗版
 - **单次最多处理数量 / Limit**：0 = 不限。**强烈建议大库先设 5~20 试跑**（你的库有上千部未观看，一次全量会瞬间创建上千订阅）
-- **指定洗版影视 / Selected items**：从媒体库未观看列表中**手动多选**。留空 = 对全部未观看影视洗版；勾选 = 只洗版勾选的影视（剧集同样会按未观看集定位，需媒体服务器在线；否则按整部洗版）
+- **排除媒体库 / Exclude libraries**：命中的媒体库整库跳过（不建订阅），且在「数据查看」页的未观看清单里**也不再出现**
+- **排除关键字 / Exclude keywords**：按媒体库名做子串匹配（例如填 `少儿` 可避开「少儿动画」这类库）
+- **指定洗版影视 / Selected items**：在「数据查看」页的未观看清单里**手动勾选**（勾选即保存）。留空 = 对全部未观看影视洗版；勾选 = 只洗版勾选的影视（剧集同样会按未观看集定位，需媒体服务器在线；否则按整部洗版）
 - **执行周期 / Cron**：5 位 cron（如 `0 4 * * *`）；留空则每 30 分钟扫描一次
 
 ## 触发方式 / How to trigger
@@ -114,6 +116,8 @@ MoviePilot-Plugins/
 ## 注意 / Notes
 
 - **「洗版」= 升级画质**：订阅创建后由 MoviePilot 负责搜索更高画质版本并整理替换，前提是站点/订阅规则允许，且整理模式支持覆盖旧版（与官方洗版要求一致）。
+- **排除规则怎么判定「哪个库」**：Emby/Jellyfin 的 Items 接口**不返回 `LibraryName`**（写进 `Fields` 也会被忽略），所以插件改为**按媒体库分别拉取**（`Library/VirtualFolders` 取库根 `ItemId` → `ParentId` 逐库查询），入库时给每条打上库名。这也是排除规则能生效的前提；若库清单读取失败，会自动退化为全局拉取并在日志告警（此时排除规则不会命中）。
+- **未观看清单会隐去被排除的条目**：命中「排除媒体库 / 排除关键字」的影视不会出现在「数据查看」页的清单里（它们运行时本来就不会被洗版），清单抬头会显示「已按排除规则隐藏 N 条」，便于核对数量。
 - **大库分页**：已按 `StartIndex` 分页拉全，不再受 `Limit=500` 限制。
 - 本插件**不会删除任何媒体**，只创建订阅。
 - Plex 暂不支持（上游 Plex 走 watchlist API，与「未观看」语义不同，故略去）。

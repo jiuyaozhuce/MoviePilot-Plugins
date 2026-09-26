@@ -45,7 +45,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "Jellyfin/Emby 扫描未观看的影视，自动订阅洗版（升级更高画质版本）。支持手动指定只对部分影视洗版。"
     # 插件版本
-    plugin_version = "1.23"
+    plugin_version = "1.24"
     # 插件作者
     plugin_author = "forked-from-bestfilmversion(wlj)"
     # 作者主页
@@ -72,6 +72,11 @@ class EmbyUnwatchedWash(_PluginBase):
     # 媒体库名称缓存（用于排除媒体库 VSelect）
     _library_names_cache: List[str] = []
     _library_names_cache_time: float = 0.0
+    # 清单里被「排除规则」隐去的条目数 / 涉及库名 / 被隐去的 tmdbid 集合
+    # （详情页要把这件事告诉用户，否则「共 N 部」与设置页看到的库对不上）
+    _options_hidden: int = 0
+    _options_hidden_libs: List[str] = []
+    _options_excluded_ids: set = set()
 
     # 配置属性
     _enabled: bool = False
@@ -354,6 +359,21 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         return sorted(list(self._options_cache or []),
                       key=lambda x: (str(x.get('title') or ''), str(x.get('value') or '')))
+
+    def _hidden_info(self) -> Tuple[int, List[str]]:
+        """
+        返回（被排除规则从清单中隐去的条目数, 涉及到的媒体库名）。
+
+        值来自上一次扫描（与 `_options_cache` 同源），所以详情页展示的条数
+        与屏幕上那份清单永远自洽。
+        """
+        count = 0
+        try:
+            count = int(getattr(self, '_options_hidden', 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        libs = list(getattr(self, '_options_hidden_libs', []) or [])
+        return count, libs
 
     def _title_of(self, tid: int) -> str:
         """按 tmdbid 反查标题，仅用于日志/提示文案（只读快照，不触发扫描）。"""
@@ -864,6 +884,17 @@ class EmbyUnwatchedWash(_PluginBase):
         else:
             hint = ('未勾选任何项时处理全部未观看影视（排除规则命中的除外）；'
                     '点击条目即勾选，勾选结果会立即保存。')
+        hidden_count, hidden_libs = self._hidden_info()
+
+        # 抬头一行：总数 + 分页 + 「被排除规则隐去的条数」。
+        # 隐去数量必须显式说出来 —— 否则设置页里勾了「排除儿童」，清单却看不出少在哪，
+        # 只会让人怀疑过滤没生效。
+        count_text = (f"共 {total} 部未观看候选 · 第 {page_no}/{page_total} 页 · "
+                      f"每页 {_LIST_PAGE_SIZE} 部")
+        if hidden_count:
+            count_text += f" · 已按排除规则隐藏 {hidden_count} 条"
+            if hidden_libs:
+                count_text += f"（{'、'.join(hidden_libs)}）"
 
         body: List[dict] = []
         if rows:
@@ -882,8 +913,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 {
                     'component': 'VCardText',
                     'props': {'class': 'text-caption text-medium-emphasis pb-1'},
-                    'text': f"共 {total} 部未观看候选 · 第 {page_no}/{page_total} 页 · "
-                            f"每页 {_LIST_PAGE_SIZE} 部"
+                    'text': count_text
                 },
                 {
                     'component': 'VAlert',
@@ -933,9 +963,13 @@ class EmbyUnwatchedWash(_PluginBase):
 
         # ---------- 1. 运行概览：5 张统计卡，一屏一行 ----------
         contents.append(self._section_title('运行概览', '数据来自媒体服务器扫描结果与插件本地记录'))
+        hidden_count, hidden_libs = self._hidden_info()
         contents.append(self._grid([
             self._stat_card('未观看候选', f"{len(options)} 部",
-                            '媒体库中未观看的影视', 'primary', 'mdi-movie-open-outline'),
+                            (f"已按排除规则隐藏 {hidden_count} 部"
+                             + (f"（{'、'.join(hidden_libs)}）" if hidden_libs else ''))
+                            if hidden_count else '媒体库中未观看的影视',
+                            'primary', 'mdi-movie-open-outline'),
             self._stat_card('洗版历史', f"{len(history)} 条",
                             '本地最多保留 500 条', 'success', 'mdi-history'),
             self._stat_card('洗版范围', '电影 + 剧集' if self._include_series else '仅电影',
@@ -963,21 +997,35 @@ class EmbyUnwatchedWash(_PluginBase):
                 'prepend-icon': 'mdi-alert-circle-outline',
                 'text': '暂未读取到未观看清单，请检查媒体服务器配置与连通性；下方历史记录不受影响。'}})
         if selected:
+            extra = ''
+            if options:
+                visible_ids = set()
+                for opt in options:
+                    try:
+                        visible_ids.add(int(opt.get('value')))
+                    except (TypeError, ValueError):
+                        continue
+                out_of_list = [x for x in selected if x not in visible_ids]
+                if out_of_list:
+                    extra = (f'其中 {len(out_of_list)} 部已不在下方清单里'
+                             f'（所属媒体库被排除，或已不再未观看），运行时同样会跳过。')
             contents.append({'component': 'VAlert', 'props': {
                 'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
                 'prepend-icon': 'mdi-format-list-checks',
                 'text': f'已勾选 {len(selected)} 部影视：运行时只对这批创建洗版订阅，'
-                        f'其余未观看内容会跳过；在下方清单点「清空全部」可恢复处理全部未观看。'}})
+                        f'其余未观看内容会跳过；在下方清单点「清空全部」可恢复处理全部未观看。'
+                        + extra}})
         if self._exclude_libraries or self._exclude_keywords:
             rules = []
             if self._exclude_libraries:
                 rules.append('排除媒体库：' + '、'.join(self._exclude_libraries))
             if self._exclude_keywords:
                 rules.append('排除关键字：' + '、'.join(self._exclude_keywords))
+            tail = '（命中即跳过该库，下方清单中也不显示这些条目）'
             contents.append({'component': 'VAlert', 'props': {
                 'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
                 'prepend-icon': 'mdi-filter-off-outline',
-                'text': '；'.join(rules) + '（命中即跳过该库）'}})
+                'text': '；'.join(rules) + tail}})
 
         # ---------- 3. 媒体库未观看清单（可勾选，点击即保存） ----------
         contents.append(self._section_title(
@@ -1339,6 +1387,52 @@ class EmbyUnwatchedWash(_PluginBase):
                 return True
         return False
 
+    def _library_entries(self, instance, stype: str = 'emby') -> List[dict]:
+        """
+        读取媒体库清单：[{'name': '电影', 'id': '库根 ItemId', 'type': 'movies'}, ...]
+
+        为什么需要它：Emby/Jellyfin 的 Items 接口**不返回 LibraryName** —— 即使显式写进
+        `Fields=...LibraryName` 也照样被忽略（本机实测 200/200 条全为空）。因此「排除媒体库」
+        无法靠条目自带字段判断，只能**按库分别拉取**（ParentId=库根 ItemId），
+        入库时就把库名打在条目上，后续 `_is_excluded_item` 才有依据。
+        """
+        entries: List[dict] = []
+        try:
+            if stype == 'jellyfin':
+                urls = ["[HOST]jellyfin/Libraries?api_key=[APIKEY]",
+                        "[HOST]jellyfin/Library/VirtualFolders?api_key=[APIKEY]"]
+            else:
+                urls = ["[HOST]emby/Library/VirtualFolders?api_key=[APIKEY]"]
+            for url in urls:
+                resp = instance.get_data(url)
+                if not resp or resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except Exception:
+                    continue
+                if not isinstance(data, list):
+                    continue
+                for lib in data:
+                    if not isinstance(lib, dict):
+                        continue
+                    lib_name = (lib.get('Name') or '').strip()
+                    lib_id = str(lib.get('ItemId') or lib.get('Id') or '').strip()
+                    if lib_name and lib_id and not any(e['name'] == lib_name for e in entries):
+                        entries.append({
+                            'name': lib_name,
+                            'id': lib_id,
+                            'type': lib.get('CollectionType') or '',
+                        })
+                if entries:
+                    break
+        except Exception as e:
+            logger.error(f"【未看洗版】读取媒体库清单失败：{e}")
+        if entries:
+            logger.info(f"【未看洗版】读取到 {len(entries)} 个媒体库："
+                        + '、'.join(e['name'] for e in entries))
+        return entries
+
     def _get_library_list_options(self) -> List[dict]:
         """
         获取媒体服务器库列表，供排除媒体库选择使用。
@@ -1656,6 +1750,7 @@ class EmbyUnwatchedWash(_PluginBase):
         return "added"
 
     def jellyfin_get_items(self, instance=None) -> List[dict]:
+        """拉取 Jellyfin 未观看条目；同样按媒体库逐个拉取并打上 LibraryName（理由见 emby_get_items）。"""
         try:
             client = instance or Jellyfin()
             # 获取所有user
@@ -1663,38 +1758,61 @@ class EmbyUnwatchedWash(_PluginBase):
             users = self.get_users(client.get_data(users_url))
             if not users:
                 return []
+            libs = self._library_entries(client, 'jellyfin')
+            if libs:
+                targets = [(lib['name'], str(lib['id'])) for lib in libs]
+            else:
+                logger.warning("【未看洗版】未能读取 Jellyfin 媒体库清单，退化为全局拉取："
+                               "本轮无法判定条目所属媒体库，排除媒体库不会命中")
+                targets = [('', '')]
             all_items = []
             limit = 500
-            for user in users:
-                # 分页拉全：按加入日期降序，仅取未观看
-                start = 0
-                while True:
-                    url = ("[HOST]Users/" + user + "/Items"
-                           "?SortBy=DateCreated%2CSortName"
-                           "&SortOrder=Descending"
-                           "&Filters=IsUnplayed"
-                           "&Recursive=true"
-                           "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
-                           "&CollapseBoxSetItems=false"
-                           "&ExcludeLocationTypes=Virtual"
-                           "&EnableTotalRecordCount=true"
-                           f"&Limit={limit}&StartIndex={start}"
-                           "&apikey=[APIKEY]")
-                    resp = self.get_items(client.get_data(url))
-                    if not resp:
-                        break
-                    items = resp
-                    all_items.extend(items)
-                    # 判断是否已经拉完
-                    if len(items) < limit:
-                        break
-                    start += limit
+            for lib_name, parent_id in targets:
+                lib_count = 0
+                for user in users:
+                    # 分页拉全：按加入日期降序，仅取未观看
+                    start = 0
+                    while True:
+                        url = ("[HOST]Users/" + user + "/Items"
+                               "?SortBy=DateCreated%2CSortName"
+                               "&SortOrder=Descending"
+                               "&Filters=IsUnplayed"
+                               "&Recursive=true"
+                               "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
+                               "&CollapseBoxSetItems=false"
+                               "&ExcludeLocationTypes=Virtual"
+                               "&EnableTotalRecordCount=true"
+                               f"&Limit={limit}&StartIndex={start}"
+                               + (f"&ParentId={parent_id}" if parent_id else "")
+                               + "&apikey=[APIKEY]")
+                        resp = self.get_items(client.get_data(url))
+                        if not resp:
+                            break
+                        if lib_name:
+                            for it in resp:
+                                if isinstance(it, dict):
+                                    it['LibraryName'] = lib_name
+                        all_items.extend(resp)
+                        lib_count += len(resp)
+                        # 判断是否已经拉完
+                        if len(resp) < limit:
+                            break
+                        start += limit
+                if lib_name:
+                    logger.info(f"【未看洗版】Jellyfin 媒体库「{lib_name}」未观看条目 {lib_count} 条")
             return all_items
         except Exception as e:
             logger.error(f"【未看洗版】读取 Jellyfin 未观看列表失败：{e}")
             return []
 
     def emby_get_items(self, instance=None) -> List[dict]:
+        """
+        拉取 Emby 未观看条目，**按媒体库逐个拉取**并给每条打上 LibraryName。
+
+        用 ParentId=库根 ItemId 逐库查询是唯一可靠的库归属办法：Emby 的 Items 接口
+        不返回 LibraryName（写进 Fields 也无效）。拿不到库清单时退化为全局拉取一次，
+        此时条目没有 LibraryName，「排除媒体库」自然不命中（并在日志里提示）。
+        """
         try:
             client = instance or Emby()
             # 获取所有user
@@ -1702,33 +1820,49 @@ class EmbyUnwatchedWash(_PluginBase):
             users = self.get_users(client.get_data(get_users_url))
             if not users:
                 return []
+            libs = self._library_entries(client, 'emby')
+            if libs:
+                targets = [(lib['name'], str(lib['id'])) for lib in libs]
+            else:
+                logger.warning("【未看洗版】未能读取 Emby 媒体库清单，退化为全局拉取："
+                               "本轮无法判定条目所属媒体库，排除媒体库不会命中")
+                targets = [('', '')]
             all_items = []
             limit = 500
-            for user in users:
-                # 分页拉全：按加入日期降序，仅取未观看
-                start = 0
-                while True:
-                    url = ("[HOST]emby/Users/" + user + "/Items"
-                           "?SortBy=DateCreated%2CSortName"
-                           "&SortOrder=Descending"
-                           "&Filters=IsUnplayed"
-                           "&Recursive=true"
-                           # Fields 含 LibraryName：供「排除媒体库 / 排除关键字」过滤
-                           "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds%2CLibraryName"
-                           "&CollapseBoxSetItems=false"
-                           "&ExcludeLocationTypes=Virtual"
-                           "&EnableTotalRecordCount=true"
-                           f"&Limit={limit}&StartIndex={start}"
-                           "&api_key=[APIKEY]")
-                    resp = self.get_items(client.get_data(url))
-                    if not resp:
-                        break
-                    items = resp
-                    all_items.extend(items)
-                    # 判断是否已经拉完
-                    if len(items) < limit:
-                        break
-                    start += limit
+            for lib_name, parent_id in targets:
+                lib_count = 0
+                for user in users:
+                    # 分页拉全：按加入日期降序，仅取未观看
+                    start = 0
+                    while True:
+                        url = ("[HOST]emby/Users/" + user + "/Items"
+                               "?SortBy=DateCreated%2CSortName"
+                               "&SortOrder=Descending"
+                               "&Filters=IsUnplayed"
+                               "&Recursive=true"
+                               # LibraryName 不在这里申请：Emby 根本不返回该字段，靠 ParentId 逐库取
+                               "&Fields=PrimaryImageAspectRatio%2CBasicSyncInfo%2CProviderIds"
+                               "&CollapseBoxSetItems=false"
+                               "&ExcludeLocationTypes=Virtual"
+                               "&EnableTotalRecordCount=true"
+                               f"&Limit={limit}&StartIndex={start}"
+                               + (f"&ParentId={parent_id}" if parent_id else "")
+                               + "&api_key=[APIKEY]")
+                        resp = self.get_items(client.get_data(url))
+                        if not resp:
+                            break
+                        if lib_name:
+                            for it in resp:
+                                if isinstance(it, dict):
+                                    it['LibraryName'] = lib_name
+                        all_items.extend(resp)
+                        lib_count += len(resp)
+                        # 判断是否已经拉完
+                        if len(resp) < limit:
+                            break
+                        start += limit
+                if lib_name:
+                    logger.info(f"【未看洗版】Emby 媒体库「{lib_name}」未观看条目 {lib_count} 条")
             return all_items
         except Exception as e:
             logger.error(f"【未看洗版】读取 Emby 未观看列表失败：{e}")
@@ -1815,6 +1949,9 @@ class EmbyUnwatchedWash(_PluginBase):
             return self._options_cache
         options = []
         library_names = set()
+        hidden = 0
+        hidden_libs = set()
+        excluded_ids = set()
         try:
             servers = self._get_server_instances()
             if not servers:
@@ -1832,10 +1969,25 @@ class EmbyUnwatchedWash(_PluginBase):
                     continue
                 for it in items:
                     item_name = it.get('Name')
+                    # 库名来自「按库拉取」时打的标记（Emby 的 Items 接口没有这个字段）
+                    lib_name = (it.get('LibraryName') or '').strip()
+                    if lib_name:
+                        library_names.add(lib_name)
                     if not item_name or item_name in seen:
                         continue
                     t = it.get('Type')
                     if t not in ('Movie', 'Series'):
+                        continue
+                    # 命中「排除媒体库 / 排除关键字」的条目直接从清单里隐去：
+                    # 它们在运行阶段本来就会被 `_build_wash_tasks` 跳过，
+                    # 留在清单里只会造成「能勾选、勾了却没反应」的误导。
+                    if self._is_excluded_item(it):
+                        hidden += 1
+                        if lib_name:
+                            hidden_libs.add(lib_name)
+                        tid_hidden = self._tmdbid_of_item(it)
+                        if tid_hidden:
+                            excluded_ids.add(tid_hidden)
                         continue
                     if t == 'Series' and not self._include_series:
                         continue
@@ -1849,10 +2001,6 @@ class EmbyUnwatchedWash(_PluginBase):
                         'value': int(pid),
                     })
                     seen.add(item_name)
-                    # 提取库名（来自 LibraryName 字段）
-                    lib_name = (it.get('LibraryName') or '').strip()
-                    if lib_name:
-                        library_names.add(lib_name)
                     if len(options) >= cap:
                         logger.info(f"EmbyUnwatchedWash 媒体库选项已截断至 {cap} 条")
                         break
@@ -1861,6 +2009,13 @@ class EmbyUnwatchedWash(_PluginBase):
         # 写缓存（即使为空也写，避免持续打爆媒体服务器）
         self._options_cache = options
         self._options_cache_time = now
+        # 记录被隐去的条目，供详情页说明「为什么清单里的库比设置页选的少」
+        self._options_hidden = hidden
+        self._options_hidden_libs = sorted(hidden_libs)
+        self._options_excluded_ids = excluded_ids
+        if hidden:
+            logger.info(f"【未看洗版】未观看清单已按排除规则隐藏 {hidden} 条"
+                        f"（媒体库：{'、'.join(sorted(hidden_libs)) or '未知'}）")
         # 写库名缓存
         self._library_names_cache = sorted(library_names)
         self._library_names_cache_time = now
