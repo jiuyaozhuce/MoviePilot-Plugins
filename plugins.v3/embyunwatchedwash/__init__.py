@@ -35,7 +35,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "根据观看记录自动后移 MP 逐集洗版订阅的开始集数（已看集不再洗、不用另建订阅避查重），并每轮核对媒体库多版本、即时清理被洗版的低画质旧条目（只删软链）。订阅创建交给 MP 原生。"
     # 插件版本
-    plugin_version = "1.43"
+    plugin_version = "1.44"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -1365,19 +1365,32 @@ class EmbyUnwatchedWash(_PluginBase):
 
         unplayed = sorted(e for e, played in s_map.items() if not played and e > 0)
         if not unplayed:
-            # 整季/整剧都看完了
+            # 当前已入库的集全部已看。
+            # 「洗版完成」护栏：已入库集数需覆盖订阅应覆盖的集数（total_episode），
+            # 否则视为连载中或尚未下完，不取消（避免误删仍在追更、还有更优可搜的订阅）。
             label = f"第{season}季" if season is not None else "整剧"
-            if username == WASH_USERNAME:
-                # 存量自建订阅：维持 v1.41 行为，整季看完取消
-                if self._delete_subscription(sid, f"剧集{label}已全部观看：{name}"):
-                    results["deleted"] = results.get("deleted", 0) + 1
-                    results.setdefault("details", []).append(
-                        f"已取消「{name}」{label}（该范围内全部已观看，存量自建订阅）")
-                else:
-                    results["failed"] = results.get("failed", 0) + 1
+            covered = len([e for e in s_map if e and e > 0])
+            total = getattr(sub, "total_episode", None)
+            try:
+                total = int(total) if total else None
+            except (TypeError, ValueError):
+                total = None
+            if total and covered < total:
+                logger.info(f"【未看洗版】{name}：{label}已观看，但仍有 {total - covered} 集未入库"
+                            f"（洗版未完成，连载/未下完），本轮不取消订阅")
+                return
+            # 洗版完成 + 已观看 → 取消（v1.44 起不限账户，保留 dry-run 与安全底线）
+            if self._dry_run:
+                logger.info(f"【未看洗版】[Dry-run] 将取消{label}洗版订阅：{name}（已观看且洗版完成）")
+                results.setdefault("details", []).append(
+                    f"[Dry-run] 「{name}」{label} 已观看且洗版完成，将取消订阅")
+                return
+            if self._delete_subscription(sid, f"剧集{label}已观看且洗版完成：{name}"):
+                results["deleted"] = results.get("deleted", 0) + 1
+                results.setdefault("details", []).append(
+                    f"已取消「{name}」{label}（已观看且洗版完成，不限账户）")
             else:
-                logger.info(f"【未看洗版】{name}：{label}已全部观看（用户自建订阅，不自动取消；"
-                            f"如需停止洗版请在 MP 订阅页手动处理）")
+                results["failed"] = results.get("failed", 0) + 1
             return
 
         new_start = unplayed[0]
@@ -1431,22 +1444,18 @@ class EmbyUnwatchedWash(_PluginBase):
         if not played:
             # 还没看，继续洗版，不做任何事
             return
-        # 已观看
-        if username == WASH_USERNAME:
-            if self._dry_run:
-                logger.info(f"【未看洗版】[Dry-run] 将取消电影洗版订阅：{name}（已观看，存量自建订阅）")
-                results.setdefault("details", []).append(
-                    f"[Dry-run] 「{name}」已观看，将取消电影洗版订阅")
-                return
-            if self._delete_subscription(sid, f"电影已观看：{name}"):
-                results["deleted"] = results.get("deleted", 0) + 1
-                results.setdefault("details", []).append(
-                    f"已取消「{name}」电影洗版订阅（已观看，存量自建订阅）")
-            else:
-                results["failed"] = results.get("failed", 0) + 1
+        # 已观看 → 取消（v1.44 起不限账户；MP 电影订阅洗满会自取消，此处补残留 + 放开代删）
+        if self._dry_run:
+            logger.info(f"【未看洗版】[Dry-run] 将取消电影洗版订阅：{name}（已观看）")
+            results.setdefault("details", []).append(
+                f"[Dry-run] 「{name}」已观看，将取消电影洗版订阅")
+            return
+        if self._delete_subscription(sid, f"电影已观看：{name}"):
+            results["deleted"] = results.get("deleted", 0) + 1
+            results.setdefault("details", []).append(
+                f"已取消「{name}」电影洗版订阅（已观看，不限账户）")
         else:
-            logger.info(f"【未看洗版】{name}：电影已观看（用户自建订阅，不自动取消；"
-                        f"如需停止洗版请在 MP 订阅页手动处理）")
+            results["failed"] = results.get("failed", 0) + 1
 
     def _delete_subscription(self, sid: Any, reason: str) -> bool:
         """
