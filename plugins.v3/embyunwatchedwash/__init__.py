@@ -35,7 +35,7 @@ class EmbyUnwatchedWash(_PluginBase):
     # 插件描述
     plugin_desc = "根据观看记录自动后移 MP 逐集洗版订阅的开始集数（已看集不再洗、不用另建订阅避查重），并每轮核对媒体库多版本、即时清理被洗版的低画质旧条目（只删软链）。订阅创建交给 MP 原生。"
     # 插件版本
-    plugin_version = "1.42"
+    plugin_version = "1.43"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -787,16 +787,16 @@ class EmbyUnwatchedWash(_PluginBase):
 
     def _apply_watched_policy(self, results: Optional[dict] = None) -> None:
         """
-        观看联动主流程（v1.42）：核对**所有** best_version=1 剧集订阅的观看状态，
-        按观看进度自动后移 start_episode（只进不退）。
+        观看联动主流程（v1.42）：核对**所有** best_version=1 订阅的观看状态——
+        剧集按观看进度后移 start_episode（只进不退）；电影已观看则取消洗版订阅。
 
         与 v1.41 的差异：v1.41 只处理 username==未看洗版 的自建订阅；v1.42 起订阅
         创建交给 MP 原生，插件改为服务**所有**开了洗版（best_version=1）的订阅。
         权限边界（安全设计）：
           · start_episode 推进：对所有 best_version=1 订阅生效（只进不退，非破坏性）
-          · 取消订阅：仅对 username==未看洗版 的存量自建订阅生效；用户自建订阅
-            整季看完也只提示、绝不代删
-        电影订阅不参与（start_episode 不适用）。每个订阅独立 try 保护。
+          · 取消订阅（剧集整季看完 / 电影已观看）：仅对 username==未看洗版 的
+            存量自建订阅生效；用户自建订阅只提示、绝不代删
+        每个订阅独立 try 保护。
         """
         if results is None:
             results = {"deleted": 0, "shrunk": 0, "failed": 0, "details": []}
@@ -817,16 +817,22 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.error(f"【未看洗版】读取逐集洗版订阅失败，本轮跳过观看状态核对：{e}")
             return
         tv_subs = [s for s in subs if self._sub_is_tv(s)]
+        movie_subs = [s for s in subs if not self._sub_is_tv(s)]
         logger.info(f"【未看洗版】观看联动：以 {srv_name}({stype}) 用户 {user_id[:8]}… 为准核对"
-                    f"逐集洗版剧集订阅 {len(tv_subs)} 部（电影 {len(subs) - len(tv_subs)} 部不参与联动）")
-        if not tv_subs:
-            return
+                    f"逐集洗版剧集订阅 {len(tv_subs)} 部、电影洗版订阅 {len(movie_subs)} 部")
         for sub in tv_subs:
             try:
                 self._reconcile_one_subscription(sub, inst, user_id, results)
             except Exception as e:
                 results["failed"] = results.get("failed", 0) + 1
-                logger.error(f"【未看洗版】核对订阅 id={getattr(sub, 'id', '?')} 失败：{e}"
+                logger.error(f"【未看洗版】核对剧集订阅 id={getattr(sub, 'id', '?')} 失败：{e}"
+                             f"\n{traceback.format_exc()}")
+        for sub in movie_subs:
+            try:
+                self._reconcile_one_movie_subscription(sub, inst, user_id, results)
+            except Exception as e:
+                results["failed"] = results.get("failed", 0) + 1
+                logger.error(f"【未看洗版】核对电影订阅 id={getattr(sub, 'id', '?')} 失败：{e}"
                              f"\n{traceback.format_exc()}")
 
     @staticmethod
@@ -1395,6 +1401,52 @@ class EmbyUnwatchedWash(_PluginBase):
                         f"（第 1~{new_start - 1} 集已观看，不再洗版）")
         else:
             results["failed"] = results.get("failed", 0) + 1
+
+    def _reconcile_one_movie_subscription(self, sub: Any, inst: Any, user_id: str,
+                                          results: dict) -> None:
+        """
+        核对单个电影洗版订阅（v1.42 补回的需求，见 L612-615）：
+        电影已观看 -> 取消它的洗版订阅。
+
+        与剧集的权限边界一致：
+          · username == 未看洗版 的存量自建订阅 -> 自动取消
+          · 用户自建订阅 -> 只提示，绝不代删
+        Dry-run 模式只打印将做的动作。
+        观看状态未知（查不到/异常）一律跳过，绝不误取消——这是安全底线。
+        """
+        sid = getattr(sub, "id", None)
+        name = getattr(sub, "name", "") or str(sid)
+        media_id = getattr(sub, "media_id", None)
+        username = str(getattr(sub, "username", "") or "")
+        try:
+            tmdb_id = int(str(media_id)) if media_id else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        if not tmdb_id:
+            return
+        played = self._movie_played(inst, tmdb_id, user_id)
+        if played is None:
+            logger.info(f"【未看洗版】{name}：在媒体服务器上观看状态未知，本轮不动它的订阅")
+            return
+        if not played:
+            # 还没看，继续洗版，不做任何事
+            return
+        # 已观看
+        if username == WASH_USERNAME:
+            if self._dry_run:
+                logger.info(f"【未看洗版】[Dry-run] 将取消电影洗版订阅：{name}（已观看，存量自建订阅）")
+                results.setdefault("details", []).append(
+                    f"[Dry-run] 「{name}」已观看，将取消电影洗版订阅")
+                return
+            if self._delete_subscription(sid, f"电影已观看：{name}"):
+                results["deleted"] = results.get("deleted", 0) + 1
+                results.setdefault("details", []).append(
+                    f"已取消「{name}」电影洗版订阅（已观看，存量自建订阅）")
+            else:
+                results["failed"] = results.get("failed", 0) + 1
+        else:
+            logger.info(f"【未看洗版】{name}：电影已观看（用户自建订阅，不自动取消；"
+                        f"如需停止洗版请在 MP 订阅页手动处理）")
 
     def _delete_subscription(self, sid: Any, reason: str) -> bool:
         """
