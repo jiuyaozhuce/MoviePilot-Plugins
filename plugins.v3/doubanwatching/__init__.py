@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.11"
+    plugin_version = "v1.9.12"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -59,14 +59,30 @@ class DouBanWatching(_PluginBase):
         self._cookie = config.get("cookie", "")
 
         self._pc_month = int(config.get("pc_month")) if config.get("pc_month", None) else 3
-        self._pc_num = int(config.get("pc_num", 50)) if config.get("pc_num", None) else 50
+        self._pc_num = self._parse_limit(config.get("pc_num", 50))
         self._mobile_month = int(config.get("mobile_month")) if config.get("mobile_month", None) else 2
-        self._mobile_num = int(config.get("mobile_num")) if config.get("mobile_num", None) else 15
+        self._mobile_num = self._parse_limit(config.get("mobile_num", 15))
 
         if self.get_data("processed"):
             from app.db.plugindata_oper import PluginDataOper
             PluginDataOper().del_data(plugin_id="DouBanWatching")
             logger.warn("检测到本插件旧版本数据，删除旧版本数据，避免报错...")
+
+    @staticmethod
+    def _parse_limit(val):
+        """
+        解析“每月显示数”配置：
+        - 正整数  -> 该月最多显示张数（上限）
+        - 空 / 0 / 非数字 -> 不限制（返回 None）
+        """
+        s = str(val).strip() if val is not None else ""
+        if s in ("", "0"):
+            return None
+        try:
+            n = int(s)
+        except (ValueError, TypeError):
+            return None
+        return n if n > 0 else None
 
     @eventmanager.register(EventType.WebhookMessage)
     def sync_log(self, event: Event, played: bool = False):
@@ -375,7 +391,7 @@ class DouBanWatching(_PluginBase):
                                         'props': {
                                             'model': 'pc_num',
                                             'label': '大屏幕每月最多显示数',
-                                            'placeholder': '50',
+                                            'placeholder': '留空或0=不限制（默认50）',
                                         }
                                     }
                                 ]
@@ -407,7 +423,7 @@ class DouBanWatching(_PluginBase):
                                         'props': {
                                             'model': 'mobile_num',
                                             'label': '小屏幕每月最多显示数',
-                                            'placeholder': '15',
+                                            'placeholder': '留空或0=不限制（默认15）',
                                         }
                                     }
                                 ]
@@ -553,8 +569,34 @@ class DouBanWatching(_PluginBase):
         month_text_class = "text-subtitle-2 font-weight-bold" if mobile else "text-subtitle-1 font-weight-bold"
         num_text_class = "text-caption"
 
-        def month_card(label: int, total: int) -> dict:
-            """与海报同尺寸的月份卡：撑满所在网格列，2:3 比例与海报等宽等高。"""
+        def month_card(label: int, total: int, shown: int, limited: bool) -> dict:
+            """
+            与海报同尺寸的月份卡：撑满所在网格列，2:3 比例与海报等宽等高。
+            total  = 当月真实观看总数（含无海报被跳过的条目）
+            shown  = 实际铺出的海报数
+            limited= 是否因“每月显示上限”被截断（截断时补一行“显示前N”提示）
+            """
+            lines = [
+                {
+                    "component": "div",
+                    "props": {"class": month_text_class},
+                    "html": f"{label}月"
+                },
+                {
+                    "component": "div",
+                    "props": {"class": num_text_class},
+                    "html": f"{total}部"
+                }
+            ]
+            if limited and shown < total:
+                lines.append({
+                    "component": "div",
+                    "props": {
+                        "class": "text-caption",
+                        "style": "font-size:10px; opacity:0.85; line-height:1.1;"
+                    },
+                    "html": f"显示前{shown}"
+                })
             return {
                 "component": "VCard",
                 "props": {
@@ -570,22 +612,7 @@ class DouBanWatching(_PluginBase):
                             "style": "height:100%; display:flex; flex-direction:column;"
                                      "align-items:center; justify-content:center; padding:0;"
                         },
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {
-                                    "class": month_text_class
-                                },
-                                "html": f"{label}月"
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "class": num_text_class
-                                },
-                                "html": f"{total}部"
-                            }
-                        ]
+                        "content": lines
                     }
                 ]
             }
@@ -669,9 +696,16 @@ class DouBanWatching(_PluginBase):
                         break
                 last_month = time_object.month
                 month_shown = 0
-                content.append(month_card(time_object.month, month_totals.get(time_object.month, 0)))
+                # 实际铺出的海报数 = 总数（无上限）或被上限截断后的值
+                shown_count = month_totals.get(time_object.month, 0)
+                if limit_num:
+                    shown_count = min(shown_count, limit_num)
+                content.append(month_card(time_object.month,
+                                         month_totals.get(time_object.month, 0),
+                                         shown_count,
+                                         bool(limit_num)))
 
-            if month_shown < limit_num:
+            if limit_num is None or month_shown < limit_num:
                 month_shown += 1
                 content.append(poster_item(poster_path, val))
 
