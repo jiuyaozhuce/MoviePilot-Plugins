@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.12"
+    plugin_version = "v1.9.13"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -59,9 +59,10 @@ class DouBanWatching(_PluginBase):
         self._cookie = config.get("cookie", "")
 
         self._pc_month = int(config.get("pc_month")) if config.get("pc_month", None) else 3
-        self._pc_num = self._parse_limit(config.get("pc_num", 50))
+        # 每月显示数默认不限制：未配置该键时 _parse_limit(None) -> None
+        self._pc_num = self._parse_limit(config.get("pc_num"))
         self._mobile_month = int(config.get("mobile_month")) if config.get("mobile_month", None) else 2
-        self._mobile_num = self._parse_limit(config.get("mobile_num", 15))
+        self._mobile_num = self._parse_limit(config.get("mobile_num"))
 
         if self.get_data("processed"):
             from app.db.plugindata_oper import PluginDataOper
@@ -391,7 +392,7 @@ class DouBanWatching(_PluginBase):
                                         'props': {
                                             'model': 'pc_num',
                                             'label': '大屏幕每月最多显示数',
-                                            'placeholder': '留空或0=不限制（默认50）',
+                                            'placeholder': '留空或0=不限制（默认不限制）',
                                         }
                                     }
                                 ]
@@ -423,7 +424,7 @@ class DouBanWatching(_PluginBase):
                                         'props': {
                                             'model': 'mobile_num',
                                             'label': '小屏幕每月最多显示数',
-                                            'placeholder': '留空或0=不限制（默认15）',
+                                            'placeholder': '留空或0=不限制（默认不限制）',
                                         }
                                     }
                                 ]
@@ -492,9 +493,9 @@ class DouBanWatching(_PluginBase):
             "exclude": '',
             "cookie": "",
             "pc_month": 3,
-            "pc_num": 50,
+            "pc_num": None,
             "mobile_month": 2,
-            "mobile_num": 15,
+            "mobile_num": None,
         }
 
     def get_dashboard(self, **kwargs) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[dict]]]:
