@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.13"
+    plugin_version = "v1.9.14"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -366,10 +366,27 @@ class DouBanWatching(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'class': 'my-3'}
+                                    },
+                                    {
+                                        'component': 'div',
+                                        'props': {'class': 'text-subtitle-1'},
+                                        'text': '时间范围'
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {
                                         'component': 'VTextField',
@@ -380,12 +397,49 @@ class DouBanWatching(_PluginBase):
                                         }
                                     }
                                 ]
-                            }, {
+                            },
+                            {
                                 'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'mobile_month',
+                                            'label': '小屏幕显示月份数',
+                                            'placeholder': '默认2个月，最少两个月',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'class': 'my-3'}
+                                    },
+                                    {
+                                        'component': 'div',
+                                        'props': {'class': 'text-subtitle-1'},
+                                        'text': '显示数量限制（留空或0=不限制）'
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {
                                         'component': 'VTextField',
@@ -396,28 +450,10 @@ class DouBanWatching(_PluginBase):
                                         }
                                     }
                                 ]
-                            }, {
+                            },
+                            {
                                 'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'mobile_month',
-                                            'label': '小屏幕屏幕显示月份数',
-                                            'placeholder': '默认2个月，最少两个月',
-                                        }
-                                    }
-                                ]
-                            }, {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
+                                'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {
                                         'component': 'VTextField',
