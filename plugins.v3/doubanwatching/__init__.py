@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.16"
+    plugin_version = "v1.9.17"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -355,6 +355,59 @@ class DouBanWatching(_PluginBase):
                                             'model': 'cookie',
                                             'label': '豆瓣cookie',
                                             'placeholder': '留空则每次从cookiecloud获取',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'class': 'my-3'}
+                                    },
+                                    {
+                                        'component': 'div',
+                                        'props': {'class': 'text-subtitle-1'},
+                                        'text': '显示数量限制'
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'pc_num',
+                                            'label': '大屏幕每月最多显示数',
+                                            'placeholder': '留空或0=不限制（默认不限制）',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'mobile_num',
+                                            'label': '小屏幕每月最多显示数',
+                                            'placeholder': '留空或0=不限制（默认不限制）',
                                         }
                                     }
                                 ]
