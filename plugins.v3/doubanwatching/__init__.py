@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.15"
+    plugin_version = "v1.9.16"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -361,78 +361,6 @@ class DouBanWatching(_PluginBase):
                             }
                         ]
                     },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12},
-                                'content': [
-                                    {
-                                        'component': 'VDivider',
-                                        'props': {'class': 'my-3'}
-                                    },
-                                    {
-                                        'component': 'div',
-                                        'props': {'class': 'text-subtitle-1'},
-                                        'text': '使用说明'
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': '需要开启媒体服务器的webhook，需要浏览器登录豆瓣，将豆瓣的cookie同步到cookiecloud，也可以手动将cookie填写到此处，不异地登陆有效期很久。'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': 'v1.8+ 解决了容易提示cookie失效，导致同步失败的问题，现在用cookiecloud应该不用填保活了,建议使用cookiecloud。'
-                                        }
-                                    }
-                                ]
-                            }, {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': 'v1.9.0 支持标记已观看同步，播放自动同步。'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
                 ]
             }
         ], {

@@ -62,7 +62,7 @@
     "name": "豆瓣书影音档案",
     "description": "将剧集在看、看完状态同步到豆瓣书影音档案。",
     "labels": "豆瓣",
-    "version": "1.9.15",
+    "version": "1.9.16",
     "icon": "douban.png",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -71,6 +71,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.9.16": "设置页移除「使用说明」分区与三条说明文字，仅保留功能配置项",
       "v1.9.15": "设置页精简：隐藏「时间范围/显示数量限制」两组调优字段（默认值仍生效、已存配置保留），改为「使用说明」分区 + webhook/cookiecloud/cookie 说明与 v1.8+/v1.9.0 版本说明",
       "v1.9.14": "修复设置页「每月最多显示数」不显示：原四个框挤在单行 md:3 四列栅格被前端丢后两列，改为带分隔线的「时间范围/显示数量限制」分区，每字段独立 md:6",
       "v1.9.13": "每月显示数量默认改为不限制：默认配置 pc_num/mobile_num 改为 None（未配置即不限制），已设过数字的用户保留原值；设置页占位符提示默认不限制",
