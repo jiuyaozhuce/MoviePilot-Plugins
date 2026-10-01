@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.18"
+    plugin_version = "v1.9.19"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -501,18 +501,32 @@ class DouBanWatching(_PluginBase):
         month_text_class = "text-subtitle-2 font-weight-bold" if mobile else "text-subtitle-1 font-weight-bold"
         num_text_class = "text-caption"
 
-        def month_card(label: str, total: int, shown: int, limited: bool) -> dict:
+        def month_card(label: str, year_tag: str, total: int, shown: int, limited: bool) -> dict:
             """
             与海报同尺寸的月份卡：撑满所在网格列，2:3 比例与海报等宽等高。
-            label  = 月份标签（如 "9月"，非当年为 "25年9月"）
-            total  = 当月（按年月分组）有海报的观看数
-            shown  = 实际铺出的海报数
-            limited= 是否因“每月显示上限”被截断（截断时补一行“显示前N”提示）
+            label   = 月份标签（如 "9月"）
+            year_tag= 年份小字（如 "25年"，当年为空串不显示；单独一行避免
+                      “25年9月”连写在窄卡里横向溢出）
+            total   = 当月（按年月分组）有海报的观看数
+            shown   = 实际铺出的海报数
+            limited = 是否因“每月显示上限”被截断（截断时补一行“显示前N”提示）
             """
-            lines = [
+            lines = []
+            if year_tag:
+                lines.append({
+                    "component": "div",
+                    "props": {
+                        "class": "text-caption",
+                        "style": "font-size:10px; opacity:0.85; line-height:1.1;"
+                                 "max-width:100%; overflow:hidden;"
+                    },
+                    "html": year_tag
+                })
+            lines += [
                 {
                     "component": "div",
-                    "props": {"class": month_text_class},
+                    "props": {"class": month_text_class,
+                              "style": "max-width:100%; overflow:hidden;"},
                     "html": label
                 },
                 {
@@ -642,12 +656,14 @@ class DouBanWatching(_PluginBase):
                 shown_count = month_totals.get(m, 0)
                 if limit_num:
                     shown_count = min(shown_count, limit_num)
-                # 非当年月份卡带年份前缀，避免与当年同月卡混淆
+                # 非当年月份卡：年份单独一行小字，避免与当年同月卡混淆且不撑破卡片
                 if newest_year is not None and time_object.year != newest_year:
-                    label = f"{time_object.year % 100}年{time_object.month}月"
+                    label = f"{time_object.month}月"
+                    year_tag = f"{time_object.year % 100}年"
                 else:
                     label = f"{time_object.month}月"
-                content.append(month_card(label,
+                    year_tag = ""
+                content.append(month_card(label, year_tag,
                                          month_totals.get(m, 0),
                                          shown_count,
                                          bool(limit_num)))
