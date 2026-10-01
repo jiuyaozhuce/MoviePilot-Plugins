@@ -23,7 +23,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.17"
+    plugin_version = "v1.9.18"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -501,10 +501,11 @@ class DouBanWatching(_PluginBase):
         month_text_class = "text-subtitle-2 font-weight-bold" if mobile else "text-subtitle-1 font-weight-bold"
         num_text_class = "text-caption"
 
-        def month_card(label: int, total: int, shown: int, limited: bool) -> dict:
+        def month_card(label: str, total: int, shown: int, limited: bool) -> dict:
             """
             与海报同尺寸的月份卡：撑满所在网格列，2:3 比例与海报等宽等高。
-            total  = 当月真实观看总数（含无海报被跳过的条目）
+            label  = 月份标签（如 "9月"，非当年为 "25年9月"）
+            total  = 当月（按年月分组）有海报的观看数
             shown  = 实际铺出的海报数
             limited= 是否因“每月显示上限”被截断（截断时补一行“显示前N”提示）
             """
@@ -512,7 +513,7 @@ class DouBanWatching(_PluginBase):
                 {
                     "component": "div",
                     "props": {"class": month_text_class},
-                    "html": f"{label}月"
+                    "html": label
                 },
                 {
                     "component": "div",
@@ -597,16 +598,24 @@ class DouBanWatching(_PluginBase):
                 return mediainfo.poster_path
             return val.get('poster_path')
 
-        # 预扫描：统计每月观看总数（月份卡需要提前知道“看过N部”）
-        month_totals: Dict[int, int] = {}
+        # 预扫描：统计每月观看总数（按“年-月”分组，避免跨年同月合并计数）
+        month_totals: Dict[str, int] = {}
         for key, val in sorted_data[::-1]:
             if not isinstance(val, dict):
                 continue
             poster = resolve_poster(val)
             if not poster or (poster.count('original') < 1):
                 continue
-            m = datetime.strptime(val.get('timestamp'), "%Y-%m-%d %H:%M:%S").month
+            t = datetime.strptime(val.get('timestamp'), "%Y-%m-%d %H:%M:%S")
+            m = t.strftime("%Y-%m")
             month_totals[m] = month_totals.get(m, 0) + 1
+
+        newest_year = None
+        if sorted_data:
+            first_val = sorted_data[-1][1]
+            if isinstance(first_val, dict):
+                newest_year = datetime.strptime(first_val['timestamp'],
+                                                "%Y-%m-%d %H:%M:%S").year
 
         last_month = None
         month_shown = 0   # 当月已展示海报数（受 limit_num 限制）
@@ -620,20 +629,26 @@ class DouBanWatching(_PluginBase):
 
             time_object = datetime.strptime(val.get('timestamp'), "%Y-%m-%d %H:%M:%S")
 
-            # 跨月：在组头插入月份卡
-            if time_object.month != last_month:
+            # 跨月（按“年-月”判断）：在组头插入月份卡
+            m = time_object.strftime("%Y-%m")
+            if m != last_month:
                 if last_month is not None:
                     limit_month -= 1
                     if limit_month < 1:
                         break
-                last_month = time_object.month
+                last_month = m
                 month_shown = 0
                 # 实际铺出的海报数 = 总数（无上限）或被上限截断后的值
-                shown_count = month_totals.get(time_object.month, 0)
+                shown_count = month_totals.get(m, 0)
                 if limit_num:
                     shown_count = min(shown_count, limit_num)
-                content.append(month_card(time_object.month,
-                                         month_totals.get(time_object.month, 0),
+                # 非当年月份卡带年份前缀，避免与当年同月卡混淆
+                if newest_year is not None and time_object.year != newest_year:
+                    label = f"{time_object.year % 100}年{time_object.month}月"
+                else:
+                    label = f"{time_object.month}月"
+                content.append(month_card(label,
+                                         month_totals.get(m, 0),
                                          shown_count,
                                          bool(limit_num)))
 
