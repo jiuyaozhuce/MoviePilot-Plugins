@@ -8,6 +8,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.chain.subscribe import SubscribeChain
+from app.chain.search import SearchChain
+from app.chain.download import DownloadChain
 from app.core.config import settings
 from app.core.event import eventmanager
 from app.log import logger
@@ -19,6 +21,11 @@ except ImportError:
     from app.helper.mediaserver import MediaServerHelper
 from app.plugins import _PluginBase
 from app.schemas.types import MediaType, EventType
+from app.core.metainfo import MetaInfo
+try:
+    from app.schemas.types import SystemConfigKey
+except ImportError:
+    SystemConfigKey = None
 
 lock = RLock()
 
@@ -27,15 +34,21 @@ lock = RLock()
 # 该标记仅用于识别**存量**插件订阅：整季看完时的「取消订阅」动作只对它们生效；
 # 用户自己在 MP 里建的订阅（best_version=1）只做 start_episode 推进，绝不删除。
 WASH_USERNAME = "未看洗版"
+# v1.46 电影洗版订阅的归属标记（与剧集未看洗版区分：电影洗版订阅不因「已观看」而取消，
+# 只在其洗到目标画质前持续存在；电影出库时由「资源出库回收」取消）。
+WASH_USERNAME_MOVIE = "未看洗版·电影"
 
 
 class EmbyUnwatchedWash(_PluginBase):
     # 插件名称
     plugin_name = "未看洗版"
     # 插件描述
-    plugin_desc = "根据观看记录自动后移 MP 逐集洗版订阅的开始集数（已看集不再洗、不用另建订阅避查重），并每轮核对媒体库多版本、即时清理被洗版的低画质旧条目（只删软链）。订阅创建交给 MP 原生。"
+    plugin_desc = "v1.46 重构为双子系统：① 剧集未看洗版——插件定时任务对已在库且未观看的集按洗版规则升画质、删旧版，" \
+                 "完全绕过 best_version 订阅（规避其不补缺失集的原生限制），缺失集由 MP 普通订阅补齐；" \
+                 "② 电影洗版——库内低于目标画质的电影自动建 best_version=1 洗版订阅（MP 原生洗版）。" \
+                 "并保留观看联动（后移开始集数）、旧版清理、资源出库回收。"
     # 插件版本
-    plugin_version = "1.44"
+    plugin_version = "1.46"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -50,6 +63,8 @@ class EmbyUnwatchedWash(_PluginBase):
     # 私有变量
     _scheduler: Optional[BackgroundScheduler] = None
     subscribechain = None
+    searchchain = None
+    downloadchain = None
     # Dry-run 标记：观看联动只打印「将推进」、旧版清理只打印「将删除」，均不实际执行
     _dry_run: bool = False
     # 洗版后清理：订阅覆盖的内容在媒体库出现更高画质版本时，删除低画质旧条目
@@ -70,9 +85,27 @@ class EmbyUnwatchedWash(_PluginBase):
     _cancel_watched: bool = True
     # 「已观看」判定所依据的媒体服务器；为空表示所有已配置且连接的服务器
     _watched_check_servers: List[str] = []
+    # 资源出库回收（v1.45 新增，默认关闭）：媒体库里已不存在的「未看洗版」存量订阅
+    # 自动取消，避免 MP 继续为空库资源搜刮下载。用户自建订阅（best_version=1）只提示不代删；
+    # 媒体服务器状态未知时一律不动（区分「确定出库」与「查询异常」，绝不误删）。
+    _cancel_removed: bool = False
+    # ------------------------------------------------------------------
+    # v1.46 重构：电影洗版 / 剧集未看洗版（双子系统，互不干扰）
+    # ------------------------------------------------------------------
+    # 电影洗版：库内低于目标画质的电影，自动建 best_version=1 订阅（MP 原生洗版）。
+    _movie_wash: bool = False
+    # 剧集未看洗版：插件定时任务对「已在库且未观看」的集按洗版规则升画质（不碰 MP 订阅）。
+    _tv_wash: bool = False
+    # 洗版目标画质（分辨率），如 1080P / 4K / Remux；低于该画质才触发洗版。
+    _wash_resolution: str = "1080P"
+    _wash_resolution_height: int = 1080
+    # 剧集未看洗版本轮最多发起的下载数（防一次扫太多打爆站点）。
+    _tv_wash_limit: int = 30
 
     def init_plugin(self, config: dict = None):
         self.subscribechain = SubscribeChain()
+        self.searchchain = SearchChain()
+        self.downloadchain = DownloadChain()
 
         # 停止现有任务
         self.stop_service()
@@ -86,6 +119,15 @@ class EmbyUnwatchedWash(_PluginBase):
             self._cancel_watched = bool(config.get("cancel_watched", True))
             self._watched_check_servers = self._normalize_str_list(
                 config.get("watched_check_servers", []))
+            self._cancel_removed = bool(config.get("cancel_removed", False))
+            self._movie_wash = bool(config.get("movie_wash", False))
+            self._tv_wash = bool(config.get("tv_wash", False))
+            self._wash_resolution = str(config.get("wash_resolution", "1080P") or "1080P")
+            self._wash_resolution_height = self._res_height(self._wash_resolution)
+            try:
+                self._tv_wash_limit = max(1, int(config.get("tv_wash_limit") or 30))
+            except (TypeError, ValueError):
+                self._tv_wash_limit = 30
             self._dry_run = bool(config.get("dry_run", False))
             # 旧版清理（v1.41 引入、v1.42 即时化）：默认关闭——这是「删除」动作，误删代价高
             self._delete_washed_old = bool(config.get("delete_washed_old", False))
@@ -104,6 +146,11 @@ class EmbyUnwatchedWash(_PluginBase):
                 "only_once": self._only_once,
                 "cancel_watched": self._cancel_watched,
                 "watched_check_servers": self._watched_check_servers,
+                "cancel_removed": self._cancel_removed,
+                "movie_wash": self._movie_wash,
+                "tv_wash": self._tv_wash,
+                "wash_resolution": self._wash_resolution,
+                "tv_wash_limit": self._tv_wash_limit,
                 "dry_run": self._dry_run,
                 "delete_washed_old": self._delete_washed_old,
                 "delete_delay_minutes": self._delete_delay_minutes,
@@ -255,9 +302,11 @@ class EmbyUnwatchedWash(_PluginBase):
                             'variant': 'tonal',
                             'class': 'text-subtitle-2',
                             'text': 'v1.42 起订阅创建完全交给 MoviePilot 原生：在订阅上开启「洗版」开关即可，'
-                                    '无需另建订阅（避免全局查重冲突）。本插件每轮自动做两件事：'
-                                    '① 按观看记录把逐集洗版订阅的「开始集数」后移到第一个未观看集（已看集不再洗）；'
-                                    '② 核对订阅覆盖内容的媒体库多版本，删除被洗版的低画质旧条目（只删软链）。'
+                            '无需另建订阅（避免全局查重冲突）。本插件每轮自动做：'
+                            '① 按观看记录把逐集洗版订阅的「开始集数」后移到第一个未观看集（已看集不再洗）；'
+                            '② 核对订阅覆盖内容的媒体库多版本，删除被洗版的低画质旧条目（只删软链）；'
+                            '③ v1.46 新增「电影洗版」（库内低画质电影自动建洗版订阅）与'
+                            '「剧集未看洗版」（插件定时对已在库未看集按洗版规则升画质，彻底绕过 best_version 订阅不补缺失集的原生限制）。'
                         }
                     }),
 
@@ -280,6 +329,11 @@ class EmbyUnwatchedWash(_PluginBase):
                             items=server_items, multiple=True, chips=True, clearable=True,
                             hint='留空表示所有已配置并连接的媒体服务器；可只选其中一个，避免多服务器观看进度不一致时误判',
                             **{'persistent-hint': True}),
+                    control('VSwitch', 'cancel_removed', '资源出库自动取消未看洗版订阅', md=6,
+                            hint='媒体库里已不存在的「未看洗版」存量订阅自动取消（需开启上方「按观看进度后移开始集数」才会逐轮核对）。'
+                                 '仅代删本插件名下的存量订阅，你自己建的订阅只提示、不代删；'
+                                 '媒体服务器连不上/抖动时不动，绝不误删',
+                            **{'persistent-hint': True}),
 
                     # ---------- 3. 旧版清理 ----------
                     section('旧版清理（删低画质旧软链）'),
@@ -294,6 +348,31 @@ class EmbyUnwatchedWash(_PluginBase):
                     control('VTextField', 'delete_delay_minutes', '完成事件兜底删除延迟（分钟）', md=6,
                             placeholder='默认 10',
                             hint='订阅完成事件触发的兜底核对，延迟 N 分钟再执行，等待新版入库与媒体库刷新',
+                            **{'persistent-hint': True}),
+
+                    # ---------- 2.5 电影洗版 ----------
+                    section('电影洗版（库内低画质 → 建洗版订阅）'),
+                    control('VSwitch', 'movie_wash', '启用电影洗版', md=6,
+                            hint='开启后每轮扫描媒体库电影：低于「目标画质」且尚无订阅的，自动建 '
+                                 'best_version=1 洗版订阅（MP 原生洗版，下到高画质后替换旧版）。'
+                                 '已有任何订阅的电影不重复建（如需洗版请手动开启 best_version）',
+                            **{'persistent-hint': True}),
+                    control('VSelect', 'wash_resolution', '洗版目标画质', md=6,
+                            items=[{'title': x, 'value': x} for x in
+                                   ['480P', '720P', '1080P', '4K', 'Remux']],
+                            hint='低于该分辨率的电影才会触发洗版；库内多为 1080P 想冲 4K 则选 4K',
+                            **{'persistent-hint': True}),
+
+                    # ---------- 2.6 剧集未看洗版 ----------
+                    section('剧集未看洗版（插件定时升画质，不碰 MP 订阅）'),
+                    control('VSwitch', 'tv_wash', '启用剧集未看洗版', md=6,
+                            hint='开启后插件定时任务扫描剧集：对「已在库且未观看」的集，按洗版规则搜索更高画质'
+                                 '并下载、删旧版。缺失集由 MP 普通订阅补齐（两者不冲突）。'
+                                 '本功能完全绕过 best_version 订阅，规避「洗版订阅不补缺失集」的原生限制',
+                            **{'persistent-hint': True}),
+                    control('VTextField', 'tv_wash_limit', '每轮最多发起下载数', md=6,
+                            placeholder='默认 30',
+                            hint='防止一次扫太多打爆站点；超出部分下轮继续',
                             **{'persistent-hint': True}),
 
                     # ---------- 4. 试运行与手动触发 ----------
@@ -312,6 +391,11 @@ class EmbyUnwatchedWash(_PluginBase):
             "only_once": False,
             "cancel_watched": True,
             "watched_check_servers": [],
+            "cancel_removed": False,
+            "movie_wash": False,
+            "tv_wash": False,
+            "wash_resolution": "1080P",
+            "tv_wash_limit": 30,
             "delete_washed_old": False,
             "tv_full_sweep": True,
             "delete_delay_minutes": 10,
@@ -447,6 +531,383 @@ class EmbyUnwatchedWash(_PluginBase):
         # 共用官方默认容器宽度。
         return [{'component': 'VContainer', 'props': {'class': 'pa-0'}, 'content': contents}]
 
+    # ==================================================================
+    # v1.46 重构：电影洗版 + 剧集未看洗版（双子系统，互不干扰）
+    # ==================================================================
+    _RES_HEIGHT = {
+        "480P": 480, "576P": 576, "720P": 720, "1080P": 1080, "1080I": 1080,
+        "2K": 1440, "1440P": 1440, "4K": 2160, "2160P": 2160, "REMUX": 2160,
+    }
+
+    @staticmethod
+    def _res_height(s: str) -> int:
+        """把分辨率字符串映射到视频高度（像素），用于画质门槛比较。"""
+        return EmbyUnwatchedWash._RES_HEIGHT.get((s or "").upper().strip(), 0)
+
+    def _emby_get(self, inst, path: str, params: dict) -> Optional[Any]:
+        """对媒体服务器发 GET，Emby(/emby 前缀) 失败自动回退 Jellyfin(根路径)。返回 json 或 None。"""
+        info = self._server_http_base(inst)
+        if not info:
+            return None
+        base, apikey = info
+        import requests as _rq
+        p = dict(params)
+        p["api_key"] = apikey
+        for b in (base, base[:-5]):
+            try:
+                r = _rq.get(f"{b}{path}", params=p, timeout=20)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                continue
+        return None
+
+    def _all_subs(self) -> List[Any]:
+        """列出全部订阅（用于电影洗版查重，避免重复建订阅）。"""
+        repo = getattr(self.subscribechain, "subscription_repository", None)
+        if repo is None:
+            return []
+        try:
+            return list(repo.list() or [])
+        except Exception as e:
+            logger.error(f"【未看洗版】读取全部订阅失败：{e}")
+            return []
+
+    def _list_library_movies(self, inst) -> List[dict]:
+        """枚举媒体库全部电影（tmdbid + 画质），分页单请求取回。"""
+        out: List[dict] = []
+        start = 0
+        limit = 500
+        for _ in range(100):  # 上限 5 万，防死循环
+            data = self._emby_get(inst, "/Items", {
+                "Recursive": "true", "IncludeItemTypes": "Movie",
+                "Fields": "ProviderIds,MediaSources,ProductionYear",
+                "StartIndex": start, "Limit": limit,
+            })
+            if not data:
+                break
+            items = data.get("Items") or []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                pids = it.get("ProviderIds") or {}
+                tmdb = pids.get("Tmdb") or pids.get("TmdbId")
+                if not tmdb:
+                    continue
+                try:
+                    tmdb = int(tmdb)
+                except (TypeError, ValueError):
+                    continue
+                out.append({"tmdb_id": tmdb, "name": it.get("Name", ""),
+                            "year": it.get("ProductionYear") or "", "item": it})
+            if len(items) < limit:
+                break
+            start += limit
+        return out
+
+    def _list_library_series(self, inst) -> List[dict]:
+        """枚举媒体库全部剧集（tmdbid + SeriesId）。"""
+        out: List[dict] = []
+        start = 0
+        limit = 500
+        for _ in range(100):
+            data = self._emby_get(inst, "/Items", {
+                "Recursive": "true", "IncludeItemTypes": "Series",
+                "Fields": "ProviderIds",
+                "StartIndex": start, "Limit": limit,
+            })
+            if not data:
+                break
+            items = data.get("Items") or []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sid = it.get("Id")
+                if not sid:
+                    continue
+                pids = it.get("ProviderIds") or {}
+                tmdb = pids.get("Tmdb") or pids.get("TmdbId")
+                if not tmdb:
+                    continue
+                try:
+                    tmdb = int(tmdb)
+                except (TypeError, ValueError):
+                    continue
+                out.append({"tmdb_id": tmdb, "name": it.get("Name", ""),
+                            "year": it.get("ProductionYear") or "", "series_id": sid})
+            if len(items) < limit:
+                break
+            start += limit
+        return out
+
+    def _series_episodes_with_quality(self, inst, series_id: str, user_id: str) -> Optional[dict]:
+        """
+        一次性取某剧全部集的「是否已看 + 画质 + 条目」，避免逐集请求（性能关键）。
+        返回 {季: {集: {'played': bool, 'h': int, 'items': [条目]}}}；查询失败返回 None。
+        """
+        info = self._server_http_base(inst)
+        if not info:
+            return None
+        base, apikey = info
+        import requests as _rq
+        params = {"api_key": apikey, "UserId": user_id,
+                  "Fields": "MediaSources,ProviderIds,Path,DateCreated"}
+        for b in (base, base[:-5]):
+            try:
+                r = _rq.get(f"{b}/Shows/{series_id}/Episodes", params=params, timeout=20)
+                if r.status_code == 200:
+                    items = (r.json() or {}).get("Items") or []
+                    out: dict = {}
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        season = it.get("ParentIndexNumber")
+                        ep = it.get("IndexNumber")
+                        if season is None or ep is None:
+                            continue
+                        try:
+                            season = int(season)
+                            ep = int(ep)
+                        except (TypeError, ValueError):
+                            continue
+                        played = bool((it.get("UserData") or {}).get("Played"))
+                        h = self._quality_key(it)[0]
+                        out.setdefault(season, {})[ep] = {"played": played, "h": h, "items": [it]}
+                    return out
+            except Exception:
+                continue
+        return None
+
+    # ---------- 电影洗版 ----------
+    def _scan_movies_wash(self) -> None:
+        """
+        电影洗版（v1.46）：扫描媒体库电影，对低于目标画质且尚无订阅的，
+        自动建 best_version=1 洗版订阅（username=未看洗版·电影）。MP 原生洗版会在下到
+        高画质后替换旧版，本方法只负责「建订阅」这一步。
+
+        安全边界：已有任何订阅的电影不重复建（尊重用户自建订阅，不翻不删）；
+        已到目标画质的电影跳过；目标画质未配置则整轮跳过。
+        """
+        threshold = self._wash_resolution_height
+        if threshold <= 0:
+            logger.warning("【未看洗版】电影洗版：未配置有效目标画质，跳过")
+            return
+        servers = self._get_server_instances()
+        if not servers:
+            return
+        bv_ids = {int(getattr(s, "media_id", None)) for s in self._list_best_version_subscriptions()
+                  if getattr(s, "media_id", None)}
+        all_ids = {int(getattr(s, "media_id", None)) for s in self._all_subs()
+                   if getattr(s, "media_id", None)}
+        created = 0
+        for stype, sname, inst in servers:
+            for m in self._list_library_movies(inst):
+                tmdb = m["tmdb_id"]
+                if tmdb in bv_ids:
+                    continue
+                h = self._quality_key(m["item"])[0]
+                if h >= threshold:
+                    continue
+                if tmdb in all_ids:
+                    logger.info(f"【未看洗版】电影 {m['name']} 已有订阅，跳过自动建洗版"
+                                f"（如需洗版请手动开启 best_version）")
+                    continue
+                if self._dry_run:
+                    logger.info(f"[Dry-run] 电影洗版将建订阅：{m['name']}（当前 {h}p < 目标 {threshold}p）")
+                    continue
+                sid, err = self.subscribechain.add(
+                    title=m["name"], year=str(m["year"] or ""), tmdbid=tmdb,
+                    best_version=1, username=WASH_USERNAME_MOVIE, exist_ok=True)
+                if sid:
+                    created += 1
+                    logger.info(f"【未看洗版】已为低画质电影建洗版订阅：{m['name']}（{h}p）")
+                else:
+                    logger.warning(f"【未看洗版】建电影洗版订阅失败：{m['name']} - {err}")
+        logger.info(f"【未看洗版】电影洗版扫描完成，新建 {created} 个洗版订阅"
+                    + ("（Dry-run 预览）" if self._dry_run else ""))
+
+    # ---------- 剧集未看洗版 ----------
+    def _tv_episode_wash(self) -> None:
+        """
+        剧集未看洗版（v1.46，核心改动）：不碰 MP 订阅、不建 best_version 订阅，
+        改为插件定时任务对「已在库且未观看」的集按洗版规则搜索更高画质并下载、删旧版。
+
+        缺失集（不在库）由 MP 普通订阅补齐——两者操作集不相交，无重复下载冲突。
+        已升到目标画质的集会记入 tv_washed 状态，避免每轮重复搜；下到的旧版删除由
+        tv_wash_pending_delete 队列在下一轮核对（等新版本入库后再删）。
+        """
+        threshold = self._wash_resolution_height
+        if threshold <= 0:
+            logger.warning("【未看洗版】剧集未看洗版：未配置有效目标画质，跳过")
+            return
+        servers = self._get_server_instances()
+        if not servers:
+            return
+        # 1) 先处理上一轮排队的「删旧版」任务
+        self._process_tv_pending_delete()
+        limit = self._tv_wash_limit
+        done = 0
+        for stype, sname, inst in servers:
+            user_id = self._server_user_id(inst)
+            if not user_id:
+                continue
+            for s in self._list_library_series(inst):
+                tmdb = s["tmdb_id"]
+                series_id = s["series_id"]
+                name = s["name"]
+                # 一次性取该剧全部集的「已看 + 画质」，避免逐集请求
+                eps = self._series_episodes_with_quality(inst, series_id, user_id)
+                if eps is None:
+                    continue
+                for season, epmap in eps.items():
+                    for ep, einfo in epmap.items():
+                        if einfo["played"]:
+                            continue
+                        key = f"{tmdb}:{season}:{ep}"
+                        if einfo["h"] >= threshold:
+                            self._tv_washed_forget(key)
+                            continue
+                        if self._tv_washed_has(key):
+                            continue
+                        if done >= limit:
+                            logger.info(f"【未看洗版】剧集未看洗版本轮达上限 {limit}，剩余下轮处理")
+                            break
+                        chosen = self._search_episode_wash(inst, name, season, ep, threshold)
+                        if not chosen:
+                            self._tv_washed_mark(key)
+                            continue
+                        if self._dry_run:
+                            logger.info(f"[Dry-run] 剧集洗版将下载：{name} S{season:02d}E{ep:02d}"
+                                        f" <- {chosen.get('title')}")
+                            self._tv_washed_mark(key)
+                            done += 1
+                            continue
+                        downloads, _lefts = self.downloadchain.batch_download(
+                            contexts=[chosen["context"]], no_exists={},
+                            userid=WASH_USERNAME, username=WASH_USERNAME, save_path=None)
+                        if downloads:
+                            pending = self.get_data("tv_wash_pending_delete") or []
+                            pending.append({"server": sname, "series_id": series_id,
+                                            "season": season, "episode": ep, "threshold": threshold})
+                            self.save_data("tv_wash_pending_delete", pending)
+                            self._tv_washed_mark(key)
+                            done += 1
+                            logger.info(f"【未看洗版】已为未看集发起洗版下载：{name} S{season:02d}E{ep:02d}")
+                        else:
+                            logger.info(f"【未看洗版】未看集下载未成功（无资源/无权限）："
+                                        f"{name} S{season:02d}E{ep:02d}")
+        logger.info(f"【未看洗版】剧集未看洗版扫描完成，本轮发起 {done} 个未看集洗版"
+                    + ("（Dry-run 预览）" if self._dry_run else ""))
+
+    def _search_episode_wash(self, inst, name: str, season: int, ep: int, threshold: int) -> Optional[dict]:
+        """
+        按洗版规则搜索某集更高画质的单集资源。返回 {'context': Context, 'title': str} 或 None。
+        只接受单集匹配（避免拉整季包），且分辨率达到目标画质门槛。
+        """
+        try:
+            mi = MetaInfo(title=f"{name} S{season:02d}E{ep:02d}")
+        except Exception as e:
+            logger.warning(f"【未看洗版】构造剧集搜索元数据失败：{name} S{season:02d}E{ep:02d} - {e}")
+            return None
+        best_rule = None
+        if SystemConfigKey:
+            try:
+                best_rule = self.systemconfig.get(SystemConfigKey.BestVersionFilterRules)
+            except Exception:
+                best_rule = None
+        try:
+            contexts = self.searchchain.process(
+                mediainfo=mi, keyword=name, no_exists={}, sites=[],
+                priority_rule=best_rule, filter_rule=None, area="title")
+        except Exception as e:
+            logger.warning(f"【未看洗版】搜索剧集资源失败：{name} S{season:02d}E{ep:02d} - {e}")
+            return None
+        if not contexts:
+            return None
+        candidates = []
+        for c in contexts:
+            ti = getattr(c, "torrent_info", None)
+            ci = getattr(c, "meta_info", None)
+            if not ti or not ci:
+                continue
+            if getattr(ci, "type", None) != MediaType.TV:
+                continue
+            ep_list = getattr(ci, "episode_list", None) or []
+            if ep_list and ep_list != [ep]:
+                continue  # 不是这一集
+            rh = self._res_height(getattr(ti, "resolution", "") or "")
+            if rh and rh < threshold:
+                continue
+            candidates.append(c)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: self._res_height(
+            getattr(getattr(c, "torrent_info", None), "resolution", "") or ""), reverse=True)
+        chosen = candidates[0]
+        return {"context": chosen,
+                "title": getattr(getattr(chosen, "torrent_info", None), "title", "")}
+
+    def _process_tv_pending_delete(self) -> None:
+        """
+        处理上一轮「剧集洗版」排队的删旧版任务：等更高画质版入库后，
+        删除同集低于最高画质的旧条目（保留最高）。新版本未入库则留待下轮。
+        """
+        pending = self.get_data("tv_wash_pending_delete") or []
+        if not pending:
+            return
+        servers = {name: inst for _stype, name, inst in self._get_server_instances()}
+        remain = []
+        changed = False
+        for task in pending:
+            inst = servers.get(task.get("server"))
+            if not inst:
+                remain.append(task)
+                continue
+            try:
+                versions = self._episode_versions(inst, task["series_id"], task["season"], task["episode"])
+            except Exception:
+                remain.append(task)
+                continue
+            if not versions:
+                changed = True  # 没有版本了（可能已被 MP 清理），丢弃任务
+                continue
+            maxh = max((self._quality_key(it)[0] for it in versions), default=0)
+            if maxh < task["threshold"]:
+                remain.append(task)  # 高画质版还没入库，留待下轮
+                continue
+            to_delete = [it for it in versions if self._quality_key(it)[0] < maxh]
+            if not to_delete:
+                changed = True
+                continue
+            if self._dry_run:
+                logger.info(f"[Dry-run] 将删旧版：{task['series_id']} S{task['season']}E{task['episode']}"
+                            f" 共 {len(to_delete)} 个")
+                changed = True
+                continue
+            for it in to_delete:
+                if self._delete_server_item(inst, it):
+                    changed = True
+        if changed:
+            self.save_data("tv_wash_pending_delete", remain)
+
+    # tv_washed 状态（已发起洗版的未看集，避免每轮重复搜）
+    def _tv_washed_state(self) -> set:
+        return set(self.get_data("tv_washed") or [])
+
+    def _tv_washed_mark(self, key: str) -> None:
+        s = self._tv_washed_state()
+        s.add(key)
+        self.save_data("tv_washed", list(s))
+
+    def _tv_washed_has(self, key: str) -> bool:
+        return key in self._tv_washed_state()
+
+    def _tv_washed_forget(self, key: str) -> None:
+        s = self._tv_washed_state()
+        if key in s:
+            s.discard(key)
+            self.save_data("tv_washed", list(s))
+
     def get_service(self) -> List[Dict[str, Any]]:
         """
         注册插件公共服务
@@ -501,8 +962,9 @@ class EmbyUnwatchedWash(_PluginBase):
           2. 旧版清理：核对订阅覆盖内容的媒体库多版本，删除被洗版的低画质旧条目
         Dry-run 模式下两者都只打印、不执行。
         """
-        if not self._cancel_watched and not self._delete_washed_old:
-            logger.info("【未看洗版】观看联动与旧版清理均未开启，本轮无事可做")
+        if not (self._cancel_watched or self._delete_washed_old or self._cancel_removed
+                or self._movie_wash or self._tv_wash):
+            logger.info("【未看洗版】观看联动、资源出库回收、旧版清理、电影洗版、剧集未看洗版均未开启，本轮无事可做")
             return
         # 获取锁
         _is_lock: bool = lock.acquire(timeout=60)
@@ -531,6 +993,18 @@ class EmbyUnwatchedWash(_PluginBase):
             except Exception as e:
                 logger.error(f"【未看洗版】旧版清理异常：{e}\n{traceback.format_exc()}")
                 swept["failed"] = swept.get("failed", 0) + 1
+            # ---------- 功能3：电影洗版（库内低画质→建洗版订阅） ----------
+            if self._movie_wash:
+                try:
+                    self._scan_movies_wash()
+                except Exception as e:
+                    logger.error(f"【未看洗版】电影洗版异常：{e}\n{traceback.format_exc()}")
+            # ---------- 功能4：剧集未看洗版（插件定时升画质） ----------
+            if self._tv_wash:
+                try:
+                    self._tv_episode_wash()
+                except Exception as e:
+                    logger.error(f"【未看洗版】剧集未看洗版异常：{e}\n{traceback.format_exc()}")
             # ---------- 汇总 ----------
             logger.info(f"【未看洗版】========== 运行完成 ========== | "
                         f"推进开始集数 {results.get('shrunk', 0)} 个 | 取消订阅 {results.get('deleted', 0)} 个 | "
@@ -800,7 +1274,7 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         if results is None:
             results = {"deleted": 0, "shrunk": 0, "failed": 0, "details": []}
-        if not self._cancel_watched:
+        if not self._cancel_watched and not self._cancel_removed:
             return
         servers = self._watched_targets()
         if not servers:
@@ -1345,8 +1819,17 @@ class EmbyUnwatchedWash(_PluginBase):
         season = getattr(sub, "season", None)
         series_id = self._series_id_of(inst, tmdb_id, name=name, year=year)
         if not series_id:
-            logger.info(f"【未看洗版】{name}：在 {getattr(inst, 'host', '媒体服务器')} 上找不到该剧集，"
-                        f"本轮不动它的订阅（可能未入库/已被删除）")
+            # 媒体库找不到该剧集：可能是未入库 / 已出库 / 标题对不上。
+            # 开启「资源出库回收」时，精确核对是否真的已从库里移除，是则取消本插件存量订阅。
+            if self._cancel_removed:
+                self._try_cancel_removed(sub, inst, tmdb_id, "Series", name, results)
+            else:
+                logger.info(f"【未看洗版】{name}：在 {getattr(inst, 'host', '媒体服务器')} 上找不到该剧集，"
+                            f"本轮不动它的订阅（可能未入库/已被删除）")
+            return
+        # 以下「观看进度推进 / 整季看完取消」逻辑仅在开启观看联动时执行；
+        # 若只开了资源出库回收（_cancel_watched=False），找到剧集即视为仍在库，直接跳过。
+        if not self._cancel_watched:
             return
         eps_map = self._episodes_of_series(inst, series_id, user_id)
         if eps_map is None:
@@ -1439,7 +1922,18 @@ class EmbyUnwatchedWash(_PluginBase):
             return
         played = self._movie_played(inst, tmdb_id, user_id)
         if played is None:
-            logger.info(f"【未看洗版】{name}：在媒体服务器上观看状态未知，本轮不动它的订阅")
+            # 观看状态未知：可能是库里已无此电影（出库），也可能是媒体服务器异常。
+            # 开启「资源出库回收」时精确核对，确认已出库则取消本插件存量订阅。
+            if self._cancel_removed:
+                self._try_cancel_removed(sub, inst, tmdb_id, "Movie", name, results)
+            else:
+                logger.info(f"【未看洗版】{name}：在媒体服务器上观看状态未知，本轮不动它的订阅")
+            return
+        if not self._cancel_watched:
+            return
+        # 电影洗版订阅（WASH_USERNAME_MOVIE）：洗到目标画质前不因「已观看」取消，
+        # 只在电影出库时由「资源出库回收」取消。
+        if username == WASH_USERNAME_MOVIE:
             return
         if not played:
             # 还没看，继续洗版，不做任何事
@@ -1454,6 +1948,81 @@ class EmbyUnwatchedWash(_PluginBase):
             results["deleted"] = results.get("deleted", 0) + 1
             results.setdefault("details", []).append(
                 f"已取消「{name}」电影洗版订阅（已观看，不限账户）")
+        else:
+            results["failed"] = results.get("failed", 0) + 1
+
+    @staticmethod
+    def _media_item_missing(inst, tmdb_id: int, item_type: str) -> Optional[bool]:
+        """
+        确认某 tmdb 对应的条目是否**已从媒体库移除**（出库/被删）。
+
+        三态返回：
+          True  = 服务器连通且按 tmdbid 精确查询成功，但确实无此条目（确认出库）
+          False = 查到了条目（仍在库）
+          None  = 服务器不可达/查询异常（未知；调用方应跳过、绝不误取消）
+
+        仅按 tmdbid 精确匹配，不退化标题搜索——避免同名不同 tmdb 的误判；
+        与 _series_id_of 的 tmdbid 分支一致，但本方法不触发标题退化搜索，
+        从而把「确定缺失」与「查询异常」区分开（这是出库回收能安全取消的前提）。
+        """
+        info = EmbyUnwatchedWash._server_http_base(inst)
+        if not info:
+            return None
+        base, apikey = info
+        import requests as _rq
+        params = {
+            "api_key": apikey,
+            "Recursive": "true",
+            "IncludeItemTypes": item_type,
+            "AnyProviderIdEquals": f"Tmdb.{tmdb_id}",
+        }
+        try:
+            r = _rq.get(f"{base}/Items", params=params, timeout=15)
+            if r.status_code != 200:
+                r = _rq.get(f"{base[:-5]}/Items", params=params, timeout=15)
+            if r.status_code != 200:
+                return None
+            items = (r.json() or {}).get("Items") or []
+            return len(items) == 0
+        except Exception:
+            return None
+
+    def _try_cancel_removed(self, sub: Any, inst: Any, tmdb_id: int,
+                            item_type: str, name: str, results: dict) -> None:
+        """
+        出库回收（v1.45 新增，默认关闭）：媒体库里已经没有的资源，取消其「未看洗版」
+        存量洗版订阅，避免 MP 继续为空库资源搜刮下载。
+
+        安全边界（与整季看完取消一致）：
+          · 仅对 username==未看洗版 的存量自建订阅代删；
+          · 用户自建订阅（best_version=1）只提示、绝不代删；
+          · 媒体服务器状态未知/异常（_media_item_missing 返回 None）一律不动，绝不误删；
+          · Dry-run 模式只打印。
+        """
+        sid = getattr(sub, "id", None)
+        username = str(getattr(sub, "username", "") or "")
+        label = "剧集" if item_type == "Series" else "电影"
+        missing = self._media_item_missing(inst, tmdb_id, item_type)
+        if missing is None:
+            logger.info(f"【未看洗版】{name}：媒体服务器状态未知（可能未连接/抖动），"
+                        f"本轮不取消它的订阅")
+            return
+        if not missing:
+            # 查到了条目：理论上不会走到这（能查到 series_id 就不会进此分支），保险处理
+            return
+        # 确认已出库：区分归属
+        if username not in (WASH_USERNAME, WASH_USERNAME_MOVIE):
+            logger.warning(f"【未看洗版】{name}：媒体库已无此{label}（可能已出库），"
+                           f"但属用户自建订阅，未代删（请到 MP 订阅页手动取消）")
+            return
+        reason = f"{label}已从媒体库移除（资源出库）：{name}"
+        if self._dry_run:
+            logger.info(f"【未看洗版】[Dry-run] 将取消洗版订阅：{name}（{reason}）")
+            results.setdefault("details", []).append(f"[Dry-run] 「{name}」{reason}，将取消订阅")
+            return
+        if self._delete_subscription(sid, reason):
+            results["deleted"] = results.get("deleted", 0) + 1
+            results.setdefault("details", []).append(f"已取消「{name}」洗版订阅（{reason}）")
         else:
             results["failed"] = results.get("failed", 0) + 1
 
