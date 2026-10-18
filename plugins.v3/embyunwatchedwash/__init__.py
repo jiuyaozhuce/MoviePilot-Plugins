@@ -48,7 +48,7 @@ class EmbyUnwatchedWash(_PluginBase):
                  "② 电影洗版——库内低于目标画质的电影自动建 best_version=1 洗版订阅（MP 原生洗版）。" \
                  "并保留观看联动（后移开始集数）、旧版清理、资源出库回收。"
     # 插件版本
-    plugin_version = "1.46"
+    plugin_version = "1.47"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -715,8 +715,14 @@ class EmbyUnwatchedWash(_PluginBase):
                 if self._dry_run:
                     logger.info(f"[Dry-run] 电影洗版将建订阅：{m['name']}（当前 {h}p < 目标 {threshold}p）")
                     continue
+                # v1.47：MP v3.1.7 起订阅写入启用严格字段白名单
+                #（application/subscription/contract.py 的 SubscriptionPatch.__post_init__），
+                # 旧关键字 tmdbid 已不在 _SUBSCRIPTION_FIELDS 中，继续传它会直接抛
+                # 「订阅写入包含未知字段: tmdbid」，导致电影洗版建订阅 100% 失败。
+                # 改为显式传 media_source + media_id（二者必须成对出现）。
                 sid, err = self.subscribechain.add(
-                    title=m["name"], year=str(m["year"] or ""), tmdbid=tmdb,
+                    title=m["name"], year=str(m["year"] or ""),
+                    media_source="themoviedb", media_id=str(tmdb),
                     best_version=1, username=WASH_USERNAME_MOVIE, exist_ok=True)
                 if sid:
                     created += 1
