@@ -1664,6 +1664,11 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.debug(f"【未看洗版】{name} {label}：订阅字段已是期望值，无需更新"
                          f"（已看 {watched_count}/{len(all_eps)} 集）")
             return
+        # manual_total_episode 只是防止 MP 覆盖 total 的附加标记，本身不代表「有变更」。
+        # 只剩它时直接跳过，避免刷出「将更新 XXX：」这种空动作日志。
+        if not (set(updates) - {"manual_total_episode"}):
+            logger.debug(f"【未看洗版】{name} {label}：仅需补 manual_total_episode 标记，跳过")
+            return
 
         # Dry-run：只报告不写库
         if self._dry_run:
