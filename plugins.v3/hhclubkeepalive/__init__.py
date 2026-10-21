@@ -9,6 +9,11 @@ Cookie 读取页面。取数分两级（均为实测确定）：
 2. 兜底口径 用户页「最近动向」——实测每次访问都会刷新成当前时刻，
    仅在没有登录记录时使用，并在页面/通知里明确标注。
 
+运行策略为「临期才核实」：30 天是从最后一次登录起算的，只要用户不登录，
+本地按这个时间倒推就不会算错，所以平时完全不访问站点；只有剩余天数进入
+「核实阈值」、本地没有可信基准，或用户手动点「立即检查」时才真正请求站点。
+这样既避免无谓的自动化访问（站方明确不支持自动化工具签到），也保证临期数据是准的。
+
 插件只做页面读取，不调用签到接口、不模拟登录。
 
 保活期限取自憨憨 wiki《账号规则 / 账号封禁规则》：
@@ -47,7 +52,7 @@ class HHClubKeepAlive(_PluginBase):
     # 插件图标
     plugin_icon = "https://hhanclub.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -70,6 +75,7 @@ class HHClubKeepAlive(_PluginBase):
     _onlyonce: bool = False
     _limit_days: int = 30
     _warn_days: int = 7
+    _verify_days: int = 7
     _daily_report: bool = True
 
     # 最近一次检查结果（插件侧视图，仅普通字典）
@@ -121,6 +127,8 @@ class HHClubKeepAlive(_PluginBase):
             self._onlyonce = bool(config.get("onlyonce", False))
             self._limit_days = int(config.get("limit_days") or 30)
             self._warn_days = int(config.get("warn_days") or 7)
+            self._verify_days = int(config.get("verify_days")
+                                    if config.get("verify_days") is not None else 7)
             self._daily_report = bool(config.get("daily_report", True))
             self._last_result = dict(config.get("last_result") or {})
 
@@ -151,6 +159,7 @@ class HHClubKeepAlive(_PluginBase):
             "onlyonce": self._onlyonce,
             "limit_days": self._limit_days,
             "warn_days": self._warn_days,
+            "verify_days": self._verify_days,
             "daily_report": self._daily_report,
             "last_result": self._last_result,
         })
@@ -287,6 +296,36 @@ class HHClubKeepAlive(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6, "class": "pa-2"},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "verify_days",
+                                        "type": "number",
+                                        "label": "核实阈值（天）",
+                                        "hint": "剩余天数大于该值时只做本地推算、不访问站点；"
+                                                "进入阈值内才去站点读一次真实登录记录。0 = 每次都核实",
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "class": "pa-2"},
+                                "content": [{
+                                    "component": "VAlert",
+                                    "props": {
+                                        "type": "success",
+                                        "variant": "tonal",
+                                        "class": "text-subtitle-2",
+                                        "text": "默认「临期才核实」：憨憨的 30 天从最后一次登录起算，只要你不登录，"
+                                                "本地按这个时间倒推不会算错，所以平时不必访问站点——"
+                                                "只有剩余天数进入核实阈值内，才去读一次登录记录（顺带确认 Cookie 是否还有效）。",
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "class": "pa-2"},
                                 "content": [{
                                     "component": "VAlert",
@@ -294,8 +333,7 @@ class HHClubKeepAlive(_PluginBase):
                                         "type": "info",
                                         "variant": "tonal",
                                         "class": "text-subtitle-2",
-                                        "text": "插件使用 MoviePilot 站点管理里憨憨站点的 Cookie，读取「用户访问记录」中的最后登录时间，"
-                                                "只做页面读取，不调用签到接口、不模拟登录。"
+                                        "text": "核实时会请求站点首页与「用户访问记录」，只读取、不调用签到接口、不模拟登录。"
                                                 "憨憨官方明确「不支持自动化工具签到」，保活仍需手动登录一次站点。",
                                     },
                                 }],
@@ -325,6 +363,7 @@ class HHClubKeepAlive(_PluginBase):
             "cron": "1 0 * * *",
             "limit_days": 30,
             "warn_days": 7,
+            "verify_days": 7,
         }
 
     # ------------------------------------------------------------------ 解析工具
@@ -532,10 +571,10 @@ class HHClubKeepAlive(_PluginBase):
 
     # ------------------------------------------------------------------ 检查主流程
 
-    def run_check(self) -> None:
+    def run_check(self, force: bool = False) -> None:
         """执行一次保活检查，任何异常都转成错误通知，避免静默失败。"""
         try:
-            self._do_check()
+            self._do_check(force=force)
         except Exception as err:
             logger.error(f"憨憨保活检查执行异常：{str(err)}")
             site_name = self._keyword
@@ -547,9 +586,57 @@ class HHClubKeepAlive(_PluginBase):
                 pass
             self._notify(site_name, None, error=f"插件执行异常：{str(err)[:200]}")
 
-    def _do_check(self) -> None:
-        """执行保活检查主流程并按策略推送提醒。"""
-        logger.info("开始执行憨憨登录保活检查 ...")
+    def _record(self, now: datetime, result: Dict[str, Any]) -> None:
+        """写入最近一次结果与历史。"""
+        result["checked_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        result["limit_days"] = self._limit_days
+        self._last_result = dict(result)
+        self._save_config()
+
+        history = self.get_data("check_history") or []
+        history.insert(0, dict(result))
+        self.save_data("check_history", history[:30])
+
+    def _do_check(self, force: bool = False) -> None:
+        """执行保活检查。
+
+        默认走「临期才核实」：平时只按本地记录的登录时间倒计时、不访问站点；
+        只有当剩余天数不大于「核实阈值」、本地没有可信基准，或用户手动点「立即检查」时，
+        才真正请求站点读一次登录记录。
+        """
+        now = datetime.now(tz=pytz.timezone(settings.TZ)).replace(tzinfo=None)
+        baseline = dict(self._last_result or {})
+
+        # 本地基准可用：登录记录口径，或上一次本地推算
+        base_time = None
+        if baseline.get("last_action") and baseline.get("source") in ("login_log", "local"):
+            try:
+                base_time = datetime.strptime(str(baseline["last_action"]), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                base_time = None
+
+        if base_time and not force and self._verify_days > 0:
+            days_since = max((now.date() - base_time.date()).days, 0)
+            remaining = self._limit_days - days_since
+            if remaining > self._verify_days:
+                logger.info(
+                    f"憨憨保活检查：本地推算 {base_time.strftime('%Y-%m-%d %H:%M:%S')} 最后登录"
+                    f"（{days_since} 天前），还剩 {remaining} 天，未达核实阈值 {self._verify_days} 天，"
+                    f"本次不访问站点"
+                )
+                result = dict(baseline)
+                result.update({
+                    "days_since": days_since,
+                    "remaining": remaining,
+                    "source": "local",
+                    "verified": False,
+                })
+                self._record(now, result)
+                if self._daily_report or remaining <= self._warn_days:
+                    self._notify(baseline.get("site") or self._keyword, self._last_result)
+                return
+
+        logger.info("开始执行憨憨登录保活检查（需要访问站点）...")
         site = self._get_site()
         if not site:
             logger.warning("憨憨保活提醒：未找到憨憨站点，请先在站点管理里添加（域名含 hhanclub）")
@@ -559,8 +646,6 @@ class HHClubKeepAlive(_PluginBase):
             logger.warning("憨憨保活提醒：站点未配置 Cookie，无法读取用户页")
             self._notify(site.name, None, error="站点未配置 Cookie，无法读取用户页，请在站点管理里补全")
             return
-
-        now = datetime.now(tz=pytz.timezone(settings.TZ)).replace(tzinfo=None)
 
         # 1. 首页：确认登录态并取 uid
         index_page = self._request(site, "index.php")
@@ -612,10 +697,10 @@ class HHClubKeepAlive(_PluginBase):
         days_since = max((now.date() - active_at.date()).days, 0)
         remaining = self._limit_days - days_since
 
-        self._last_result = {
-            "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "username": username,
-            "uid": uid,
+        result = {
+            "username": username or baseline.get("username", ""),
+            "uid": uid or baseline.get("uid", ""),
+            "site": site.name,
             "field": label,
             "last_action": active_at.strftime("%Y-%m-%d %H:%M:%S"),
             "ip": (login or {}).get("ip", ""),
@@ -623,15 +708,12 @@ class HHClubKeepAlive(_PluginBase):
             "method": (login or {}).get("method", ""),
             "days_since": days_since,
             "remaining": remaining,
-            "limit_days": self._limit_days,
             "self_refresh": self_refresh,
             "source": "login_log" if login else "recent_action",
+            "verified": True,
+            "verify_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        self._save_config()
-
-        history = self.get_data("check_history") or []
-        history.insert(0, dict(self._last_result))
-        self.save_data("check_history", history[:30])
+        self._record(now, result)
 
         logger.info(
             f"憨憨保活检查完成：{label} {active_at.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -640,8 +722,7 @@ class HHClubKeepAlive(_PluginBase):
             + ("，本次请求可能已刷新活跃度" if self_refresh else "")
         )
 
-        warn = remaining <= self._warn_days
-        if self._daily_report or warn:
+        if self._daily_report or remaining <= self._warn_days:
             self._notify(site.name, self._last_result)
 
     # ------------------------------------------------------------------ 通知
@@ -678,7 +759,10 @@ class HHClubKeepAlive(_PluginBase):
             f"（已封存账号为 400 天）",
             f"剩余天数：{remaining} 天",
         ]
-        if result.get("source") == "recent_action":
+        source = result.get("source")
+        if source == "local":
+            lines.append(f"数据来源：本地推算（上次到站点核实于 {result.get('verify_at') or '—'}），本次未访问站点。")
+        elif source == "recent_action":
             lines.append("注：站点登录记录为空，本次按用户页「最近动向」估算，该时间可能被页面访问刷新。")
         if urgent:
             lines.append("已超期！账号面临封禁风险，请立即手动登录一次（浏览器打开网站即可）。")
@@ -739,13 +823,14 @@ class HHClubKeepAlive(_PluginBase):
         }
 
     def api_check_now(self) -> Dict[str, Any]:
-        """详情页「立即检查」按钮：排入一次后台检查，接口立即返回。"""
+        """详情页「立即检查」按钮：强制访问站点核实一次，接口立即返回。"""
         if not self._enabled:
             return {"success": False, "message": "插件未启用", "data": None}
         try:
             scheduler = BackgroundScheduler(timezone=settings.TZ)
             scheduler.add_job(
                 func=self.run_check,
+                kwargs={"force": True},
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                 name="憨憨登录保活检查（手动）",
@@ -778,6 +863,12 @@ class HHClubKeepAlive(_PluginBase):
             content.append(alert)
 
             place = " · ".join(x for x in (last.get("region"), last.get("method")) if x)
+            source = last.get("source")
+            source_text = {
+                "local": "本地推算",
+                "login_log": "站点登录记录",
+                "recent_action": "用户页最近动向",
+            }.get(source, "—")
             content.append({
                 "component": "VAlert",
                 "props": {"type": "info", "variant": "tonal", "class": "text-subtitle-2 mt-2"},
@@ -787,7 +878,15 @@ class HHClubKeepAlive(_PluginBase):
                          + (f" · {place}" if place else "")
                          + f" · 期限 {last.get('limit_days') or self._limit_days} 天"),
             })
-            if last.get("source") == "recent_action":
+            content.append({
+                "component": "VAlert",
+                "props": {"type": "success", "variant": "tonal", "class": "text-subtitle-2 mt-2"},
+                "text": (f"数据来源：{source_text}"
+                         + (f"，上次到站点核实于 {last.get('verify_at')}"
+                            if last.get("verify_at") else "")
+                         + ("；本次只做本地推算，未访问站点。" if source == "local" else "")),
+            })
+            if source == "recent_action":
                 content.append({
                     "component": "VAlert",
                     "props": {"type": "warning", "variant": "tonal",
