@@ -38,7 +38,7 @@ from app.utils.http import RequestUtils
 
 
 class HHClubKeepAlive(_PluginBase):
-    """憨憨登录保活提醒插件：每日读取用户页「最近动向」，按站规期限推送剩余天数提醒。"""
+    """憨憨登录保活提醒插件：读取「用户访问记录」的最后登录时间，按站规期限推送剩余天数提醒。"""
 
     # 插件名称
     plugin_name = "憨憨登录保活提醒"
