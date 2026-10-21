@@ -1,4 +1,17 @@
 {
+  "HHClubKeepAlive": {
+    "name": "憨憨登录保活提醒",
+    "description": "读取憨憨「用户访问记录」里的最后登录时间，按 30 天（封存 400 天）保活线推送剩余天数提醒，不签到、不模拟登录。",
+    "labels": "站点",
+    "version": "1.0.0",
+    "icon": "https://hhanclub.net/favicon.ico",
+    "author": "jiuyaozhuce",
+    "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
+    "level": 1,
+    "release": false,
+    "system_version": ">=3.0.0",
+    "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins"
+  },
   "EmbyUnwatchedWash": {
     "name": "Emby未看洗版",
     "description": "根据观看记录自动后移 MP 逐集洗版订阅的开始集数（已看集不再洗），并每轮核对媒体库多版本、即时清理被洗版的低画质旧条目（只删软链）。订阅创建交给 MP 原生。",
