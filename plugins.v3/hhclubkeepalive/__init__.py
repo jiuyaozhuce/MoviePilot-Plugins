@@ -52,7 +52,7 @@ class HHClubKeepAlive(_PluginBase):
     # 插件图标
     plugin_icon = "https://hhanclub.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -98,11 +98,32 @@ class HHClubKeepAlive(_PluginBase):
     _default_ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-    # 详情页顶部大号字体样式
-    _big_text_style = ("font-size:clamp(2rem,7vw,3rem);font-weight:700;line-height:1.25;"
-                       "text-align:center;padding:20px 12px")
-    # 副标题样式：另起一行并退回常规字号
-    _sub_text_style = "font-size:.95rem;font-weight:400;line-height:1.5;margin-top:6px"
+    # ---------- 详情页样式：只用静态类与内联样式，颜色一律交给组件属性 ----------
+    # 主状态卡：去掉默认图标，让大号天数在卡里真正居中
+    _hero_style = "padding:22px 16px;text-align:center"
+    _hero_row_style = ("display:flex;align-items:baseline;justify-content:center;"
+                       "gap:8px;flex-wrap:wrap")
+    _hero_num_style = "font-size:clamp(2.4rem,9vw,3.4rem);font-weight:700;line-height:1"
+    _hero_word_style = "font-size:1.05rem;font-weight:500;opacity:.85"
+    _notice_title_style = "font-size:1.35rem;font-weight:600;line-height:1.3"
+    # 副标题样式：另起一行并退回常规字号（否则会继承大号字体）
+    _sub_text_style = ("font-size:.95rem;font-weight:400;line-height:1.5;"
+                       "margin-top:10px;text-align:center")
+    # 脚注、分区标题与网格标签/取值样式
+    _foot_style = ("font-size:.8rem;line-height:1.6;margin-top:14px;"
+                   "opacity:.85;text-align:center")
+    _card_title_style = "font-size:1.02rem;font-weight:600;line-height:1.4"
+    _label_style = "font-size:.72rem;line-height:1.4;letter-spacing:.03em"
+    _value_style = "font-size:.95rem;line-height:1.45;margin-top:3px"
+    _hint_style = "font-size:.75rem;line-height:1.4;margin-top:2px"
+    # 概况网格：靠 flex 自适应列数，窄屏不会散成一列一个大格
+    _grid_style = "display:flex;flex-wrap:wrap;gap:14px 18px"
+    _cell_style = "flex:1 1 calc(33.333% - 12px);min-width:160px"
+    # 列表标题：覆盖 Vuetify 的单行截断，长文本按容器宽度自动换行
+    _list_title_style = ("display:flex;align-items:center;gap:6px;flex-wrap:wrap;"
+                         "overflow:visible;text-overflow:clip;-webkit-line-clamp:unset")
+    _wrap_style = ("display:block;white-space:normal;overflow:visible;"
+                   "text-overflow:clip;-webkit-line-clamp:unset")
     # 详情页需要醒目标记的站点关键字与样式
     _keyword = "憨憨"
     _keyword_style = ("font-weight:700;text-decoration:underline;"
@@ -111,6 +132,14 @@ class HHClubKeepAlive(_PluginBase):
     _subtitle_normal = "站点活跃度正常，无需操作"
     _subtitle_warn = "活跃度已临期，请尽快手动登录憨憨站点保活"
     _subtitle_over = "已超期未登录，账号可能已被封禁，请立即到憨憨站点确认"
+    # 详情页最多展示的检查次数
+    _page_history = 10
+    # 数据来源标签：本地推算 / 站点登录记录 / 用户页最近动向
+    _source_meta = {
+        "local": {"label": "本地推算", "color": "grey"},
+        "login_log": {"label": "站点登录记录", "color": "primary"},
+        "recent_action": {"label": "用户页最近动向", "color": "warning"},
+    }
 
     _dt_re = re.compile(
         r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})日?[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?"
@@ -508,10 +537,10 @@ class HHClubKeepAlive(_PluginBase):
                 fallback = site
         return fallback
 
-    def _site_url(self) -> Optional[str]:
-        """取站点地址（只保留协议与域名），用于详情页跳转。"""
+    def _site_url(self, site=None) -> Optional[str]:
+        """取站点地址（只保留协议与域名），用于详情页跳转；不传站点时自动匹配。"""
         try:
-            site = self._get_site()
+            site = site if site is not None else self._get_site()
             if not site:
                 return None
             raw = str(site.url or "").strip()
@@ -777,28 +806,137 @@ class HHClubKeepAlive(_PluginBase):
     # ------------------------------------------------------------------ 详情页
 
     def _days_text(self, days: Any) -> str:
+        """把距今天数转成可读文案，0 天显示今天。"""
         try:
             value = int(days)
         except (TypeError, ValueError):
             return "—"
         return "今天" if value <= 0 else f"{value} 天前"
 
-    def _remaining_alert(self, remaining: Any) -> Tuple[str, str, str]:
-        """按剩余天数返回提示框类型、大号文案与副标题。"""
+    def _status_meta(self, remaining: Any) -> Dict[str, str]:
+        """按剩余天数返回状态色、大号文案分段、状态标签与副标题：临期黄、超期红。"""
         try:
             value = int(remaining)
         except (TypeError, ValueError):
-            return "info", "剩余 — 天", self._subtitle_normal
+            return {"color": "info", "lead": "剩余", "number": "—",
+                    "label": "状态未知", "subtitle": self._subtitle_normal}
         if value < 0:
-            return "error", f"已超期 {-value} 天", self._subtitle_over
+            return {"color": "error", "lead": "已超期", "number": str(-value),
+                    "label": "需立即登录", "subtitle": self._subtitle_over}
         if value == 0:
-            return "error", "剩余 0 天", self._subtitle_over
+            return {"color": "error", "lead": "剩余", "number": "0",
+                    "label": "今天到期", "subtitle": self._subtitle_over}
         if value <= self._warn_days:
-            return "warning", f"剩余 {value} 天", self._subtitle_warn
-        return "info", f"剩余 {value} 天", self._subtitle_normal
+            return {"color": "warning", "lead": "剩余", "number": str(value),
+                    "label": "临期提醒", "subtitle": self._subtitle_warn}
+        return {"color": "info", "lead": "剩余", "number": str(value),
+                "label": "活跃度正常", "subtitle": self._subtitle_normal}
+
+    def _chip_text(self, remaining: Any) -> str:
+        """剩余天数徽章文案。"""
+        try:
+            value = int(remaining)
+        except (TypeError, ValueError):
+            return "剩余 — 天"
+        if value < 0:
+            return f"超期 {-value} 天"
+        if value == 0:
+            return "今天到期"
+        return f"剩 {value} 天"
+
+    @staticmethod
+    def _short_time(value: Any) -> str:
+        """把 2026-10-17 01:52:51 收成 2026-10-17 01:52，窄屏上不易折行。"""
+        text = str(value or "").strip()
+        return text[:16] if text else "—"
+
+    @staticmethod
+    def _host(link: str) -> str:
+        """取站点地址的主机名，用于概况卡的次要说明。"""
+        try:
+            return urlparse(str(link)).netloc or str(link)
+        except Exception:
+            return str(link)
+
+    def _days_since(self, timestamp: Any) -> Optional[int]:
+        """按自然日计算时间串距今的天数，取不到时间返回 None。"""
+        text = str(timestamp or "").strip()
+        if not text:
+            return None
+        for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+            try:
+                moment = datetime.strptime(text[:size], fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+        try:
+            today = datetime.now(tz=pytz.timezone(settings.TZ)).date()
+        except Exception:
+            today = datetime.now().date()
+        return max((today - moment.date()).days, 0)
+
+    def _deadline_text(self, record: Dict[str, Any]) -> str:
+        """按最后登录时间加保活期限推算保活截止日。"""
+        days = self._days_since(record.get("last_action"))
+        if days is None:
+            return "—"
+        try:
+            limit = int(record.get("limit_days") or self._limit_days)
+        except (TypeError, ValueError):
+            return "—"
+        return (datetime.now() + timedelta(days=limit - days)).strftime("%Y-%m-%d")
+
+    def _next_check_text(self) -> str:
+        """按执行周期推算下一次自动检查时间，未启用或表达式非法时返回占位符。"""
+        cron = str(self._cron or "").strip()
+        if not self._enabled or cron.count(" ") != 4:
+            return "—"
+        try:
+            timezone = pytz.timezone(settings.TZ)
+            next_time = CronTrigger.from_crontab(
+                cron, timezone=timezone).get_next_fire_time(None, datetime.now(tz=timezone))
+            return next_time.strftime("%Y-%m-%d %H:%M") if next_time else "—"
+        except Exception as err:
+            logger.warning(f"憨憨保活提醒：推算下次检查时间失败：{str(err)}")
+            return "—"
+
+    def _chip(self, text: str, color: str = "grey-lighten-3", variant: str = "tonal") -> dict:
+        """生成一枚小徽章；颜色走组件属性，不依赖运行期才注入的全局颜色类。"""
+        return {
+            "component": "VChip",
+            "props": {"size": "x-small", "variant": variant, "color": color,
+                      "class": "text-none"},
+            "text": text,
+        }
+
+    def _source_chip(self, record: Dict[str, Any]) -> dict:
+        """数据来源徽章：本地推算 / 站点登录记录 / 用户页最近动向。"""
+        meta = self._source_meta.get(str(record.get("source") or ""), None)
+        if not meta:
+            return self._chip("来源未知", "grey")
+        return self._chip(meta["label"], meta["color"], "tonal")
+
+    def _cell(self, label: str, value: Any, hint: str = "") -> dict:
+        """概况网格中的一格：弱化标签 + 正常取值 + 可选补充说明。"""
+        children: List[dict] = [
+            {"component": "div",
+             "props": {"class": "text-medium-emphasis", "style": self._label_style},
+             "text": label},
+            {"component": "div", "props": {"style": self._value_style},
+             "text": str(value) if str(value or "").strip() else "—"},
+        ]
+        if hint:
+            children.append({
+                "component": "div",
+                "props": {"class": "text-medium-emphasis", "style": self._hint_style},
+                "text": hint,
+            })
+        return {"component": "div", "props": {"style": self._cell_style}, "content": children}
 
     def _subtitle_node(self, text: str, link: Optional[str] = None) -> dict:
-        """副标题节点：常规字号另起一行，站点关键字加粗下划线，可带站点链接。"""
+        """生成副标题节点：常规字号另起一行，站点关键字加粗下划线，可带站点链接。"""
         children: List[dict] = []
         for index, part in enumerate(str(text).split(self._keyword)):
             if index:
@@ -822,6 +960,204 @@ class HHClubKeepAlive(_PluginBase):
             "content": children,
         }
 
+    def _notice_block(self, alert_type: str, title: str, description: str) -> dict:
+        """未启用或暂无记录时的状态卡，与主卡保持同样的排版节奏。"""
+        return {
+            "component": "VAlert",
+            "props": {"type": alert_type, "variant": "tonal", "icon": False,
+                      "class": "mb-3", "style": self._hero_style},
+            "content": [
+                {"component": "div", "props": {"style": self._notice_title_style},
+                 "text": title},
+                {"component": "div", "props": {"style": self._sub_text_style},
+                 "text": description},
+            ],
+        }
+
+    def _hero_block(self, record: Dict[str, Any], link: Optional[str]) -> dict:
+        """状态主卡：状态徽章 + 大号剩余天数 + 副标题 + 期限进度条 + 关键时间脚注。"""
+        status = self._status_meta(record.get("remaining"))
+        try:
+            limit = max(int(record.get("limit_days") or self._limit_days), 1)
+        except (TypeError, ValueError):
+            limit = 30
+        try:
+            used = min(max(int(record.get("days_since") or 0), 0), limit)
+        except (TypeError, ValueError):
+            used = 0
+        chips: List[dict] = [self._chip(status["label"], status["color"], "flat"),
+                             self._source_chip(record)]
+        content: List[dict] = [
+            {"component": "div",
+             "props": {"style": "display:flex;justify-content:center;gap:6px;flex-wrap:wrap"},
+             "content": chips},
+            {"component": "div", "props": {"style": self._hero_row_style}, "content": [
+                {"component": "span", "props": {"style": self._hero_word_style},
+                 "text": status["lead"]},
+                {"component": "span", "props": {"style": self._hero_num_style},
+                 "text": status["number"]},
+                {"component": "span", "props": {"style": self._hero_word_style}, "text": "天"},
+            ]},
+            # 临期与超期文案里的「憨憨」要能直接点回站点，地址取自站点管理
+            self._subtitle_node(status["subtitle"],
+                                 link if self._keyword in status["subtitle"] else None),
+            {"component": "VProgressLinear",
+             "props": {"model-value": round(used * 100 / limit, 1), "color": status["color"],
+                       "height": 6, "rounded": True, "class": "mt-4"}},
+            {"component": "div", "props": {"style": self._foot_style},
+             "text": (f"最后登录 {self._short_time(record.get('last_action'))}"
+                      f"（{self._days_text(record.get('days_since'))}） · "
+                      f"已用 {used}/{limit} 天 · 保活截止 {self._deadline_text(record)}")},
+        ]
+        return {
+            "component": "VAlert",
+            "props": {"type": status["color"], "variant": "tonal", "icon": False,
+                      "class": "mb-3", "style": self._hero_style},
+            "content": content,
+        }
+
+    def _overview_card(self, record: Dict[str, Any], link: Optional[str],
+                       site_name: str, site_missing: bool = False) -> dict:
+        """概况卡：登录与核实时间、检查周期、期限口径、数据来源与站点入口。"""
+        record = record or {}
+        place = " · ".join(x for x in (record.get("region"), record.get("method")) if x)
+        login_hint = self._days_text(record.get("days_since"))
+        if place:
+            login_hint = f"{login_hint} · {place}" if login_hint != "—" else place
+        verify_at = record.get("verify_at")
+        if verify_at:
+            verify_hint = "本地推算时以此为基准"
+        elif record.get("source") == "login_log":
+            verify_hint = "本次即站点核实"
+        else:
+            verify_hint = "尚未到站点核实"
+        source_meta = self._source_meta.get(str(record.get("source") or ""), {})
+        actions: List[dict] = [{
+            "component": "span",
+            "props": {"class": "text-medium-emphasis", "style": self._hint_style},
+            "text": ("平时不访问站点，只按最后登录时间本地倒计时；进入核实阈值才读一次登录记录"
+                     if self._verify_days > 0 else
+                     "已设为每次都核实：每轮都会读取站点登录记录"),
+        }]
+        if self._enabled:
+            actions.append({
+                "component": "VBtn",
+                "props": {"size": "small", "variant": "tonal", "color": "primary",
+                          "prepend-icon": "mdi-refresh", "class": "text-none"},
+                "text": "立即检查",
+                "events": {"click": {
+                    "api": f"plugin/{self.__class__.__name__}/check_now",
+                    "method": "get",
+                    "params": {},
+                }},
+            })
+        if link:
+            actions.append({
+                "component": "VBtn",
+                "props": {"size": "small", "variant": "tonal", "color": "primary",
+                          "href": link, "target": "_blank", "rel": "noopener noreferrer",
+                          "class": "text-none"},
+                "text": f"打开 {site_name or self._keyword}",
+            })
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-3"},
+            "content": [
+                {"component": "div", "props": {"class": "px-4 pt-4 pb-3",
+                                               "style": self._card_title_style},
+                 "text": "检查概况"},
+                {
+                    "component": "div",
+                    "props": {"class": "px-4", "style": self._grid_style},
+                    "content": [
+                        self._cell("最后登录", self._short_time(record.get("last_action")),
+                                   login_hint),
+                        self._cell("数据来源", source_meta.get("label", "—"),
+                                   f"上次核实 {self._short_time(verify_at)}"
+                                   if verify_at else verify_hint),
+                        self._cell("最近检查", self._short_time(record.get("checked_at"))),
+                        self._cell("下次检查", self._next_check_text(),
+                                   f"执行周期 {self._cron}"),
+                        self._cell("保活期限", f"{record.get('limit_days') or self._limit_days} 天",
+                                   f"剩余不大于 {self._warn_days} 天必发通知"),
+                        self._cell("核实阈值", f"{self._verify_days} 天",
+                                   "剩余大于该值时不访问站点" if self._verify_days > 0
+                                   else "0 = 每次都核实"),
+                        self._cell("账号", record.get("username") or "—",
+                                   f"UID {record.get('uid')}" if record.get("uid") else ""),
+                        self._cell("保活站点", site_name or "未找到站点",
+                                   self._host(link) if link else
+                                   ("站点管理里未匹配到憨憨站点" if site_missing
+                                    else "站点管理里未配置域名")),
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "px-4 pb-3",
+                              "style": "display:flex;align-items:center;"
+                                       "justify-content:space-between;gap:10px;flex-wrap:wrap"},
+                    "content": actions,
+                },
+            ],
+        }
+
+    def _history_card(self, history: List[dict]) -> dict:
+        """历史卡：每次检查一行，标题带检查时间、来源与剩余天数徽章。"""
+        shown = history[:self._page_history]
+        items: List[dict] = []
+        for index, record in enumerate(shown):
+            status = self._status_meta(record.get("remaining"))
+            title_children: List[dict] = [
+                {"component": "span", "text": self._short_time(record.get("checked_at"))},
+            ]
+            if index == 0:
+                title_children.append(self._chip("最新", "primary", "tonal"))
+            title_children.append(self._chip(self._chip_text(record.get("remaining")),
+                                             status["color"], "flat"))
+            title_children.append(self._source_chip(record))
+            # 旧格式记录可能没有 last_action，退回按「最近动向」展示
+            action = record.get("last_action")
+            main_line = (f"{record.get('field') or '最后登录'} {self._short_time(action)}"
+                         if action else "无登录时间记录")
+            place = " · ".join(x for x in (record.get("region"), record.get("method")) if x)
+            subtitle = f"{main_line} · {self._days_text(record.get('days_since'))}"
+            if place:
+                subtitle = f"{subtitle} · {place}"
+            items.append({
+                "component": "VListItem",
+                "props": {"density": "compact"},
+                "content": [
+                    {"component": "VListItemTitle",
+                     "props": {"style": self._list_title_style},
+                     "content": title_children},
+                    {"component": "VListItemSubtitle",
+                     "props": {"class": "text-break", "style": self._wrap_style},
+                     "text": subtitle},
+                ],
+            })
+            if index < len(shown) - 1:
+                items.append({"component": "VDivider", "props": {"inset": True}})
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "px-4 pt-4",
+                              "style": "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap"},
+                    "content": [
+                        {"component": "span", "props": {"style": self._card_title_style},
+                         "text": "检查历史"},
+                        {"component": "span",
+                         "props": {"class": "text-medium-emphasis", "style": self._hint_style},
+                         "text": f"显示最近 {len(shown)} 次 / 共 {len(history)} 次"},
+                    ],
+                },
+                {"component": "VList", "props": {"density": "compact", "class": "pt-1 pb-2"},
+                 "content": items},
+            ],
+        }
+
     def api_check_now(self) -> Dict[str, Any]:
         """详情页「立即检查」按钮：强制访问站点核实一次，接口立即返回。"""
         if not self._enabled:
@@ -842,105 +1178,39 @@ class HHClubKeepAlive(_PluginBase):
             logger.error(f"憨憨保活提醒：排入手动检查失败：{str(err)}")
             return {"success": False, "message": f"排入检查失败：{str(err)[:120]}", "data": None}
 
-    def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页：顶部大号剩余天数 + 关键信息 + 检查历史 + 立即检查按钮。"""
-        if not self._enabled:
-            return None
-        content: List[dict] = []
+    def get_page(self) -> List[dict]:
+        """返回插件详情页：保活状态主卡 + 检查概况 + 检查历史。"""
         history = self.get_data("check_history") or []
+        # 配置里的最近一次结果可能缺失（例如只写过历史），退回历史首条
         last = self._last_result or (history[0] if history else {})
+        site = None
+        try:
+            site = self._get_site()
+        except Exception as err:
+            logger.warning(f"憨憨保活提醒：读取站点信息失败：{str(err)}")
+        link = self._site_url(site) if site else None
+        site_name = str(getattr(site, "name", "") or "").strip() if site else ""
 
+        if not self._enabled:
+            return [self._notice_block(
+                "warning", "插件未启用",
+                f"在插件配置里打开「启用插件」后，会按执行周期 {self._cron} 检查"
+                f"{site_name or self._keyword}的登录状态并在临期时提醒。"
+            )]
+        blocks: List[dict] = []
         if last:
-            alert_type, big_text, subtitle = self._remaining_alert(last.get("remaining"))
-            alert: Dict[str, Any] = {
-                "component": "VAlert",
-                "props": {"type": alert_type, "variant": "tonal", "style": self._big_text_style},
-                "text": big_text,
-            }
-            if subtitle:
-                link = self._site_url() if self._keyword in subtitle else None
-                alert["content"] = [self._subtitle_node(subtitle, link)]
-            content.append(alert)
-
-            place = " · ".join(x for x in (last.get("region"), last.get("method")) if x)
-            source = last.get("source")
-            source_text = {
-                "local": "本地推算",
-                "login_log": "站点登录记录",
-                "recent_action": "用户页最近动向",
-            }.get(source, "—")
-            content.append({
-                "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal", "class": "text-subtitle-2 mt-2"},
-                "text": (f"账号 {last.get('username') or '—'}（UID {last.get('uid') or '—'}） · "
-                         f"{last.get('field') or '最后登录'} {last.get('last_action') or '—'}"
-                         f"（{self._days_text(last.get('days_since'))}）"
-                         + (f" · {place}" if place else "")
-                         + f" · 期限 {last.get('limit_days') or self._limit_days} 天"),
-            })
-            content.append({
-                "component": "VAlert",
-                "props": {"type": "success", "variant": "tonal", "class": "text-subtitle-2 mt-2"},
-                "text": (f"数据来源：{source_text}"
-                         + (f"，上次到站点核实于 {last.get('verify_at')}"
-                            if last.get("verify_at") else "")
-                         + ("；本次只做本地推算，未访问站点。" if source == "local" else "")),
-            })
-            if source == "recent_action":
-                content.append({
-                    "component": "VAlert",
-                    "props": {"type": "warning", "variant": "tonal",
-                              "class": "text-subtitle-2 mt-2"},
-                    "text": "站点登录记录为空，本次按用户页「最近动向」估算；该时间会被页面访问刷新，"
-                            "请以自己手动登录的时间为准。",
-                })
+            blocks.append(self._hero_block(last, link))
         else:
-            content.append({
-                "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal", "class": "text-subtitle-2"},
-                "text": "暂无检查记录。启用插件后，可在下方点「立即检查」或等待执行周期。",
-            })
-
-        content.append({
-            "component": "VRow",
-            "props": {"class": "ma-0 mt-2"},
-            "content": [{
-                "component": "VCol",
-                "props": {"cols": 12, "class": "pa-0"},
-                "content": [{
-                    "component": "VBtn",
-                    "props": {"color": "primary", "variant": "tonal",
-                              "prepend-icon": "mdi-refresh", "size": "small"},
-                    "text": "立即检查",
-                    "events": {"click": {
-                        "api": f"plugin/{self.__class__.__name__}/check_now",
-                        "method": "get",
-                        "params": {},
-                    }},
-                }],
-            }],
-        })
-
+            blocks.append(self._notice_block(
+                "info", "暂无检查记录",
+                "首次运行会到站点读一次登录记录作为基准；之后平时只做本地倒计时，"
+                "进入核实阈值再回站点确认。"
+            ))
+        blocks.append(self._overview_card(last, link, site_name, site_missing=site is None))
         if history:
-            content.append({"component": "VDivider", "props": {"class": "my-2"}})
-            content.append({
-                "component": "VListItem",
-                "props": {"class": "text-subtitle-2 font-weight-bold"},
-                "text": f"检查历史（最近 {min(len(history), 10)} 次）",
-            })
-            for index, record in enumerate(history[:10]):
-                content.append({
-                    "component": "VListItem",
-                    "props": {"dense": True, "class": "text-break",
-                              "style": "white-space:pre-line"},
-                    "text": (f"{'【最新】' if index == 0 else ''}"
-                             f"{record.get('checked_at') or '—'} 检查：\n"
-                             f"{record.get('field') or '最近动向'} "
-                             f"{record.get('last_action') or '—'}，"
-                             f"{self._days_text(record.get('days_since'))}，"
-                             f"剩 {record.get('remaining', '—')} 天"),
-                })
-        return content
+            blocks.append(self._history_card(history))
+        # 弹窗标题已显示插件名，页面内不再重复包一层带标题的卡片
+        return blocks
 
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
