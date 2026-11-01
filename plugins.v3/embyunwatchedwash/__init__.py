@@ -49,7 +49,7 @@ class EmbyUnwatchedWash(_PluginBase):
                  "v1.49 增加 Emby/Jellyfin Webhook 即时触发（播放结束/标记已看后延迟去抖同步）。" \
                  "并保留旧版清理与资源出库回收。"
     # 插件版本
-    plugin_version = "1.49"
+    plugin_version = "1.50"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -109,6 +109,12 @@ class EmbyUnwatchedWash(_PluginBase):
     _webhook_delay: int = 20
     # 去抖调度器：独立于 only_once 的一次性调度器，避免互相干扰
     _wh_scheduler: Optional[BackgroundScheduler] = None
+    # ------------------------------------------------------------------
+    # 排除媒体库（v1.50）：这些库里的影视不参与任何洗版动作，
+    # Emby/Jellyfin Webhook 命中这些库时也不触发同步（如「儿童」动画库）。
+    # 配置填媒体库名或路径，逗号/换行分隔。
+    # ------------------------------------------------------------------
+    _exclude_libraries: List[str] = []
 
     def init_plugin(self, config: dict = None):
         self.subscribechain = SubscribeChain()
@@ -146,6 +152,9 @@ class EmbyUnwatchedWash(_PluginBase):
                 self._webhook_delay = max(0, int(config.get("webhook_delay") or 20))
             except (TypeError, ValueError):
                 self._webhook_delay = 20
+            # 排除媒体库（v1.50）：命中的影视不洗版，Webhook 也不触发同步
+            self._exclude_libraries = self._normalize_str_list(
+                config.get("exclude_libraries"))
 
         if self._only_once:
             self._only_once = False
@@ -164,6 +173,7 @@ class EmbyUnwatchedWash(_PluginBase):
                 "tv_full_sweep": self._tv_full_sweep,
                 "webhook_trigger": self._webhook_trigger,
                 "webhook_delay": self._webhook_delay,
+                "exclude_libraries": ",".join(self._exclude_libraries or []),
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(self.sync, 'date',
@@ -388,6 +398,11 @@ class EmbyUnwatchedWash(_PluginBase):
                             placeholder='默认 20',
                             hint='短时间内的多次 Webhook 合并为一次同步；0 表示立即执行',
                             **{'persistent-hint': True}),
+                    control('VTextField', 'exclude_libraries', '排除媒体库（不洗版 / 不触发）', md=12,
+                            placeholder='如：儿童 或 /媒体库/儿童（多个用逗号分隔）',
+                            hint='填媒体库名称或路径。命中这些库的影视不参与观看联动、旧版清理与电影洗版扫描；'
+                                 'Emby Webhook 命中这些库时也不触发同步（适合儿童动画等无需洗版的库）',
+                            **{'persistent-hint': True}),
 
                     # ---------- 4. 试运行与手动触发 ----------
                     section('试运行与手动触发'),
@@ -414,6 +429,7 @@ class EmbyUnwatchedWash(_PluginBase):
             "dry_run": False,
             "webhook_trigger": True,
             "webhook_delay": 20,
+            "exclude_libraries": "儿童",
         }
 
     # ------------------------------------------------------------------
@@ -595,7 +611,7 @@ class EmbyUnwatchedWash(_PluginBase):
         for _ in range(100):  # 上限 5 万，防死循环
             data = self._emby_get(inst, "/Items", {
                 "Recursive": "true", "IncludeItemTypes": "Movie",
-                "Fields": "ProviderIds,MediaSources,ProductionYear",
+                "Fields": "ProviderIds,MediaSources,ProductionYear,Path",
                 "StartIndex": start, "Limit": limit,
             })
             if not data:
@@ -679,6 +695,8 @@ class EmbyUnwatchedWash(_PluginBase):
         for stype, sname, inst in servers:
             for m in self._list_library_movies(inst):
                 tmdb = m["tmdb_id"]
+                if self._is_excluded((m.get("item") or {}).get("Path")):
+                    continue
                 if tmdb in bv_ids:
                     continue
                 h = self._quality_key(m["item"])[0]
@@ -813,6 +831,18 @@ class EmbyUnwatchedWash(_PluginBase):
             item_type = str(g("item_type") or "").strip().upper()
             if item_type and item_type not in ("TV", "MOV"):
                 return
+            # 排除媒体库：命中直接忽略，连同步都不触发（如「儿童」库的动画）
+            if self._exclude_libraries:
+                _p = g("item_path")
+                if not _p and g("item_id"):
+                    for _st, _sn, _inst in self._watched_targets():
+                        _p = self._item_path_by_id(_inst, g("item_id"))
+                        if _p:
+                            break
+                if _p and self._is_excluded(_p):
+                    logger.info(f"【未看洗版】忽略 Webhook：{g('item_name') or raw_event} "
+                                f"位于排除媒体库（{_p}）")
+                    return
             self._schedule_sync("Webhook[%s] %s 用户 %s" % (
                 channel or server_name, g("item_name") or raw_event,
                 g("user_name") or "?"))
@@ -997,6 +1027,77 @@ class EmbyUnwatchedWash(_PluginBase):
             logger.warning(f"【未看洗版】配置的观看状态核对服务器未连接/不存在，已跳过："
                            f"{'、'.join(missing)}")
         return picked
+
+    # ------------------------------------------------------------------
+    # 排除媒体库（v1.50）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _in_excluded_library(path: Any, tokens: List[str]) -> bool:
+        """
+        判断条目路径是否落在被排除的媒体库里。
+
+        统一按「路径段」匹配：填「儿童」或「/媒体库/儿童」都能命中
+        `/媒体库/儿童/超级宝贝JOJO (2019)/Season 2/xxx.mkv`；
+        用路径段而不是子串匹配，避免「儿童片」这类目录名被误伤。
+        """
+        raw = str(path or "").replace("\\", "/").strip()
+        if not raw or not tokens:
+            return False
+        seg = "/" + raw.strip("/") + "/"
+        for t in tokens:
+            tok = str(t or "").replace("\\", "/").strip().strip("/")
+            if tok and ("/" + tok + "/") in seg:
+                return True
+        return False
+
+    def _is_excluded(self, path: Any) -> bool:
+        """按当前配置判断路径是否属于排除媒体库。"""
+        return self._in_excluded_library(path, self._exclude_libraries)
+
+    @staticmethod
+    def _item_path_by_id(inst, item_id: Any) -> Optional[str]:
+        """按条目 ID 取文件路径（Webhook 未携带 Path 时的兜底查询）。"""
+        sid = str(item_id or "").strip()
+        if not sid:
+            return None
+        info = EmbyUnwatchedWash._server_http_base(inst)
+        if not info:
+            return None
+        base, apikey = info
+        import requests as _rq
+        for url in (f"{base}/Items/{sid}", f"{base[:-5]}/Items/{sid}"):
+            try:
+                r = _rq.get(url, params={"api_key": apikey, "Fields": "Path"}, timeout=10)
+                if r.status_code == 200:
+                    return (r.json() or {}).get("Path")
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _media_item_by_tmdb(inst, tmdb_id: int, item_type: str) -> Optional[dict]:
+        """按 tmdbid 精确取单个条目（含 Path），用于排除媒体库判断。"""
+        info = EmbyUnwatchedWash._server_http_base(inst)
+        if not info:
+            return None
+        base, apikey = info
+        import requests as _rq
+        for url in (f"{base}/Items", f"{base[:-5]}/Items"):
+            try:
+                r = _rq.get(url, params={
+                    "api_key": apikey,
+                    "Recursive": "true",
+                    "IncludeItemTypes": item_type,
+                    "AnyProviderIdEquals": f"Tmdb.{tmdb_id}",
+                    "Fields": "Path",
+                }, timeout=15)
+                if r.status_code != 200:
+                    continue
+                items = (r.json() or {}).get("Items") or []
+                return items[0] if items else None
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _episodes_of_series(inst, series_id: str, user_id: str) -> Optional[Dict[int, Dict[int, bool]]]:
@@ -1539,6 +1640,9 @@ class EmbyUnwatchedWash(_PluginBase):
                 if not series_id:
                     logger.info(f"【未看洗版】[{srv_name}] 未找到剧集条目（可能尚未入库），跳过删除：{task.get('title')}")
                     continue
+                if self._is_excluded(self._item_path_by_id(inst, series_id)):
+                    logger.info(f"【未看洗版】[{srv_name}] {task.get('title')}：位于排除媒体库，跳过删除")
+                    continue
                 season = task.get("season")
                 episode = task.get("start_episode")
                 if episode is not None and season is not None:
@@ -1561,6 +1665,10 @@ class EmbyUnwatchedWash(_PluginBase):
                 else:
                     logger.info(f"【未看洗版】[{srv_name}] 删除任务缺季/集信息且未开启逐集核对，跳过：{task.get('title')}")
             else:
+                _mi = self._media_item_by_tmdb(inst, tmdb, "Movie")
+                if _mi and self._is_excluded(_mi.get("Path")):
+                    logger.info(f"【未看洗版】[{srv_name}] {task.get('title')}：位于排除媒体库，跳过删除")
+                    continue
                 versions = self._movie_versions(inst, tmdb)
                 if versions is None:
                     raise RuntimeError(f"[{srv_name}] 查询版本条目失败")
@@ -1713,6 +1821,9 @@ class EmbyUnwatchedWash(_PluginBase):
             return
         season = getattr(sub, "season", None)
         series_id = self._series_id_of(inst, tmdb_id, name=name, year=year)
+        if series_id and self._is_excluded(self._item_path_by_id(inst, series_id)):
+            logger.info(f"【未看洗版】{name}：位于排除媒体库，跳过观看联动")
+            return
         if not series_id:
             # 媒体库找不到该剧集：可能是未入库 / 已出库 / 标题对不上。
             # 开启「资源出库回收」时，精确核对是否真的已从库里移除，是则取消本插件存量订阅。
@@ -1853,6 +1964,10 @@ class EmbyUnwatchedWash(_PluginBase):
         except (TypeError, ValueError):
             tmdb_id = None
         if not tmdb_id:
+            return
+        _mitem = self._media_item_by_tmdb(inst, tmdb_id, "Movie")
+        if _mitem and self._is_excluded(_mitem.get("Path")):
+            logger.info(f"【未看洗版】{name}：位于排除媒体库，跳过电影洗版联动")
             return
         played = self._movie_played(inst, tmdb_id, user_id)
         if played is None:
@@ -2088,6 +2203,9 @@ class EmbyUnwatchedWash(_PluginBase):
                         if not series_id:
                             logger.info(f"【未看洗版】[{srv_name}] {name}：未入库，跳过旧版核对")
                             continue
+                        if self._is_excluded(self._item_path_by_id(inst, series_id)):
+                            logger.info(f"【未看洗版】[{srv_name}] {name}：位于排除媒体库，跳过旧版核对")
+                            continue
                         if not self._tv_full_sweep:
                             # 未开逐集核对：仅核对订阅开始集那一集（保守模式）
                             if season is None:
@@ -2115,6 +2233,10 @@ class EmbyUnwatchedWash(_PluginBase):
                                                              f"S{s}E{ep}", ep_versions[s][ep],
                                                              quiet_single=True)
                     else:
+                        _mi = self._media_item_by_tmdb(inst, tmdb_id, "Movie")
+                        if _mi and self._is_excluded(_mi.get("Path")):
+                            logger.info(f"【未看洗版】[{srv_name}] {name}：位于排除媒体库，跳过旧版核对")
+                            continue
                         versions = self._movie_versions(inst, tmdb_id)
                         if versions is None:
                             results["failed"] = results.get("failed", 0) + 1
