@@ -19,9 +19,9 @@
   },
   "EmbyUnwatchedWash": {
     "name": "Emby未看洗版",
-    "description": "根据观看记录自动后移 MP 逐集洗版订阅的开始集数（已看集不再洗），并每轮核对媒体库多版本、即时清理被洗版的低画质旧条目（只删软链）。订阅创建交给 MP 原生。",
+    "description": "根据观看记录自动后移 MP 逐集洗版订阅的开始集数（已看集不再洗），支持 Emby/Jellyfin Webhook 在播放结束或标记已看后即时触发同步，并每轮核对媒体库多版本、即时清理被洗版的低画质旧条目（只删软链）。订阅创建交给 MP 原生。",
     "labels": "媒体库",
-    "version": "1.46",
+    "version": "1.49",
     "icon": "icon.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -30,6 +30,9 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.49": "新增 Emby/Jellyfin Webhook 即时触发：监听 MoviePilot 的 WebhookMessage 事件，只认「播放停止」「标记为已播放」「标记为未播放」三类观看状态变更（播放开始/暂停/心跳一律忽略，避免刷爆），按「去抖延迟」（默认 20 秒，0 = 立即）合并同一窗口内的多次事件后只跑一次同步，不必等整点 cron；事件本身不改任何数据，实际动作仍由观看联动按媒体服务器事实决定，所以重复投递无副作用。新增配置项「接收 Webhook 触发同步」（默认开）与「去抖延迟（秒）」，设置页新增「Webhook 即时触发」分区。同时修复 /emby_wash 远程命令长期不生效——命令经 Command.send_plugin_event 派发时 event_data 只有命令自身声明的 data（外加 channel/source/user），并没有 cmd 字段，导致监听端 `event_data.get(\"cmd\") == \"/emby_wash\"` 永远匹配不上；现改为 get_command 显式声明 data={\"action\": \"/emby_wash\"}，监听端同时兼容读取 action 与 cmd，并统一走带锁的 _schedule_sync 调度",
+      "v1.48": "剧集部分只同步订阅字段：不再自己搜种、下载、比画质、删旧版，只把 Emby 观看事实写回 MP 的 best_version=1 订阅（开始集数 / 总集数 / 已看集优先级），搜索下载与画质比较全部交回官方洗版路径；电影洗版保持按目标画质建订阅。附带修复仅 manual_total_episode 变更时刷出空日志的问题",
+      "v1.47": "修复 MP v3.1.7 上电影洗版订阅创建失败",
       "v1.46": "电影洗版 + 剧集未看洗版双子系统重构",
       "v1.44": "放开代删 + 剧集洗满护栏：① 取消订阅权限从「仅 username=未看洗版 存量自建」放开到「不限账户」——电影已观看、剧集追平且洗版完成，用户自建订阅也自动取消（仍保留 Dry-run 预览、状态未知绝不误删的安全底线）；② 剧集追平分支新增「洗版完成」护栏：已入库集数需覆盖订阅 total_episode，否则视为连载/未下完，不取消只提示（避免误删追更订阅）。依据：电影 MP 洗满会自取消、剧集 MP 永不自动取消，故「洗版完成+已看」即订阅无价值。单测 57 条全绿",
       "v1.43": "补回电影观看联动：观看联动主流程不再把电影踢出，新增 _reconcile_one_movie_subscription——电影（best_version=1 订阅）在 Emby 上已观看则取消其洗版订阅（复用 _movie_played 按 Tmdb 精确定位）。权限边界与剧集一致：仅 username=未看洗版 的存量自建订阅自动取消，用户自建电影只提示绝不代删；观看状态未知一律跳过不误删；Dry-run 只打印。运行日志改为「核对剧集订阅 N 部、电影洗版订阅 M 部」",

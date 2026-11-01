@@ -46,9 +46,10 @@ class EmbyUnwatchedWash(_PluginBase):
     plugin_desc = "v1.48 精简重构：剧集部分只把 Emby 观看事实写回 MP 订阅（开始集数 / 总集数 / 已看集优先级），" \
                  "搜索下载、画质比较、旧版去重全部交给 MoviePilot 官方路径，插件不再自己搜种下载；" \
                  "电影部分仍按目标画质自动建 best_version=1 洗版订阅（MP 原生洗版）。" \
+                 "v1.49 增加 Emby/Jellyfin Webhook 即时触发（播放结束/标记已看后延迟去抖同步）。" \
                  "并保留旧版清理与资源出库回收。"
     # 插件版本
-    plugin_version = "1.48"
+    plugin_version = "1.49"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -97,6 +98,17 @@ class EmbyUnwatchedWash(_PluginBase):
     # 洗版目标画质（分辨率），如 1080P / 4K / Remux；低于该画质才触发洗版。
     _wash_resolution: str = "1080P"
     _wash_resolution_height: int = 1080
+    # ------------------------------------------------------------------
+    # Webhook 即时触发（v1.49 新增，默认开启）
+    # ------------------------------------------------------------------
+    #   Emby / Jellyfin 的「播放停止」「标记已看」「标记未看」事件推过来后，
+    #   延迟去抖触发一次 sync，不必等整点 cron；事件本身不改任何数据，
+    #   实际动作仍由 sync 里的观看联动按 Emby 事实决定，所以重复投递无副作用。
+    _webhook_trigger: bool = True
+    # 去抖延迟（秒）：一段时间内的多次事件合并成一次同步；0 表示立即执行
+    _webhook_delay: int = 20
+    # 去抖调度器：独立于 only_once 的一次性调度器，避免互相干扰
+    _wh_scheduler: Optional[BackgroundScheduler] = None
 
     def init_plugin(self, config: dict = None):
         self.subscribechain = SubscribeChain()
@@ -128,6 +140,12 @@ class EmbyUnwatchedWash(_PluginBase):
                 self._delete_delay_minutes = 10
             # 剧集逐集核对（v1.42 新增）：默认开启，追更期旧版软料即时清理
             self._tv_full_sweep = bool(config.get("tv_full_sweep", True))
+            # Webhook 即时触发（v1.49）
+            self._webhook_trigger = bool(config.get("webhook_trigger", True))
+            try:
+                self._webhook_delay = max(0, int(config.get("webhook_delay") or 20))
+            except (TypeError, ValueError):
+                self._webhook_delay = 20
 
         if self._only_once:
             self._only_once = False
@@ -144,6 +162,8 @@ class EmbyUnwatchedWash(_PluginBase):
                 "delete_washed_old": self._delete_washed_old,
                 "delete_delay_minutes": self._delete_delay_minutes,
                 "tv_full_sweep": self._tv_full_sweep,
+                "webhook_trigger": self._webhook_trigger,
+                "webhook_delay": self._webhook_delay,
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(self.sync, 'date',
@@ -164,7 +184,10 @@ class EmbyUnwatchedWash(_PluginBase):
             "cmd": "/emby_wash",
             "event": EventType.PluginAction,
             "desc": "立即执行未看洗版",
-            "category": "未看洗版"
+            "category": "未看洗版",
+            # 事件型命令由 Command.send_plugin_event 派发，event_data 里只有这里声明的
+            # data（外加 channel/source/user），**没有 cmd**，所以必须显式带 action。
+            "data": {"action": "/emby_wash"}
         }]
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -355,6 +378,17 @@ class EmbyUnwatchedWash(_PluginBase):
                             hint='低于该分辨率的电影才会触发洗版；库内多为 1080P 想冲 4K 则选 4K',
                             **{'persistent-hint': True}),
 
+                    # ---------- 3.5 Webhook 即时触发 ----------
+                    section('Webhook 即时触发（播放结束 / 标记已看）'),
+                    control('VSwitch', 'webhook_trigger', '接收 Webhook 触发同步', md=6,
+                            hint='在 Emby「设置 → Webhook」新增 Webhook，URL 填 http://<MoviePilot地址>/api/v1/webhook/?token=<API_TOKEN>&source=<媒体服务器名>，'
+                                 '请求方式 POST；事件勾选「播放停止」「标记为已播放」「标记为未播放」。收到后延迟去抖触发一次同步，不必等整点 cron',
+                            **{'persistent-hint': True}),
+                    control('VTextField', 'webhook_delay', '去抖延迟（秒）', md=6,
+                            placeholder='默认 20',
+                            hint='短时间内的多次 Webhook 合并为一次同步；0 表示立即执行',
+                            **{'persistent-hint': True}),
+
                     # ---------- 4. 试运行与手动触发 ----------
                     section('试运行与手动触发'),
                     control('VSwitch', 'dry_run', 'Dry-run 预览模式', md=6,
@@ -378,6 +412,8 @@ class EmbyUnwatchedWash(_PluginBase):
             "tv_full_sweep": True,
             "delete_delay_minutes": 10,
             "dry_run": False,
+            "webhook_trigger": True,
+            "webhook_delay": 20,
         }
 
     # ------------------------------------------------------------------
@@ -703,6 +739,14 @@ class EmbyUnwatchedWash(_PluginBase):
         退出插件
         """
         try:
+            if self._wh_scheduler:
+                self._wh_scheduler.remove_all_jobs()
+                if self._wh_scheduler.running:
+                    self._wh_scheduler.shutdown()
+                self._wh_scheduler = None
+        except Exception as e:
+            logger.error("退出 Webhook 调度器失败：%s" % str(e))
+        try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
@@ -716,8 +760,94 @@ class EmbyUnwatchedWash(_PluginBase):
         """
         响应远程命令 /emby_wash，立即执行一次扫描
         """
-        if event.event_data and event.event_data.get("cmd") == "/emby_wash":
-            self.sync()
+        if not self._enabled:
+            return
+        ed = getattr(event, "event_data", None) or {}
+        if not isinstance(ed, dict):
+            ed = {}
+        # 兼容两种写法：新命令带 action（推荐），旧命令可能只有 cmd
+        action = ed.get("action") or ed.get("cmd")
+        if action == "/emby_wash":
+            self._schedule_sync("手动命令 %s" % action, delay=0)
+
+    # ------------------------------------------------------------------
+    # Webhook 即时触发（v1.49）
+    # ------------------------------------------------------------------
+    # Emby/Jellyfin 各版本事件名大小写与点分写法不一致，统一转小写后比对。
+    # 只关心「会改变观看状态」的三类事件；播放开始/暂停/心跳一律忽略，避免刷爆。
+    _WEBHOOK_WATCH_EVENTS = {
+        "playback.stop", "playbackstop", "media.stop",
+        "item.markplayed", "markplayed",
+        "item.markunplayed", "markunplayed",
+    }
+
+    @eventmanager.register(EventType.WebhookMessage)
+    def emby_webhook_handler(self, event):
+        """
+        接收媒体服务器 Webhook（Emby / Jellyfin）：播放结束、标记已看/未看后
+        触发一次去抖同步，让订阅开始集数不必等整点定时。
+
+        event_data 是 WebhookEventInfo 对象（不是 dict），字段用 getattr 取。
+        """
+        try:
+            if not self._enabled or not self._webhook_trigger:
+                return
+            ed = getattr(event, "event_data", None)
+
+            def g(name, default=None):
+                if isinstance(ed, dict):
+                    return ed.get(name, default)
+                return getattr(ed, name, default)
+
+            channel = str(g("channel") or "").strip().lower()
+            server_name = str(g("server_name") or "").strip()
+            if channel:
+                if channel not in ("emby", "jellyfin"):
+                    return
+            elif not server_name:
+                return
+            raw_event = str(g("event") or "").strip().lower()
+            if raw_event not in self._WEBHOOK_WATCH_EVENTS:
+                logger.debug(f"【未看洗版】忽略 Webhook 事件：{raw_event}")
+                return
+            item_type = str(g("item_type") or "").strip().upper()
+            if item_type and item_type not in ("TV", "MOV"):
+                return
+            self._schedule_sync("Webhook[%s] %s 用户 %s" % (
+                channel or server_name, g("item_name") or raw_event,
+                g("user_name") or "?"))
+        except Exception as e:
+            logger.error(f"【未看洗版】处理 Webhook 事件异常：{e}\n{traceback.format_exc()}")
+
+    def _schedule_sync(self, reason: str, delay: Optional[int] = None) -> None:
+        """
+        延迟去抖触发一次 sync。
+
+        固定 job id + replace_existing：短时间内的多次触发只保留最后一次，
+        合并成一轮同步；sync 自身还有任务锁兜底，不会并发跑。
+        """
+        wait = self._webhook_delay if delay is None else delay
+        try:
+            wait = max(0, int(wait or 0))
+        except (TypeError, ValueError):
+            wait = 20
+        try:
+            if not self._wh_scheduler or not self._wh_scheduler.running:
+                self._wh_scheduler = BackgroundScheduler(timezone=settings.TZ)
+                self._wh_scheduler.start()
+            self._wh_scheduler.add_job(
+                self.sync, 'date',
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=wait),
+                id="embyunwatchedwash_trigger", replace_existing=True,
+                name="未看洗版触发同步")
+            logger.info(f"【未看洗版】触发来源：{reason}，{wait} 秒后执行一次同步"
+                        + ("（Dry-run 预览）" if self._dry_run else ""))
+        except Exception as e:
+            logger.error(f"【未看洗版】安排同步任务失败，改为直接执行：{e}")
+            try:
+                self.sync()
+            except Exception as e2:
+                logger.error(f"【未看洗版】直接执行同步失败：{e2}\n{traceback.format_exc()}")
 
     def sync(self):
         """
