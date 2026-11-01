@@ -1065,11 +1065,16 @@ class EmbyUnwatchedWash(_PluginBase):
             return None
         base, apikey = info
         import requests as _rq
-        for url in (f"{base}/Items/{sid}", f"{base[:-5]}/Items/{sid}"):
+        # Emby/Jellyfin 的 /Items/{id} 单条目端点在本机实测为 404，
+        # 只有列表端点 /Items?Ids=<id> 稳定返回 Path，故统一走列表查询。
+        for url in (f"{base}/Items", f"{base[:-5]}/Items"):
             try:
-                r = _rq.get(url, params={"api_key": apikey, "Fields": "Path"}, timeout=10)
+                r = _rq.get(url, params={
+                    "api_key": apikey, "Ids": sid, "Fields": "Path"}, timeout=10)
                 if r.status_code == 200:
-                    return (r.json() or {}).get("Path")
+                    items = (r.json() or {}).get("Items") or []
+                    if items:
+                        return items[0].get("Path")
             except Exception:
                 continue
         return None
