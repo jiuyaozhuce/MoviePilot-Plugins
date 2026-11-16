@@ -35,7 +35,7 @@
 import datetime
 import threading
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import pytz
@@ -59,6 +59,11 @@ SUPPORTED_SERVER_TYPES = ("emby", "jellyfin")
 MODE_PERCENTAGE = "percentage"
 MODE_ANY_PLAY = "any_play"
 MODE_PLAYED = "played"
+
+# 详情页「播放进度」列最多逐个列出的未看完集数，其余只给总数（避免剧集多时把表格撑长）
+WATCHED_DETAIL_LIMIT = 3
+# 详情页「播放进度」列的文本长度上限，超出后只保留区间概览，保证单元格不会被撑到需要横向滚动
+WATCHED_TEXT_MAX = 60
 
 # 读取播放进度失败的原因（写进日志与详情页，避免静默跳过）
 PLAYBACK_STATUS_TEXT = {
@@ -94,7 +99,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.3.2"
+    plugin_version = "3.3.3"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -305,7 +310,8 @@ class PlaybackBestVersion(_PluginBase):
                                     "props": {
                                         "density": "compact",
                                         "hover": True,
-                                        "class": "text-no-wrap",
+                                        # 不加 text-no-wrap：'播放进度'列内容偏长时宁可换行，也不要撑出横向滚动
+                                        "style": "width: 100%;",
                                     },
                                     "content": [
                                         {
@@ -1211,28 +1217,103 @@ class PlaybackBestVersion(_PluginBase):
         return title
 
     def _describe_watched(self, playback: Dict[str, Any]) -> str:
-        """把读取到的进度整理成一行文字。"""
+        """把读取到的进度整理成一行文字。
+
+        集号会合并成区间（如 E1-33），否则剧集一多这一列就会很长、把表格顶得需要横向滚动。
+        """
         movie = playback.get("movie")
         if movie is not None:
-            flag = "已看" if movie.get("played") else "未看完"
-            return f"{flag} {movie.get('percentage')}%"
+            percentage = float(movie.get("percentage") or 0)
+            if self._hit(movie):
+                return "已看"
+            # 有进度但还没到阈值：说「看到 X%」而不是「未看完 X%」，避免和「已看」混淆
+            return f"看到 {percentage:.0f}%" if percentage > 0 else "未看"
+
         episodes = playback.get("episodes") or {}
         if not episodes:
             return "无播放记录"
-        parts = []
+
+        watched: List[int] = []
+        unfinished: List[Tuple[int, float]] = []
         for episode in sorted(episodes):
-            progress = episodes[episode]
-            parts.append(f"E{episode}({progress.get('percentage')}%)")
-        return " ".join(parts)
+            progress = episodes[episode] or {}
+            number = self._as_int(episode, 0)
+            if self._hit(progress):
+                watched.append(number)
+            else:
+                unfinished.append((number, float(progress.get("percentage") or 0)))
+
+        total = len(watched) + len(unfinished)
+        parts: List[str] = []
+        if watched:
+            if len(watched) == total:
+                parts.append(f"已看全部 {total} 集")
+            else:
+                parts.append(f"已看 {len(watched)}/{total} 集（{self._episode_ranges(watched)}）")
+        if unfinished:
+            parts.append(self._describe_unfinished(unfinished))
+
+        text = "；".join(part for part in parts if part)
+        if len(text) > WATCHED_TEXT_MAX and watched:
+            # 兜底：仍然过长时只保留区间概览，不逐集列百分比
+            text = f"已看 {len(watched)}/{total} 集（{self._episode_ranges(watched)}）；其余 {len(unfinished)} 集未看完"
+        return text or "无播放记录"
 
     @staticmethod
-    def _describe_changed(changed) -> str:
-        """把写入的跳过标记整理成文字。"""
+    def _describe_unfinished(unfinished: List[Tuple[int, float]]) -> str:
+        """还没到看过线的集：百分比一致时合并，否则只列前几集，其余给总数。"""
+        if all(percentage <= 0 for _, percentage in unfinished):
+            # 一点进度都没有的集，直接说「未看」，别和「看了一半」混在一起
+            return f"未看 {len(unfinished)} 集"
+        percentages = {round(percentage) for _, percentage in unfinished}
+        if len(percentages) == 1:
+            return f"{len(unfinished)} 集看到 {percentages.pop()}%"
+        shown = unfinished[:WATCHED_DETAIL_LIMIT]
+        detail = "、".join(
+            f"E{number} 未看" if percentage <= 0 else f"E{number} {percentage:.0f}%"
+            for number, percentage in shown
+        )
+        if len(unfinished) > len(shown):
+            detail += f" 等 {len(unfinished)} 集"
+        return f"未看完 {detail}"
+
+    @staticmethod
+    def _episode_ranges(episodes: List[int]) -> str:
+        """把集号压缩成区间文本：1,2,3,5,7,8 -> "1-3、5、7-8"。"""
+        values = sorted({int(value) for value in episodes})
+        if not values:
+            return ""
+        parts: List[str] = []
+        start = prev = values[0]
+        for value in values[1:]:
+            if value == prev + 1:
+                prev = value
+                continue
+            parts.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = value
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        return "、".join(parts)
+
+    @classmethod
+    def _describe_changed(cls, changed) -> str:
+        """把写入的跳过标记整理成文字（集号同样合并成区间）。"""
         if not changed:
             return ""
         if changed == ["整部"]:
             return "整部"
-        return "、".join(f"E{episode}" for episode in changed)
+        numbers: List[int] = []
+        others: List[str] = []
+        for item in changed:
+            number = cls._as_int(item, 0)
+            if number > 0:
+                numbers.append(number)
+            else:
+                others.append(str(item))
+        parts: List[str] = []
+        if numbers:
+            parts.append(f"E{cls._episode_ranges(numbers)}")
+        parts.extend(others)
+        return "、".join(parts)
 
     def _page_summary(self, last: Dict[str, Any]) -> str:
         """详情页顶部摘要。"""
