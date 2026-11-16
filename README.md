@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| 播放进度洗版 (PlaybackBestVersion) | 3.3.3 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版，支持 Webhook 即时触发 |
+| 播放进度洗版 (PlaybackBestVersion) | 3.3.4 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版，支持 Webhook 即时触发 |
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
 | 豆瓣书影音档案 (DouBanWatching) | 1.9.20 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
@@ -53,7 +53,7 @@ MoviePilot → 设置 → 插件 → 插件仓库 → 新增：
 ## 来源与许可
 
 - 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
-- 本仓库由 `jiuyaozhuce` 接管维护，在 v3.2.0 基础上增加 Webhook 即时触发（v3.3.0）；插件作者与项目地址已改指本仓库（v3.3.1 仅为了让已安装的实例刷新该作者信息而升版本，功能不变）；v3.3.2 修复了详情页表格只显示分页、不显示条目的问题；v3.3.3 把「播放进度」列改成区间压缩显示（E1-33 这种），剧集多时不再把表格撑出横向滚动
+- 本仓库由 `jiuyaozhuce` 接管维护，在 v3.2.0 基础上增加 Webhook 即时触发（v3.3.0）；插件作者与项目地址已改指本仓库（v3.3.1 仅为了让已安装的实例刷新该作者信息而升版本，功能不变）；v3.3.2 修复了详情页表格只显示分页、不显示条目的问题；v3.3.3 把「播放进度」列改成区间压缩显示（E1-33 这种），剧集多时不再把表格撑出横向滚动；v3.3.4 在详情页加了逐集状态方块条（一格一集，四色区分未下载/已下载/已洗版/已观看），并把表格精简到 4 列
 - 许可证 **GPL-3.0**，副本见 [plugins.v3/playbackbestversion/LICENSE](plugins.v3/playbackbestversion/LICENSE)
 
 ---

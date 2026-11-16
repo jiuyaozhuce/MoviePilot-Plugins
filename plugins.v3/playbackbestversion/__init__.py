@@ -65,6 +65,23 @@ WATCHED_DETAIL_LIMIT = 3
 # 详情页「播放进度」列的文本长度上限，超出后只保留区间概览，保证单元格不会被撑到需要横向滚动
 WATCHED_TEXT_MAX = 60
 
+# 详情页逐集状态条：每位代表一集，按媒体库与订阅事实取最靠后的状态
+TIMELINE_MISSING = "0"     # 媒体库里没有、也没有下载记录
+TIMELINE_DOWNLOADED = "1"  # 已经有一份，但还没洗到最高版本
+TIMELINE_UPGRADED = "2"    # 已洗到最高版本（宿主口径：优先级 100）
+TIMELINE_WATCHED = "3"     # 已看过，宿主侧不会再为它洗版
+# 每个状态对应的方块配色与文字说明：填充色 / 边框色 / 悬停与图例文案
+TIMELINE_STYLES = {
+    TIMELINE_MISSING: ("rgba(158,158,158,.22)", "rgba(158,158,158,.55)", "未下载"),
+    TIMELINE_DOWNLOADED: ("#42A5F5", "#2E8BD6", "已下载"),
+    TIMELINE_UPGRADED: ("#7E57C2", "#6A45AE", "已洗版"),
+    TIMELINE_WATCHED: ("#43A047", "#358A39", "已观看"),
+}
+# 方块条容器最大宽度（px）：超出就换行，避免上百集把表格顶出横向滚动
+TIMELINE_MAX_WIDTH = 220
+# 单个方块边长（px）
+TIMELINE_BOX_SIZE = 11
+
 # 读取播放进度失败的原因（写进日志与详情页，避免静默跳过）
 PLAYBACK_STATUS_TEXT = {
     "no_user": "没有可统计的用户",
@@ -99,7 +116,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.3.3"
+    plugin_version = "3.3.4"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -281,22 +298,52 @@ class PlaybackBestVersion(_PluginBase):
             # Vuetify 3.7 的 VDataTable 一旦收到默认插槽，就用它替换整个 thead/tbody，
             # 只剩单独渲染的 footer 分页栏 —— 表现为「有分页数字、表头和所有行全空白」。
             # 因此按 v3 原生插件的口径改用 VTable + 手写 thead/tbody：VTable 正好渲染默认插槽。
-            headers = ["订阅", "类型", "季", "服务器", "播放进度", "跳过洗版", "结果"]
+            #
+            # 列数只留 4 列：类型 / 季 / 服务器并到订阅名下面一行小字，
+            # 这样手机竖屏不用横向滚动就能看全，分集状态条也放在订阅名下方。
+            headers = ["订阅", "播放进度", "跳过洗版", "结果"]
             rows = []
             for record in records:
-                cells = [
-                    str(record.get("title") or "-"),
-                    str(record.get("type") or "-"),
-                    str(record.get("season") or "-"),
-                    str(record.get("server") or "-"),
-                    str(record.get("watched") or "-"),
-                    str(self._describe_changed(record.get("changed")) or "-"),
-                    str(record.get("status") or "-"),
+                title_block: List[dict] = [
+                    {
+                        "component": "div",
+                        "props": {"style": "font-weight:500"},
+                        "text": str(record.get("title") or "-"),
+                    }
                 ]
+                meta = self._record_meta(record)
+                if meta:
+                    title_block.append({
+                        "component": "div",
+                        "props": {"style": "font-size:12px;opacity:.65;margin-top:2px"},
+                        "text": meta,
+                    })
+                timeline = record.get("timeline")
+                if timeline:
+                    title_block.append({"component": "div", "html": self._timeline_html(timeline)})
                 rows.append({
                     "component": "tr",
-                    "content": [{"component": "td", "text": cell} for cell in cells],
+                    "content": [
+                        {"component": "td", "content": title_block},
+                        {"component": "td", "text": str(record.get("watched") or "-")},
+                        {"component": "td", "text": str(self._describe_changed(record.get("changed")) or "-")},
+                        {"component": "td", "text": str(record.get("status") or "-")},
+                    ],
                 })
+            page.append(
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {"component": "div", "html": self._timeline_legend_html()}
+                            ],
+                        }
+                    ],
+                }
+            )
             page.append(
                 {
                     "component": "VRow",
@@ -836,6 +883,7 @@ class PlaybackBestVersion(_PluginBase):
             "season": getattr(subscribe, "season", None) or "",
             "server": "",
             "watched": "",
+            "timeline": None,
             "changed": [],
             "status": "未找到条目",
         }
@@ -858,6 +906,7 @@ class PlaybackBestVersion(_PluginBase):
 
             record["server"] = server["name"]
             record["watched"] = self._describe_watched(playback)
+            record["timeline"] = self._build_timeline(subscribe, media_type, playback)
             changed = self._apply(subscribe, media_type, playback)
             if changed:
                 record["changed"] = changed
@@ -1204,6 +1253,133 @@ class PlaybackBestVersion(_PluginBase):
         return self._as_int(item.get("ParentIndexNumber"), 0) == season
 
     # ---- 展示与通知 ----
+
+    def _build_timeline(self, subscribe, media_type: MediaType,
+                        playback: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """构造逐集状态条数据：每集编码成一个字符，详情页再渲染成小方块。
+
+        状态取「最靠后」的事实：看过 > 洗到最高版本 > 已有一份 > 没有。
+        Emby 上不存在但订阅下载记录里有、或已写入过优先级的集，同样算「已有一份」，
+        避免刚下载还没入库时全被当成未下载。
+
+        :param subscribe: 订阅记录
+        :param media_type: 媒体类型
+        :param playback: 媒体服务器读取结果
+        :return: {"start": 起始集, "total": 结束集, "codes": 逐集状态串}，拿不到集数时返回 None
+        """
+        if media_type == MediaType.MOVIE:
+            movie = playback.get("movie") or {}
+            if not movie:
+                return None
+            return {
+                "start": 1,
+                "total": 1,
+                "codes": TIMELINE_WATCHED if self._hit(movie) else TIMELINE_DOWNLOADED,
+            }
+
+        target = self._target_episodes(subscribe)
+        if not target:
+            return None
+
+        episodes = playback.get("episodes") or {}
+        priorities = self._stored_priorities(subscribe)
+        noted = self._note_episodes(subscribe)
+        codes: List[str] = []
+        for episode in target:
+            progress = episodes.get(episode)
+            priority = priorities.get(str(episode), UNSET_PRIORITY)
+            downloaded = progress is not None or episode in noted or priority > UNSET_PRIORITY
+            if not downloaded:
+                codes.append(TIMELINE_MISSING)
+            elif progress is not None and self._hit(progress):
+                codes.append(TIMELINE_WATCHED)
+            elif priority >= BEST_VERSION_DONE_PRIORITY:
+                codes.append(TIMELINE_UPGRADED)
+            else:
+                codes.append(TIMELINE_DOWNLOADED)
+        return {"start": target[0], "total": target[-1], "codes": "".join(codes)}
+
+    @staticmethod
+    def _stored_priorities(subscribe) -> Dict[str, int]:
+        """订阅里已经写入的分集优先级（不做 current_priority 回退填充，只认真实记录的集）。"""
+        result: Dict[str, int] = {}
+        for key, value in (getattr(subscribe, "episode_priority", None) or {}).items():
+            try:
+                result[str(int(key))] = PlaybackBestVersion._as_int(value, UNSET_PRIORITY)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @staticmethod
+    def _note_episodes(subscribe) -> set:
+        """订阅下载记录（note）里出现过的集号。"""
+        raw = getattr(subscribe, "note", None) or []
+        if isinstance(raw, dict):
+            raw = list(raw.keys())
+        elif isinstance(raw, str):
+            raw = raw.split(",")
+        result = set()
+        for item in raw:
+            try:
+                result.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @staticmethod
+    def _timeline_box_html(code: str, title: str = "") -> str:
+        """单个小方块的 HTML。"""
+        fill, border, _ = TIMELINE_STYLES.get(code, TIMELINE_STYLES[TIMELINE_MISSING])
+        title_attr = f' title="{title}"' if title else ""
+        return (
+            f'<span{title_attr} style="display:inline-block;width:{TIMELINE_BOX_SIZE}px;'
+            f'height:{TIMELINE_BOX_SIZE}px;border-radius:2px;box-sizing:border-box;'
+            f'background:{fill};border:1px solid {border}"></span>'
+        )
+
+    def _timeline_html(self, timeline: Dict[str, Any]) -> str:
+        """把逐集状态串渲染成一排小方块（容器限宽，超出自动换行）。"""
+        codes = str(timeline.get("codes") or "")
+        start = self._as_int(timeline.get("start"), 1) or 1
+        boxes = []
+        for offset, code in enumerate(codes):
+            label = TIMELINE_STYLES.get(code, TIMELINE_STYLES[TIMELINE_MISSING])[2]
+            boxes.append(self._timeline_box_html(code, f"E{start + offset} {label}"))
+        return (
+            f'<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:5px;'
+            f'max-width:{TIMELINE_MAX_WIDTH}px">' + "".join(boxes) + "</div>"
+        )
+
+    @staticmethod
+    def _timeline_legend_html() -> str:
+        """方块颜色图例。"""
+        items = [
+            '<span style="margin-right:14px;opacity:.7">每格代表一集：</span>'
+        ]
+        for code in (TIMELINE_MISSING, TIMELINE_DOWNLOADED, TIMELINE_UPGRADED, TIMELINE_WATCHED):
+            fill, border, label = TIMELINE_STYLES[code]
+            items.append(
+                '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px">'
+                f'<span style="display:inline-block;width:{TIMELINE_BOX_SIZE}px;height:{TIMELINE_BOX_SIZE}px;'
+                f'border-radius:2px;box-sizing:border-box;background:{fill};border:1px solid {border}"></span>'
+                f'{label}</span>'
+            )
+        return ('<div style="display:flex;flex-wrap:wrap;align-items:center;'
+                'font-size:12px;margin-bottom:8px">' + "".join(items) + "</div>")
+
+    @staticmethod
+    def _record_meta(record: Dict[str, Any]) -> str:
+        """订阅名下方那行小字：类型 · 季 · 服务器。"""
+        parts: List[str] = []
+        media_type = str(record.get("type") or "")
+        parts.append({"TV": "电视剧", "MOVIE": "电影"}.get(media_type, media_type))
+        season = record.get("season")
+        if season not in (None, "", 0, "0"):
+            parts.append(f"S{season}")
+        server = record.get("server")
+        if server:
+            parts.append(str(server))
+        return " · ".join(part for part in parts if part)
 
     def _title(self, subscribe) -> str:
         """订阅的展示名：名称（年份）Sxx。"""

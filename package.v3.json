@@ -62,7 +62,7 @@
     "name": "播放进度洗版",
     "description": "按媒体服务器（Emby / Jellyfin）的分集播放进度决定订阅是否继续洗版：进度达到阈值（或播过、或标记已看）的集写成洗版完成优先级，宿主不再为它搜索更高版本；电影命中则整部停止洗版。支持多服务器、多用户合并、Webhook 即时触发、试运行与通知。",
     "labels": "订阅,洗版,媒体服务器,Emby,Jellyfin,Webhook",
-    "version": "3.3.3",
+    "version": "3.3.4",
     "icon": "playbackbestversion.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -71,6 +71,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v3.3.4": "详情页新增逐集状态方块条：每个小方块代表一集，按「未下载（灰）/ 已下载（蓝）/ 已洗到最高版本（紫）/ 已观看（绿）」四色区分，悬停显示集号与状态；方块数等于订阅的集数，容器限宽自动换行，剧集再多也不会把表格撑出横向滚动。同时把「类型 / 季 / 服务器」并入订阅名下方的小字，表格从 7 列精简到 4 列，手机竖屏不用横向滑动即可看全。洗版判定与配置不变。",
       "v3.3.3": "详情页「播放进度」列改为区间压缩显示：连续集号合并为 E1-33 形式，已看/未看完分类汇总，避免剧集多时这一列过长导致表格需要横向滚动；同时把表格的强制不换行去掉，内容偏长时改为换行而不是撑宽。「跳过洗版」列同样按区间合并。洗版判定与配置不变。",
       "v3.3.2": "修复插件详情页表格空白：MoviePilot v3 的页面渲染器会给每个组件无条件传入默认插槽，而 Vuetify 3.7 的 VDataTable 收到默认插槽后会用插槽内容替换整个 thead/tbody，导致只剩分页栏、表头与所有行都不显示。改用 v3 原生插件口径的 VTable + 手写 thead/tbody，逐订阅明细正常可见；洗版逻辑与配置不变。",
       "v3.3.1": "仅元数据更新：插件作者（plugin_author / author_url）与索引 author / project_url 改指 jiuyaozhuce，功能与配置不变。因 MoviePilot 按版本号判定已安装插件是否需要更新，纯改作者字段不会触发重新拉包，故升一个补丁版本，让已安装的插件刷新到新作者信息。",
