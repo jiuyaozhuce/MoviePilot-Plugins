@@ -35,6 +35,7 @@
 import datetime
 import re
 import threading
+from html import escape
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -73,15 +74,23 @@ TIMELINE_UPGRADED = "2"    # 已洗到最高版本（宿主口径：优先级 10
 TIMELINE_WATCHED = "3"     # 已看过，宿主侧不会再为它洗版
 # 每个状态对应的方块配色与文字说明：填充色 / 边框色 / 悬停与图例文案
 TIMELINE_STYLES = {
-    TIMELINE_MISSING: ("rgba(158,158,158,.22)", "rgba(158,158,158,.55)", "未下载"),
+    TIMELINE_MISSING: ("rgba(158,158,158,.3)", "rgba(158,158,158,.7)", "未下载"),
     TIMELINE_DOWNLOADED: ("#42A5F5", "#2E8BD6", "已下载"),
     TIMELINE_UPGRADED: ("#7E57C2", "#6A45AE", "已洗版"),
     TIMELINE_WATCHED: ("#43A047", "#358A39", "已观看"),
 }
-# 方块条容器最大宽度（px）：超出就换行，避免上百集把表格顶出横向滚动
-TIMELINE_MAX_WIDTH = 220
-# 单个方块边长（px）
-TIMELINE_BOX_SIZE = 11
+# 方块条最大宽度（px）：480 刚好容纳 30 集一行（12px + 3px 间距），再长就换行
+TIMELINE_MAX_WIDTH = 480
+# 单个方块边长与间距（px）
+TIMELINE_BOX_SIZE = 12
+TIMELINE_GAP = 3
+# 详情页状态徽章的圆点颜色（中性底 + 语义色点，深浅色主题都不需要改）
+BADGE_DOT = {
+    "done": "#43A047",   # 已写入跳过标记
+    "dry": "#42A5F5",    # 试运行
+    "error": "#E53935",  # 读取失败
+    "muted": "#757575",  # 无变化
+}
 
 # 订阅「最近活跃」的判定来源，按可信度从高到低：最近观看 → 订阅最近更新 → 订阅创建时间。
 # 详情页按它倒序排列，最近在看的排在前面。
@@ -132,7 +141,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.3.6"
+    plugin_version = "3.4.0"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -284,9 +293,16 @@ class PlaybackBestVersion(_PluginBase):
         ]
 
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：展示最近一次执行摘要与逐订阅结果。"""
+        """插件详情页：执行摘要 + 逐订阅卡片 + 折叠的未匹配清单。
+
+        不用表格：Vuetify 的 VTable 在手机竖屏会把「跳过洗版」这类窄表头压成竖排、
+        把标题和方块条挤成碎行（实测 390px 下表格列宽只剩 52~119px，行高 192px）。
+        改成 flex 卡片后，宽屏一行放下标题/徽章/方块条，窄屏自动堆叠，永不横向滚动。
+        """
         last = self._last_run or {}
         records = self._sorted_records(last.get("records") or [])
+        matched = [record for record in records if record.get("server")]
+        unmatched = [record for record in records if not record.get("server")]
 
         page: List[dict] = [
             {
@@ -297,13 +313,9 @@ class PlaybackBestVersion(_PluginBase):
                         "props": {"cols": 12},
                         "content": [
                             {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info" if last.get("success") else "warning",
-                                    "variant": "tonal",
-                                    "title": "播放进度洗版",
-                                    "text": self._page_summary(last),
-                                },
+                                "component": "div",
+                                "props": {"style": "max-width: 960px; margin: 0 auto"},
+                                "html": self._summary_html(last),
                             }
                         ],
                     }
@@ -311,57 +323,26 @@ class PlaybackBestVersion(_PluginBase):
             }
         ]
 
+        blocks: List[str] = []
         if records:
-            # MoviePilot v3 的 PageRender 会给每个组件无条件传入默认插槽（哪怕内容为空）。
-            # Vuetify 3.7 的 VDataTable 一旦收到默认插槽，就用它替换整个 thead/tbody，
-            # 只剩单独渲染的 footer 分页栏 —— 表现为「有分页数字、表头和所有行全空白」。
-            # 因此按 v3 原生插件的口径改用 VTable + 手写 thead/tbody：VTable 正好渲染默认插槽。
-            #
-            # 列数只留 4 列：类型 / 季 / 服务器并到订阅名下面一行小字，
-            # 这样手机竖屏不用横向滚动就能看全，分集状态条也放在订阅名下方。
-            headers = ["订阅", "播放进度", "跳过洗版", "结果"]
-            rows = []
-            for record in records:
-                title_block: List[dict] = [
-                    {
-                        "component": "div",
-                        "props": {"style": "font-weight:500"},
-                        "text": str(record.get("title") or "-"),
-                    }
-                ]
-                meta = self._record_meta(record)
-                if meta:
-                    title_block.append({
-                        "component": "div",
-                        "props": {"style": "font-size:12px;opacity:.65;margin-top:2px"},
-                        "text": meta,
-                    })
-                timeline = record.get("timeline")
-                if timeline:
-                    title_block.append({"component": "div", "html": self._timeline_html(timeline)})
-                rows.append({
-                    "component": "tr",
-                    "content": [
-                        {"component": "td", "content": title_block},
-                        {"component": "td", "text": str(record.get("watched") or "-")},
-                        {"component": "td", "text": str(self._describe_changed(record.get("changed")) or "-")},
-                        {"component": "td", "text": str(record.get("status") or "-")},
-                    ],
-                })
-            page.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {"component": "div", "html": self._timeline_legend_html()}
-                            ],
-                        }
-                    ],
-                }
-            )
+            blocks.append(self._legend_html())
+            if matched:
+                blocks.append(
+                    '<div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">'
+                    + "".join(self._card_html(record) for record in matched)
+                    + "</div>"
+                )
+            else:
+                blocks.append(
+                    '<div style="margin-top:10px;font-size:13px;line-height:1.6;'
+                    'opacity:.7">本轮没有任何订阅匹配到媒体库条目，先确认名称/年份/TMDB ID '
+                    '与媒体服务器一致，或该订阅尚未下载入库。</div>'
+                )
+            if unmatched:
+                blocks.append(self._unmatched_html(unmatched))
+            blocks.append(self._explain_html())
+
+        if blocks:
             page.append(
                 {
                     "component": "VRow",
@@ -371,48 +352,43 @@ class PlaybackBestVersion(_PluginBase):
                             "props": {"cols": 12},
                             "content": [
                                 {
-                                    "component": "VTable",
-                                    "props": {
-                                        "density": "compact",
-                                        "hover": True,
-                                        # 不加 text-no-wrap：'播放进度'列内容偏长时宁可换行，也不要撑出横向滚动
-                                        "style": "width: 100%;",
-                                    },
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": text}
-                                                        for text in headers
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {"component": "tbody", "content": rows},
-                                    ],
+                                    "component": "div",
+                                    "props": {"style": "max-width: 960px; margin: 0 auto"},
+                                    "html": "".join(blocks),
                                 }
                             ],
                         }
                     ],
                 }
             )
-
-        page.append(
-            {
-                "component": "VAlert",
-                "props": {
-                    "type": "warning",
-                    "variant": "tonal",
-                    "text": "说明：命中的集会被写入订阅的分集洗版优先级 100（宿主口径：该集洗版完成），"
-                            "后续洗版搜索不再为它下载更高优先级的版本；开启 Webhook 后播放结束/标记已看"
-                            "会即时触发检查。可先开启「试运行」只观察日志。注意：标记未看不会撤销已写入的 100。",
-                },
-            }
-        )
         return page
+
+    def _summary_html(self, last: Dict[str, Any]) -> str:
+        """顶部状态条：自建而不是 VAlert —— VAlert 会把长文本块整体居中，
+        中文还会被拆成「· 检 / 查 28 个订阅」这种断词。这里逐段 nowrap + 左对齐。"""
+        ok = bool(last.get("success")) and bool(last)
+        tone = "info" if ok else "warning"
+        items: List[str] = []
+        if not last:
+            items.append("尚未执行过检查")
+        else:
+            items.append(f"最近一次执行 {last.get('time') or '-'}")
+            if last.get("message"):
+                items.append(str(last["message"]))
+            if last.get("records"):
+                items.append(f"写入 {last.get('changed') or 0} 个跳过标记")
+            if self._dry_run:
+                items.append("试运行，未写库")
+        spans = "".join(
+            f'<span style="white-space:nowrap">{escape(item)}</span>' for item in items
+        )
+        return (
+            f'<div style="display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;'
+            f'padding:8px 12px;border-radius:8px;font-size:13px;line-height:1.6;'
+            f'background:rgba(var(--v-theme-{tone},33,150,243),.12);'
+            f'border:1px solid rgba(var(--v-theme-{tone},33,150,243),.3);'
+            f'color:rgba(var(--v-theme-on-surface,0,0,0),.85)">' + spans + "</div>"
+        )
 
     def stop_service(self):
         """停用插件时关闭定时调度器，并取消尚未触发的 Webhook 去抖任务。"""
@@ -1499,45 +1475,170 @@ class PlaybackBestVersion(_PluginBase):
             f'background:{fill};border:1px solid {border}"></span>'
         )
 
-    def _timeline_html(self, timeline: Dict[str, Any]) -> str:
-        """把逐集状态串渲染成一排小方块（容器限宽，超出自动换行）。"""
+    def _timeline_block_html(self, timeline: Dict[str, Any]) -> str:
+        """逐集方块条 + 起止集号刻度。
+
+        width:fit-content 让容器正好包住方块，刻度行才能与方块两端对齐；
+        超过 max-width 就换行，窄屏自动收缩，不需要媒体查询。
+        """
         codes = str(timeline.get("codes") or "")
         start = self._as_int(timeline.get("start"), 1) or 1
+        end = start + max(len(codes) - 1, 0)
         boxes = []
         for offset, code in enumerate(codes):
             label = TIMELINE_STYLES.get(code, TIMELINE_STYLES[TIMELINE_MISSING])[2]
             boxes.append(self._timeline_box_html(code, f"E{start + offset} {label}"))
         return (
-            f'<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:5px;'
-            f'max-width:{TIMELINE_MAX_WIDTH}px">' + "".join(boxes) + "</div>"
+            f'<div style="width:fit-content;'
+            f'max-width:min({TIMELINE_MAX_WIDTH}px,100%);margin-top:8px">'
+            f'<div style="display:flex;flex-wrap:wrap;gap:{TIMELINE_GAP}px">'
+            + "".join(boxes) +
+            '</div>'
+            '<div style="display:flex;justify-content:space-between;font-size:10px;'
+            'line-height:1.4;margin-top:2px;'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.45)">'
+            f'<span>E{start}</span><span>E{end}</span></div>'
+            '</div>'
         )
 
     @staticmethod
-    def _timeline_legend_html() -> str:
-        """方块颜色图例。"""
+    def _legend_html() -> str:
+        """方块图例（跟着方块条走，别放到表格外面隔一屏）。"""
         items = [
-            '<span style="margin-right:14px;opacity:.7">每格代表一集：</span>'
+            '<span style="margin-right:10px;'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.7)">每格代表一集</span>'
         ]
         for code in (TIMELINE_MISSING, TIMELINE_DOWNLOADED, TIMELINE_UPGRADED, TIMELINE_WATCHED):
             fill, border, label = TIMELINE_STYLES[code]
             items.append(
-                '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px">'
+                '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:12px">'
                 f'<span style="display:inline-block;width:{TIMELINE_BOX_SIZE}px;height:{TIMELINE_BOX_SIZE}px;'
-                f'border-radius:2px;box-sizing:border-box;background:{fill};border:1px solid {border}"></span>'
-                f'{label}</span>'
+                f'border-radius:2px;box-sizing:border-box;background:{fill};'
+                f'border:1px solid {border}"></span>'
+                f'<span style="color:rgba(var(--v-theme-on-surface,0,0,0),.7)">{label}</span></span>'
             )
-        return ('<div style="display:flex;flex-wrap:wrap;align-items:center;'
-                'font-size:12px;margin-bottom:8px">' + "".join(items) + "</div>")
+        items.append(
+            '<span style="margin-left:auto;color:rgba(var(--v-theme-on-surface,0,0,0),.45)">'
+            '最近活跃优先</span>'
+        )
+        return ('<div style="display:flex;flex-wrap:wrap;align-items:center;gap:2px 0;'
+                'font-size:12px">' + "".join(items) + "</div>")
+
+    @staticmethod
+    def _badge_html(kind: str, text: str, detail: str = "") -> str:
+        """状态徽章：中性底 + 语义色圆点，深浅色主题都不用改色。"""
+        dot = BADGE_DOT.get(kind, BADGE_DOT["muted"])
+        detail_attr = f' title="{escape(detail, quote=True)}"' if detail else ""
+        return (
+            '<span' + detail_attr + ' style="display:inline-flex;align-items:center;gap:6px;'
+            'flex:0 0 auto;padding:0 8px;height:22px;border-radius:11px;font-size:12px;'
+            'line-height:22px;white-space:nowrap;'
+            'background:rgba(var(--v-theme-on-surface,0,0,0),.06);'
+            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.14);'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.78)">'
+            f'<span style="display:inline-block;width:6px;height:6px;border-radius:50%;'
+            f'background:{dot}"></span>{escape(text)}</span>'
+        )
+
+    def _badge_of(self, record: Dict[str, Any]) -> Tuple[str, str, str]:
+        """从执行记录推出徽章的（类型, 短文案, 悬停详情）。"""
+        status = str(record.get("status") or "")
+        changed = record.get("changed") or []
+        if changed:
+            detail = PlaybackBestVersion._describe_changed(changed)
+            if self._dry_run:
+                return "dry", f"试运行 {detail}", f"试运行：本应跳过 {detail} 的洗版，未写库"
+            return "done", f"已跳过 {detail}", f"已把 {detail} 写成分集洗版优先级 100"
+        if "失败" in status:
+            return "error", "读取失败", status
+        return "muted", "无变化", status
+
+    def _card_html(self, record: Dict[str, Any]) -> str:
+        """单个订阅卡片：标题 + 徽章 / 小字 / 方块条 / 进度。"""
+        title = escape(str(record.get("title") or "-"))
+        meta = escape(self._record_meta(record))
+        kind, text, detail = self._badge_of(record)
+        parts = [
+            '<div style="border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);'
+            'border-radius:8px;padding:10px 12px">',
+            '<div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">',
+            '<div style="flex:1 1 180px;min-width:0">',
+            f'<div style="font-size:14px;font-weight:600;line-height:1.4">{title}</div>',
+            f'<div style="font-size:12px;line-height:1.5;margin-top:2px;'
+            f'color:rgba(var(--v-theme-on-surface,0,0,0),.6)">{meta}</div>',
+            '</div>',
+            self._badge_html(kind, text, detail),
+            '</div>',
+        ]
+        timeline = record.get("timeline")
+        if timeline:
+            parts.append(self._timeline_block_html(timeline))
+        watched = str(record.get("watched") or "")
+        if watched:
+            parts.append(
+                f'<div style="font-size:12px;line-height:1.5;margin-top:6px;'
+                f'color:rgba(var(--v-theme-on-surface,0,0,0),.75)">{escape(watched)}</div>'
+            )
+        parts.append('</div>')
+        return "".join(parts)
+
+    def _unmatched_html(self, records: List[Dict[str, Any]]) -> str:
+        """未匹配到媒体库条目的订阅：默认折叠成一行，点开再看。
+
+        这类订阅通常占多数（本轮 28 个里 26 个），展开成三列表格会让整页 80% 都是
+        「- / - / 找不到对应条目」的噪音。
+        """
+        rows = []
+        for record in records:
+            title = escape(str(record.get("title") or "-"))
+            meta = escape(self._record_meta(record))
+            rows.append(
+                '<div style="display:flex;gap:10px;align-items:baseline;font-size:12px;'
+                'line-height:1.6;padding:2px 0">'
+                f'<span style="flex:1 1 auto;min-width:0">{title}</span>'
+                f'<span style="flex:0 0 auto;color:rgba(var(--v-theme-on-surface,0,0,0),.55)">'
+                f'{meta}</span></div>'
+            )
+        return (
+            '<details style="margin-top:12px;border:1px solid '
+            'rgba(var(--v-theme-on-surface,0,0,0),.12);border-radius:8px;padding:8px 12px">'
+            '<summary style="cursor:pointer;font-size:12px;line-height:1.6;'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.7)">'
+            f'{len(records)} 个订阅未在媒体库找到条目，点开查看</summary>'
+            # auto-fill + minmax：宽屏自动铺成多列，手机仍是一列，不用写媒体查询
+            '<div style="margin-top:8px;display:grid;gap:2px 20px;'
+            'grid-template-columns:repeat(auto-fill,minmax(240px,1fr))">'
+            + "".join(rows) +
+            '</div></details>'
+        )
+
+    @staticmethod
+    def _explain_html() -> str:
+        """口径说明：默认折叠，不占版面。"""
+        points = [
+            "命中集写入订阅的分集洗版优先级 100（宿主口径：该集洗版完成），"
+            "后续洗版搜索不再为它下载更高优先级的版本",
+            "全集洗版（best_version_full）只在目标集全部看过时才写 100",
+            "开启 Webhook 后，播放结束 / 标记已看会即时触发一次检查",
+            "标记未看不会撤销已写入的 100；拿不准时先开「试运行」只看日志",
+        ]
+        items = "".join(f"<li>{escape(point)}</li>" for point in points)
+        return (
+            '<details style="margin-top:12px;border:1px solid '
+            'rgba(var(--v-theme-on-surface,0,0,0),.12);border-radius:8px;padding:8px 12px">'
+            '<summary style="cursor:pointer;font-size:12px;line-height:1.6;'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.7)">判定口径与写库规则</summary>'
+            '<ul style="margin:8px 0 0;padding-left:18px;font-size:12px;line-height:1.8;'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.7)">' + items + "</ul>"
+            '</details>'
+        )
 
     @staticmethod
     def _record_meta(record: Dict[str, Any]) -> str:
-        """订阅名下方那行小字：类型 · 季 · 服务器 · 最近活跃。"""
+        """订阅名下方那行小字：类型 · 服务器 · 最近活跃（季已写在标题里，不重复）。"""
         parts: List[str] = []
         media_type = str(record.get("type") or "")
         parts.append({"TV": "电视剧", "MOVIE": "电影"}.get(media_type, media_type))
-        season = record.get("season")
-        if season not in (None, "", 0, "0"):
-            parts.append(f"S{season}")
         server = record.get("server")
         if server:
             parts.append(str(server))
@@ -1631,7 +1732,10 @@ class PlaybackBestVersion(_PluginBase):
 
     @staticmethod
     def _episode_ranges(episodes: List[int]) -> str:
-        """把集号压缩成区间文本：1,2,3,5,7,8 -> "1-3、5、7-8"。"""
+        """把集号压缩成区间文本：1,2,3,5,7,8 -> "E1-3、E5、E7-8"。
+
+        每段都带 E 前缀：只写数字时「已看 1/26 集（1）」会被读成「已看 1 集」，与括号里的集号混淆。
+        """
         values = sorted({int(value) for value in episodes})
         if not values:
             return ""
@@ -1641,9 +1745,9 @@ class PlaybackBestVersion(_PluginBase):
             if value == prev + 1:
                 prev = value
                 continue
-            parts.append(str(start) if start == prev else f"{start}-{prev}")
+            parts.append(f"E{start}" if start == prev else f"E{start}-{prev}")
             start = prev = value
-        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        parts.append(f"E{start}" if start == prev else f"E{start}-{prev}")
         return "、".join(parts)
 
     @classmethod
@@ -1663,24 +1767,9 @@ class PlaybackBestVersion(_PluginBase):
                 others.append(str(item))
         parts: List[str] = []
         if numbers:
-            parts.append(f"E{cls._episode_ranges(numbers)}")
+            parts.append(cls._episode_ranges(numbers))
         parts.extend(others)
         return "、".join(parts)
-
-    def _page_summary(self, last: Dict[str, Any]) -> str:
-        """详情页顶部摘要。"""
-        if not last:
-            return "尚未执行过检查。"
-        parts = [f"最近一次执行：{last.get('time') or '-'}"]
-        if last.get("message"):
-            parts.append(str(last["message"]))
-        if last.get("changed"):
-            parts.append(f"写入 {last['changed']} 个跳过标记")
-        if last.get("records"):
-            parts.append("订阅按最近活跃排序")
-        if self._dry_run:
-            parts.append("当前为试运行，未写入任何订阅")
-        return "，".join(parts)
 
     def _send_notify(self, records: List[Dict[str, Any]]):
         """把本轮写入的跳过标记发到配置的通知渠道。"""
