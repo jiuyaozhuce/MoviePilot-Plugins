@@ -96,9 +96,9 @@ class PlaybackBestVersion(_PluginBase):
     # 插件版本
     plugin_version = "3.3.0"
     # 插件作者
-    plugin_author = "xlmc"
+    plugin_author = "jiuyaozhuce"
     # 作者主页
-    author_url = "https://github.com/xlmc"
+    author_url = "https://github.com/jiuyaozhuce"
     # 插件配置项 ID 前缀
     plugin_config_prefix = "playbackbestversion_"
     # 加载顺序

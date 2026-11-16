@@ -26,7 +26,7 @@ MoviePilot → 设置 → 插件 → 插件仓库 → 新增：
 
 保存后刷新仓库列表，安装所需插件即可。注意「添加仓库」与「绑定插件源」是两件事，需绑定后才会提示版本更新。
 
-> **历史说明**：原自研插件「EmbyUnwatchedWash（未看洗版）」已移除，同类功能改由上游 [xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 PlaybackBestVersion 承担（本仓库分发版增加 Webhook 即时触发）。若之前启用过旧插件，它写入订阅表的 `start_episode`、分集 `episode_priority=100` **不会随卸载回滚**，升级后请手动核对订阅状态。
+> **历史说明**：原自研插件「EmbyUnwatchedWash（未看洗版）」已移除，同类功能改由本仓库维护的 PlaybackBestVersion 承担（基于上游 [xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) v3.2.0，本仓库增加 Webhook 即时触发并接管维护）。若之前启用过旧插件，它写入订阅表的 `start_episode`、分集 `episode_priority=100` **不会随卸载回滚**，升级后请手动核对订阅状态。
 
 ---
 
@@ -53,7 +53,7 @@ MoviePilot → 设置 → 插件 → 插件仓库 → 新增：
 ## 来源与许可
 
 - 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
-- 本仓库分发版由 `jiuyaozhuce` 在 v3.2.0 基础上增加 Webhook 即时触发（v3.3.0）
+- 本仓库由 `jiuyaozhuce` 接管维护，在 v3.2.0 基础上增加 Webhook 即时触发（v3.3.0）；插件作者与项目地址已改指本仓库
 - 许可证 **GPL-3.0**，副本见 [plugins.v3/playbackbestversion/LICENSE](plugins.v3/playbackbestversion/LICENSE)
 
 ---
