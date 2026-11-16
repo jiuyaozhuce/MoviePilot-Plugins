@@ -33,6 +33,7 @@
       run() 按媒体服务器事实决定，因此重复投递无副作用。
 """
 import datetime
+import re
 import threading
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
@@ -82,6 +83,12 @@ TIMELINE_MAX_WIDTH = 220
 # 单个方块边长（px）
 TIMELINE_BOX_SIZE = 11
 
+# 订阅「最近活跃」的判定来源，按可信度从高到低：最近观看 → 订阅最近更新 → 订阅创建时间。
+# 详情页按它倒序排列，最近在看的排在前面。
+ACTIVITY_WATCH = "最近观看"
+ACTIVITY_UPDATE = "最近更新"
+ACTIVITY_CREATED = "订阅于"
+
 # 读取播放进度失败的原因（写进日志与详情页，避免静默跳过）
 PLAYBACK_STATUS_TEXT = {
     "no_user": "没有可统计的用户",
@@ -116,7 +123,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.3.4"
+    plugin_version = "3.3.5"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -268,7 +275,7 @@ class PlaybackBestVersion(_PluginBase):
     def get_page(self) -> Optional[List[dict]]:
         """插件详情页：展示最近一次执行摘要与逐订阅结果。"""
         last = self._last_run or {}
-        records = last.get("records") or []
+        records = self._sorted_records(last.get("records") or [])
 
         page: List[dict] = [
             {
@@ -824,6 +831,8 @@ class PlaybackBestVersion(_PluginBase):
                     record = self._process(subscribe, servers)
                     if record:
                         records.append(record)
+                # 最近活跃的排前面（观看时间 > 订阅更新时间 > 订阅创建时间）
+                records = self._sorted_records(records)
                 changed = sum(len(record.get("changed") or []) for record in records)
                 summary = {
                     "success": True,
@@ -877,6 +886,7 @@ class PlaybackBestVersion(_PluginBase):
         :return: 执行记录（供详情页与通知使用）
         """
         media_type = self._media_type(subscribe)
+        active_ts, active_label = self._activity_of(subscribe, {})
         record: Dict[str, Any] = {
             "title": self._title(subscribe),
             "type": media_type.value if media_type else "",
@@ -886,6 +896,9 @@ class PlaybackBestVersion(_PluginBase):
             "timeline": None,
             "changed": [],
             "status": "未找到条目",
+            # 排序键：拿不到播放进度时先按「订阅最近更新 / 创建时间」占位，读到进度后再换成观看时间
+            "active_ts": active_ts,
+            "active_label": active_label,
         }
 
         for server in servers:
@@ -907,6 +920,8 @@ class PlaybackBestVersion(_PluginBase):
             record["server"] = server["name"]
             record["watched"] = self._describe_watched(playback)
             record["timeline"] = self._build_timeline(subscribe, media_type, playback)
+            # 读到进度后，活跃时间改用「最近观看」（比订阅更新时间更贴近用户真正在追什么）
+            record["active_ts"], record["active_label"] = self._activity_of(subscribe, playback)
             changed = self._apply(subscribe, media_type, playback)
             if changed:
                 record["changed"] = changed
@@ -1051,18 +1066,21 @@ class PlaybackBestVersion(_PluginBase):
 
         if media_type == MediaType.MOVIE:
             movie: Dict[str, Any] = {}
+            last_ts = 0.0
             for user_id in user_ids:
                 data = self._get_json(
                     client,
                     f"[HOST]{prefix}/Users/{user_id}/Items/{item['Id']}?Fields=UserData&api_key=[APIKEY]",
                 )
                 progress = self._progress_of(data or {})
+                last_ts = max(last_ts, float(progress.get("last_ts") or 0))
                 if progress["percentage"] > float(movie.get("percentage") or 0) \
                         or (progress["played"] and not movie.get("played")):
                     movie = progress
-            return {"status": "ok", "movie": movie}
+            return {"status": "ok", "movie": movie, "last_ts": last_ts}
 
         episodes: Dict[int, Dict[str, Any]] = {}
+        last_ts = 0.0
         for user_id in user_ids:
             data = self._get_json(
                 client,
@@ -1076,11 +1094,13 @@ class PlaybackBestVersion(_PluginBase):
                 if number <= 0:
                     continue
                 progress = self._progress_of(episode_item)
+                # 整季最近一次观看时间 = 各集 LastPlayedDate 的最大值
+                last_ts = max(last_ts, float(progress.get("last_ts") or 0))
                 exists = episodes.get(number)
                 if not exists or progress["percentage"] > exists["percentage"] \
                         or (progress["played"] and not exists["played"]):
                     episodes[number] = progress
-        return {"status": "ok", "episodes": episodes}
+        return {"status": "ok", "episodes": episodes, "last_ts": last_ts}
 
     def _find_item(self, client, prefix: str, user_id, subscribe, media_type: MediaType) -> Optional[Dict[str, Any]]:
         """在媒体服务器上按名称/年份/TMDB ID 找订阅对应的剧集或电影条目。"""
@@ -1148,7 +1168,10 @@ class PlaybackBestVersion(_PluginBase):
 
     @staticmethod
     def _progress_of(item: Dict[str, Any]) -> Dict[str, Any]:
-        """把 Emby/Jellyfin 的 UserData 归一化成 {played, percentage}。"""
+        """把 Emby/Jellyfin 的 UserData 归一化成 {played, percentage, last_ts}。
+
+        last_ts 是 UserData.LastPlayedDate 的 epoch 秒（没看过则为 0），详情页用它排「最近活跃」。
+        """
         user_data = (item or {}).get("UserData") or {}
         played = bool(user_data.get("Played"))
         percentage = user_data.get("PlayedPercentage")
@@ -1162,7 +1185,79 @@ class PlaybackBestVersion(_PluginBase):
             percentage = 0.0
         if played:
             percentage = 100.0
-        return {"played": played, "percentage": round(percentage, 1)}
+        return {
+            "played": played,
+            "percentage": round(percentage, 1),
+            "last_ts": PlaybackBestVersion._parse_ts(user_data.get("LastPlayedDate")),
+        }
+
+    @staticmethod
+    def _parse_ts(value: Any) -> float:
+        """把 ISO 字符串 / datetime 转成 epoch 秒；解析不出来返回 0（排序时沉底）。"""
+        if not value:
+            return 0.0
+        if isinstance(value, datetime.datetime):
+            return value.timestamp()
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return 0.0
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        # Emby 给的秒内小数是 7 位（2026-11-16T13:00:00.0000000Z），fromisoformat 只吃 6 位
+        trimmed = re.match(r"^(.*\.\d{6})\d+(.*)$", text)
+        if trimmed:
+            text = trimmed.group(1) + trimmed.group(2)
+        try:
+            parsed = datetime.datetime.fromisoformat(text)
+        except ValueError:
+            return 0.0
+        # 不带时区的值（订阅表的 last_update / date）是宿主本地时间，按本地解释，
+        # 不能当 UTC，否则会整体偏移一个时区。
+        return parsed.timestamp()
+
+    @staticmethod
+    def _humanize_ts(ts: float) -> str:
+        """epoch 秒 → 人话（刚刚 / N 分钟前 / N 小时前 / N 天前 / 具体日期）。"""
+        if not ts:
+            return ""
+        moment = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+        seconds = datetime.datetime.now(datetime.timezone.utc).timestamp() - ts
+        if seconds < 60:
+            return "刚刚"
+        if seconds < 3600:
+            return f"{int(seconds // 60)} 分钟前"
+        if seconds < 86400:
+            return f"{int(seconds // 3600)} 小时前"
+        if seconds < 30 * 86400:
+            return f"{int(seconds // 86400)} 天前"
+        return moment.astimezone().strftime("%Y-%m-%d")
+
+    def _activity_of(self, subscribe, playback: Dict[str, Any]) -> Tuple[float, str]:
+        """订阅的「最近活跃」时间与来源：最近观看 > 订阅最近更新 > 订阅创建时间。"""
+        watched = float((playback or {}).get("last_ts") or 0)
+        if watched > 0:
+            return watched, ACTIVITY_WATCH
+        updated = self._parse_ts(getattr(subscribe, "last_update", None))
+        if updated > 0:
+            return updated, ACTIVITY_UPDATE
+        return self._parse_ts(getattr(subscribe, "date", None)), ACTIVITY_CREATED
+
+    @staticmethod
+    def _record_ts(record: Dict[str, Any]) -> float:
+        """从执行记录里取活跃时间戳（兼容旧数据：没有该字段就当 0）。"""
+        try:
+            return float(record.get("active_ts") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _sorted_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """最近活跃的排前面；时间相同按订阅名，保证每次刷新顺序稳定。"""
+        return sorted(
+            records or [],
+            key=lambda item: (-self._record_ts(item), str(item.get("title") or "")),
+        )
 
     def _hit(self, progress: Dict[str, Any]) -> bool:
         """按配置的判定方式判断这一集/这部电影是否算「看过」。"""
@@ -1369,7 +1464,7 @@ class PlaybackBestVersion(_PluginBase):
 
     @staticmethod
     def _record_meta(record: Dict[str, Any]) -> str:
-        """订阅名下方那行小字：类型 · 季 · 服务器。"""
+        """订阅名下方那行小字：类型 · 季 · 服务器 · 最近活跃。"""
         parts: List[str] = []
         media_type = str(record.get("type") or "")
         parts.append({"TV": "电视剧", "MOVIE": "电影"}.get(media_type, media_type))
@@ -1379,6 +1474,20 @@ class PlaybackBestVersion(_PluginBase):
         server = record.get("server")
         if server:
             parts.append(str(server))
+        label = str(record.get("active_label") or "")
+        try:
+            active_ts = float(record.get("active_ts") or 0)
+        except (TypeError, ValueError):
+            active_ts = 0.0
+        if label and active_ts:
+            if label == ACTIVITY_CREATED:
+                # 「订阅于」直接给日期，避免「订阅于 3 天前」这种别扭说法
+                moment = datetime.datetime.fromtimestamp(
+                    active_ts, datetime.timezone.utc).astimezone().strftime("%Y-%m-%d")
+            else:
+                moment = PlaybackBestVersion._humanize_ts(active_ts)
+            if moment:
+                parts.append(f"{label} {moment}")
         return " · ".join(part for part in parts if part)
 
     def _title(self, subscribe) -> str:
@@ -1500,6 +1609,8 @@ class PlaybackBestVersion(_PluginBase):
             parts.append(str(last["message"]))
         if last.get("changed"):
             parts.append(f"写入 {last['changed']} 个跳过标记")
+        if last.get("records"):
+            parts.append("订阅按最近活跃排序")
         if self._dry_run:
             parts.append("当前为试运行，未写入任何订阅")
         return "，".join(parts)
