@@ -157,3 +157,31 @@ Emby 侧配置（设置 → Webhook → 新增 Webhook）：
 - 详情页：主状态卡（状态徽章 + 数据来源徽章 + 大号剩余天数 + 期限进度条 + 保活截止日）、
   检查概况网格（最后登录/来源/最近检查/下次检查/期限/核实阈值/账号/站点）、检查历史卡，
   可点「立即检查」强制核实一次、「打开憨憨」跳站点
+
+---
+
+# PlaybackBestVersion（播放进度洗版）
+
+按媒体服务器（Emby / Jellyfin）的**分集播放进度**决定订阅是否继续洗版：进度达到阈值（默认 90%）、播过、或标记已看的集写成宿主口径的洗版完成（`episode_priority=100`），后续洗版不再为它搜更高版本；电影命中则整部停止洗版。支持多服务器、多用户合并、试运行与通知。
+
+> ⚠️ 与本仓库 **EmbyUnwatchedWash（未看洗版）** 操作同一批订阅字段，功能高度重叠，**请勿同时启用**，二选一即可。
+
+## Webhook 即时触发（v3.3.0 新增）
+
+默认开启。Emby「设置 → Webhook」新增一条：
+
+- URL：`http://<MoviePilot地址>/api/v1/webhook/?token=<API_TOKEN>&source=<媒体服务器名>`
+- 请求方式：POST
+- 事件：勾选「播放停止」「标记为已播放」「标记为未播放」
+
+插件监听宿主 `WebhookMessage`，只认这三类会改变观看状态的事件（播放开始 / 暂停 / 心跳一律忽略），兼容 Emby 带点事件名与 Jellyfin 无点写法；按「去抖延迟」（默认 20 秒，0 = 立即）合并窗口内多次事件只跑一轮检查，不必等下一轮定时。事件本身不携带、也不改写任何订阅数据，实际动作仍由 `run()` 按媒体服务器事实决定，重复投递无副作用。定时检测（默认 30 分钟）与手动运行保持原样。
+
+注意插件「只写不回滚」：**标记为未播放**会触发一次检查，但不会撤销该集已写入的 100，需要恢复洗版时手动修改订阅的分集优先级。
+
+完整配置说明见 [plugins.v3/playbackbestversion/README.md](plugins.v3/playbackbestversion/README.md)。
+
+## 来源与许可
+
+- 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
+- 本仓库分发版由 `jiuyaozhuce` 增加 Webhook 即时触发（v3.3.0），代码与 `jiuyaozhuce/xlmc-MoviePilot-Plugins` fork 版一致
+- 许可证 **GPL-3.0**，副本见 [plugins.v3/playbackbestversion/LICENSE](plugins.v3/playbackbestversion/LICENSE)
