@@ -94,7 +94,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.3.1"
+    plugin_version = "3.3.2"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -272,6 +272,26 @@ class PlaybackBestVersion(_PluginBase):
         ]
 
         if records:
+            # MoviePilot v3 的 PageRender 会给每个组件无条件传入默认插槽（哪怕内容为空）。
+            # Vuetify 3.7 的 VDataTable 一旦收到默认插槽，就用它替换整个 thead/tbody，
+            # 只剩单独渲染的 footer 分页栏 —— 表现为「有分页数字、表头和所有行全空白」。
+            # 因此按 v3 原生插件的口径改用 VTable + 手写 thead/tbody：VTable 正好渲染默认插槽。
+            headers = ["订阅", "类型", "季", "服务器", "播放进度", "跳过洗版", "结果"]
+            rows = []
+            for record in records:
+                cells = [
+                    str(record.get("title") or "-"),
+                    str(record.get("type") or "-"),
+                    str(record.get("season") or "-"),
+                    str(record.get("server") or "-"),
+                    str(record.get("watched") or "-"),
+                    str(self._describe_changed(record.get("changed")) or "-"),
+                    str(record.get("status") or "-"),
+                ]
+                rows.append({
+                    "component": "tr",
+                    "content": [{"component": "td", "text": cell} for cell in cells],
+                })
             page.append(
                 {
                     "component": "VRow",
@@ -281,32 +301,27 @@ class PlaybackBestVersion(_PluginBase):
                             "props": {"cols": 12},
                             "content": [
                                 {
-                                    "component": "VDataTable",
+                                    "component": "VTable",
                                     "props": {
-                                        "headers": [
-                                            {"title": "订阅", "key": "title"},
-                                            {"title": "类型", "key": "type"},
-                                            {"title": "季", "key": "season"},
-                                            {"title": "服务器", "key": "server"},
-                                            {"title": "播放进度", "key": "watched"},
-                                            {"title": "跳过洗版", "key": "changed"},
-                                            {"title": "结果", "key": "status"},
-                                        ],
-                                        "items": [
-                                            {
-                                                "title": record.get("title") or "",
-                                                "type": record.get("type") or "",
-                                                "season": record.get("season") or "",
-                                                "server": record.get("server") or "",
-                                                "watched": record.get("watched") or "",
-                                                "changed": self._describe_changed(record.get("changed")),
-                                                "status": record.get("status") or "",
-                                            }
-                                            for record in records
-                                        ],
                                         "density": "compact",
                                         "hover": True,
+                                        "class": "text-no-wrap",
                                     },
+                                    "content": [
+                                        {
+                                            "component": "thead",
+                                            "content": [
+                                                {
+                                                    "component": "tr",
+                                                    "content": [
+                                                        {"component": "th", "text": text}
+                                                        for text in headers
+                                                    ],
+                                                }
+                                            ],
+                                        },
+                                        {"component": "tbody", "content": rows},
+                                    ],
                                 }
                             ],
                         }

@@ -62,7 +62,7 @@
     "name": "播放进度洗版",
     "description": "按媒体服务器（Emby / Jellyfin）的分集播放进度决定订阅是否继续洗版：进度达到阈值（或播过、或标记已看）的集写成洗版完成优先级，宿主不再为它搜索更高版本；电影命中则整部停止洗版。支持多服务器、多用户合并、Webhook 即时触发、试运行与通知。",
     "labels": "订阅,洗版,媒体服务器,Emby,Jellyfin,Webhook",
-    "version": "3.3.1",
+    "version": "3.3.2",
     "icon": "playbackbestversion.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -71,6 +71,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v3.3.2": "修复插件详情页表格空白：MoviePilot v3 的页面渲染器会给每个组件无条件传入默认插槽，而 Vuetify 3.7 的 VDataTable 收到默认插槽后会用插槽内容替换整个 thead/tbody，导致只剩分页栏、表头与所有行都不显示。改用 v3 原生插件口径的 VTable + 手写 thead/tbody，逐订阅明细正常可见；洗版逻辑与配置不变。",
       "v3.3.1": "仅元数据更新：插件作者（plugin_author / author_url）与索引 author / project_url 改指 jiuyaozhuce，功能与配置不变。因 MoviePilot 按版本号判定已安装插件是否需要更新，纯改作者字段不会触发重新拉包，故升一个补丁版本，让已安装的插件刷新到新作者信息。",
       "v3.3.0": "新增 Emby / Jellyfin Webhook 即时触发（默认开启）：监听宿主 WebhookMessage，只认「播放停止」「标记为已播放」「标记为未播放」三类会改变观看状态的事件，播放开始 / 暂停 / 心跳一律忽略；按可配「去抖延迟」（默认 20 秒，0 = 立即）合并同一窗口内多次事件只跑一次检查，不必等下一轮定时。事件本身不携带也不改写任何订阅数据，实际动作仍由 run() 按媒体服务器事实决定，重复投递无副作用。去抖用独立 threading.Timer 实现，保存配置重排定时调度不会丢任务，停用插件时一并取消未触发的定时器；定时检测与手动运行保持原样。注意：本插件「只写不回滚」，标记未看不会撤销已写入的 100。",
       "v3.2.0": "取消「并入洗版管家」的合并提示，恢复为独立插件：按播放进度停止洗版。同时修复通知渠道不生效（配置里存的是宿主通知配置的 type，之前直接传给 post_message 会校验失败、通知被静默丢弃，现在先映射成通知渠道枚举再发送，未知渠道跳过并写日志）；读取播放进度失败（没有可统计的用户 / 找不到对应条目）不再静默跳过，原因会写进日志与详情页。",
