@@ -5,11 +5,15 @@ from urllib.parse import unquote
 import requests
 from bs4 import BeautifulSoup
 from http.cookies import SimpleCookie
-from app.core.config import settings
-from app.core.meta import MetaBase
-from app.helper.cookiecloud import CookieCloudHelper
-from app.log import logger
-from app.utils.http import RequestUtils
+# MoviePilot V3 SDK 适配（已在 v3.2.6 容器实测，与旧路径均为同一对象）：
+# settings / MetaBase / RequestUtils / logger 改用 app.sdk.* 正式入口；
+# CookieCloud 在 V3 SDK 中只有 app.sdk._legacy.cookiecloud 这一处实现，
+# 暂无非 legacy 替代模块，故取该路径（与 app.helper.cookiecloud 指向同一个类）。
+from app.sdk._legacy.cookiecloud import CookieCloudHelper
+from app.sdk.config import settings
+from app.sdk.logging import logger
+from app.sdk.media import MetaBase
+from app.sdk.network import RequestUtils
 
 
 class DoubanHelper:

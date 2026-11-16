@@ -1,16 +1,25 @@
+import re
 import threading
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
 
+# MoviePilot V3 SDK 适配（已在 v3.2.6 容器逐项实测，新旧符号均为同一对象）：
+# - config / events / logging / media / plugin / network 统一走 app.sdk.* 正式入口；
+#   旧路径 app.core.event / app.core.config / app.core.metainfo / app.core.meta /
+#   app.helper.cookiecloud / app.utils.http / app.db.plugindata_oper / app.log
+#   在 V3 中已无对应源码文件，仅由宿主兼容层以 sys.modules 别名提供。
+# - app.chain.media / app.schemas / app.schemas.types / app.db.oper 在 V3 中仍是
+#   真实模块，保持原路径；app.plugins.doubanwatching 为插件自身包路径。
+# - 注意：app.schemas.MediaInfo 与 app.sdk.media.MediaInfo 并非同一个类，
+#   类型标注仍从 app.schemas 取，不要用 SDK 版本替换。
 from app.chain.media import MediaChain
-from app.core.event import eventmanager, Event
-from app.core.metainfo import MetaInfo
-from app.plugins import _PluginBase
-from app.plugins.doubanwatching.DoubanHelper import DoubanHelper
 from app.schemas import WebhookEventInfo, MediaInfo
 from app.schemas.types import EventType, MediaType, MediaSource
-import re
-from app.log import logger
+from app.sdk.events import eventmanager, Event
+from app.sdk.logging import logger
+from app.sdk.media import MetaInfo
+from app.sdk.plugin import _PluginBase
+from app.plugins.doubanwatching.DoubanHelper import DoubanHelper
 
 lock = threading.Lock()
 
@@ -23,7 +32,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "v1.9.19"
+    plugin_version = "v1.9.20"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -65,7 +74,7 @@ class DouBanWatching(_PluginBase):
         self._mobile_num = self._parse_limit(config.get("mobile_num"))
 
         if self.get_data("processed"):
-            from app.db.plugindata_oper import PluginDataOper
+            from app.db.oper import PluginDataOper
             PluginDataOper().del_data(plugin_id="DouBanWatching")
             logger.warn("检测到本插件旧版本数据，删除旧版本数据，避免报错...")
 

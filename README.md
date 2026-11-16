@@ -8,12 +8,14 @@
 | --- | --- | --- |
 | 播放进度洗版 (PlaybackBestVersion) | 3.3.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版，支持 Webhook 即时触发 |
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
-| 豆瓣书影音档案 (DouBanWatching) | 1.9.19 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
+| 豆瓣书影音档案 (DouBanWatching) | 1.9.20 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
 ## 索引与兼容性
 
 - 本仓库只维护 V3 索引 `package.v3.json` 与 `plugins.v3/` 目录。原 V2 索引 `package.json` 与 `plugins/doubanwatching/` 旧目录已移除——DouBanWatching 在 V3 索引里本就有同名同版本条目，无需重复维护。若仍有 V2 客户端接入本仓库，它将看不到任何插件。
-- ⚠️ DouBanWatching 的插件代码沿用上游 V2 风格导入（`app.core.event` / `app.log` / `app.plugins` 等），依赖宿主的旧插件兼容层；MoviePilot 较新的 V3 分支已移除这些模块，升级宿主前需先做 V3 SDK 适配。
+- ✅ DouBanWatching 已完成 V3 SDK 适配（v1.9.20，实测宿主 **v3.2.6**）：配置 / 事件 / 日志 / 媒体元数据 / 插件基类 / 网络请求统一改走 `app.sdk.*`；旧路径（`app.core.event`、`app.core.config`、`app.core.metainfo`、`app.core.meta`、`app.helper.cookiecloud`、`app.utils.http`、`app.db.plugindata_oper`、`app.log`）在 V3 中已无源码文件，只靠宿主兼容层以别名注入，现已不再依赖。新旧符号经容器逐项实测为同一对象，功能与配置无变化。
+  - `app.chain.media`、`app.schemas`、`app.schemas.types`、`app.db.oper` 在 V3 中仍是真实模块，保持原路径；`app.schemas.MediaInfo` 与 `app.sdk.media.MediaInfo` 不是同一个类，类型标注仍取前者。
+  - 唯一例外：CookieCloud 在 V3 SDK 中只有 `app.sdk._legacy.cookiecloud` 一处实现（无新替代模块），与旧 `app.helper.cookiecloud` 指向同一个类。
 
 ## 安装
 

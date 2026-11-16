@@ -22,7 +22,7 @@
     "name": "豆瓣书影音档案",
     "description": "将剧集在看、看完状态同步到豆瓣书影音档案。",
     "labels": "豆瓣",
-    "version": "1.9.19",
+    "version": "1.9.20",
     "icon": "douban.png",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -31,6 +31,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.9.20": "V3 SDK 适配：config / events / logging / media / plugin / network 等旧路径（app.core.* / app.log / app.utils.http / app.helper.cookiecloud / app.db.plugindata_oper）统一改为 app.sdk.* 正式入口；在 MoviePilot v3.2.6 容器内逐项实测，新旧符号均为同一对象，MediaChain / schemas / db.oper 保持 V3 正规路径。功能与配置不变，仅消除对宿主旧插件兼容层的依赖。",
       "v1.9.19": "修复非当年月份卡文字溢出：年份改为独立一行小字（25年/9月 分两行），月份行与年份行加 max-width 溢出保护",
       "v1.9.18": "修复月份卡跨年合并计数：分组键由月份改为年-月（此前9月=2025年6部+2026年11部被合并成17部，与海报数不符），非当年月份卡加年份前缀（如25年9月）",
       "v1.9.17": "设置页加回「显示数量限制」分区：大/小屏幕每月最多显示数两个输入框（留空或0=不限制，默认不限制）",
