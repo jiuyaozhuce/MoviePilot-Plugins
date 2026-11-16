@@ -141,7 +141,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.4.0"
+    plugin_version = "3.4.1"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -1607,7 +1607,7 @@ class PlaybackBestVersion(_PluginBase):
             f'{len(records)} 个订阅未在媒体库找到条目，点开查看</summary>'
             # auto-fill + minmax：宽屏自动铺成多列，手机仍是一列，不用写媒体查询
             '<div style="margin-top:8px;display:grid;gap:2px 20px;'
-            'grid-template-columns:repeat(auto-fill,minmax(240px,1fr))">'
+            'grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">'
             + "".join(rows) +
             '</div></details>'
         )

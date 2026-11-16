@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| 播放进度洗版 (PlaybackBestVersion) | 3.4.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版，支持 Webhook 即时触发 |
+| 播放进度洗版 (PlaybackBestVersion) | 3.4.1 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版，支持 Webhook 即时触发 |
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
 | 豆瓣书影音档案 (DouBanWatching) | 1.9.20 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
