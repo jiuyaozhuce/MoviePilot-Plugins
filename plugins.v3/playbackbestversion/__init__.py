@@ -88,6 +88,15 @@ TIMELINE_BOX_SIZE = 11
 ACTIVITY_WATCH = "最近观看"
 ACTIVITY_UPDATE = "最近更新"
 ACTIVITY_CREATED = "订阅于"
+# 媒体服务器活动日志的取样条数：Emby/Jellyfin 的列表接口不返回 LastPlayedDate，
+# 只能靠活动日志（含播放/标记已看事件）反推「最近观看时间」。
+ACTIVITY_LOG_LIMIT = 500
+# 活动日志里算作「观看活动」的事件类型（统一小写比对，Emby 带点、Jellyfin 不带点）
+ACTIVITY_LOG_EVENTS = {
+    "playback.start", "playbackstart",
+    "playback.stop", "playbackstop",
+    "item.markplayed", "markplayed",
+}
 
 # 读取播放进度失败的原因（写进日志与详情页，避免静默跳过）
 PLAYBACK_STATUS_TEXT = {
@@ -123,7 +132,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.3.5"
+    plugin_version = "3.3.6"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -195,6 +204,8 @@ class PlaybackBestVersion(_PluginBase):
         self._lock = threading.Lock()
         # 最近一次执行结果（详情页与通知用）
         self._last_run: Dict[str, Any] = {}
+        # 活动日志缓存（每轮检查只拉一次，键 = 服务器名），用于「最近观看时间」
+        self._activity_cache: Dict[str, Dict[str, float]] = {}
 
     def init_plugin(self, config: dict = None):
         """初始化插件：读取配置、按需立即运行一次，并启动定时调度。
@@ -806,6 +817,8 @@ class PlaybackBestVersion(_PluginBase):
             return {"success": False, "message": "上一轮检查尚未结束", "records": []}
 
         started = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 每轮重新拉活动日志，保证「最近观看」跟着实际播放走
+        self._activity_cache = {}
         try:
             subscribes = self._get_best_version_subscribes()
             servers = self._get_servers()
@@ -1077,8 +1090,12 @@ class PlaybackBestVersion(_PluginBase):
                 if progress["percentage"] > float(movie.get("percentage") or 0) \
                         or (progress["played"] and not movie.get("played")):
                     movie = progress
+            if not last_ts:
+                last_ts = self._watch_ts_from_activity(
+                    getattr(subscribe, "name", ""),
+                    self._activity_index(client, prefix, server["name"]),
+                )
             return {"status": "ok", "movie": movie, "last_ts": last_ts}
-
         episodes: Dict[int, Dict[str, Any]] = {}
         last_ts = 0.0
         for user_id in user_ids:
@@ -1100,6 +1117,11 @@ class PlaybackBestVersion(_PluginBase):
                 if not exists or progress["percentage"] > exists["percentage"] \
                         or (progress["played"] and not exists["played"]):
                     episodes[number] = progress
+        if not last_ts:
+            last_ts = self._watch_ts_from_activity(
+                getattr(subscribe, "name", ""),
+                self._activity_index(client, prefix, server["name"]),
+            )
         return {"status": "ok", "episodes": episodes, "last_ts": last_ts}
 
     def _find_item(self, client, prefix: str, user_id, subscribe, media_type: MediaType) -> Optional[Dict[str, Any]]:
@@ -1132,6 +1154,51 @@ class PlaybackBestVersion(_PluginBase):
             if score > best_score:
                 best, best_score = item, score
         return best if best_score > 0 else None
+
+    def _activity_index(self, client, prefix: str, server_name: str) -> Dict[str, float]:
+        """取「活动日志条目名 → 最近一次观看时间」索引（每个媒体服务器每轮只拉一次）。
+
+        Emby/Jellyfin 的条目列表接口不返回 LastPlayedDate（实测 Emby 4.x 只给 Played / PlayCount），
+        所以「看过但没有时间」。活动日志里每条播放 / 标记已看都带 Date 和片名，
+        用片名做包含匹配即可回填「最近观看」；读不到（接口不存在 / 无权限）时返回空字典，
+        调用方自然退回订阅更新时间，不影响任何洗版判定。
+        """
+        cached = self._activity_cache.get(server_name)
+        if cached is not None:
+            return cached
+
+        index: Dict[str, float] = {}
+        data = self._get_json(
+            client,
+            f"[HOST]{prefix}/System/ActivityLog/Entries?HasUserId=true"
+            f"&Limit={ACTIVITY_LOG_LIMIT}&api_key=[APIKEY]",
+        )
+        for entry in (data or {}).get("Items") or []:
+            if str(entry.get("Type") or "").lower() not in ACTIVITY_LOG_EVENTS:
+                continue
+            name = str(entry.get("Name") or "").strip()
+            ts = self._parse_ts(entry.get("Date"))
+            if not name or not ts:
+                continue
+            if ts > index.get(name, 0):
+                index[name] = ts
+        self._activity_cache[server_name] = index
+        return index
+
+    @staticmethod
+    def _watch_ts_from_activity(title: str, index: Dict[str, float]) -> float:
+        """在活动日志索引里找这个片名的最近观看时间：先精确匹配，再退化为包含匹配。"""
+        target = (title or "").strip()
+        if not target or not index:
+            return 0.0
+        exact = index.get(target)
+        if exact:
+            return exact
+        best = 0.0
+        for label, ts in index.items():
+            if target in label and ts > best:
+                best = ts
+        return best
 
     def _resolve_users(self, client) -> List[Any]:
         """解析要统计的用户 ID 列表；未配置用户名时用服务器配置的用户。"""
