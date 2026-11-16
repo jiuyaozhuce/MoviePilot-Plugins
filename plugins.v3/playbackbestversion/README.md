@@ -89,5 +89,6 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 
 - 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
 - v3.3.0 起由 `jiuyaozhuce` 接管维护并增加 Webhook 即时触发；作者与项目地址改指本仓库，图标改为仓库根目录的 `playbackbestversion.svg`
+- v3.3.1：仅把作者元数据同步到已安装的实例（MoviePilot 按版本号判定更新），功能与配置无变化
 - 许可证 **GPL-3.0**，副本见本目录 `LICENSE`
 - ⚠️ 若之前启用过旧版自研「未看洗版」插件，它写入订阅表的 `start_episode` 与分集 `episode_priority=100` 不会随卸载回滚，升级后请手动核对订阅状态
