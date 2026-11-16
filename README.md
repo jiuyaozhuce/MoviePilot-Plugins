@@ -10,6 +10,11 @@
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
 | 豆瓣书影音档案 (DouBanWatching) | 1.9.19 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
+## 索引与兼容性
+
+- 本仓库只维护 V3 索引 `package.v3.json` 与 `plugins.v3/` 目录。原 V2 索引 `package.json` 与 `plugins/doubanwatching/` 旧目录已移除——DouBanWatching 在 V3 索引里本就有同名同版本条目，无需重复维护。若仍有 V2 客户端接入本仓库，它将看不到任何插件。
+- ⚠️ DouBanWatching 的插件代码沿用上游 V2 风格导入（`app.core.event` / `app.log` / `app.plugins` 等），依赖宿主的旧插件兼容层；MoviePilot 较新的 V3 分支已移除这些模块，升级宿主前需先做 V3 SDK 适配。
+
 ## 安装
 
 MoviePilot → 设置 → 插件 → 插件仓库 → 新增：
