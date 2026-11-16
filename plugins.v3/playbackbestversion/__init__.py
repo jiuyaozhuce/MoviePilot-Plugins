@@ -141,7 +141,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.4.1"
+    plugin_version = "3.4.2"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -1588,16 +1588,17 @@ class PlaybackBestVersion(_PluginBase):
         这类订阅通常占多数（本轮 28 个里 26 个），展开成三列表格会让整页 80% 都是
         「- / - / 找不到对应条目」的噪音。
         """
+        # 标题与日期分两行：并排时「孔雀东南飞（2026） 第 1 季」这种长名会折行，
+        # 把右侧日期顶到上一行，和同排短名项错位。两行式高度统一，一眼扫下来更整齐。
         rows = []
         for record in records:
             title = escape(str(record.get("title") or "-"))
             meta = escape(self._record_meta(record))
             rows.append(
-                '<div style="display:flex;gap:10px;align-items:baseline;font-size:12px;'
-                'line-height:1.6;padding:2px 0">'
-                f'<span style="flex:1 1 auto;min-width:0">{title}</span>'
-                f'<span style="flex:0 0 auto;color:rgba(var(--v-theme-on-surface,0,0,0),.55)">'
-                f'{meta}</span></div>'
+                '<div style="font-size:12px;line-height:1.5;padding:3px 0;min-width:0">'
+                f'<div style="overflow-wrap:anywhere">{title}</div>'
+                f'<div style="color:rgba(var(--v-theme-on-surface,0,0,0),.55)">{meta}</div>'
+                '</div>'
             )
         return (
             '<details style="margin-top:12px;border:1px solid '
@@ -1607,7 +1608,7 @@ class PlaybackBestVersion(_PluginBase):
             f'{len(records)} 个订阅未在媒体库找到条目，点开查看</summary>'
             # auto-fill + minmax：宽屏自动铺成多列，手机仍是一列，不用写媒体查询
             '<div style="margin-top:8px;display:grid;gap:2px 20px;'
-            'grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">'
+            'grid-template-columns:repeat(auto-fill,minmax(240px,1fr))">'
             + "".join(rows) +
             '</div></details>'
         )

@@ -89,6 +89,7 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 
 - 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
 - v3.3.0 起由 `jiuyaozhuce` 接管维护并增加 Webhook 即时触发；作者与项目地址改指本仓库，图标改为仓库根目录的 `playbackbestversion.svg`
+- v3.4.2：折叠清单改为两行式（标题 / 类型·日期），长订阅名不再折行错位，列宽 240px
 - v3.4.1：折叠清单列宽 240px → 280px，避免「孔雀东南飞（2026） 第 1 季」这类长名折行把日期顶到下一行
 - v3.4.0：详情页按视觉效果整体重排。原 4 列表格在手机竖屏下不可用（实测 390px 时「跳过洗版」表头竖排成 4 行、行高 192px、订阅名断成三行、方块条被压到 87px 宽），改为：
   - 顶部一条摘要（左对齐、逐段不拆词，代替会居中的 VAlert）
