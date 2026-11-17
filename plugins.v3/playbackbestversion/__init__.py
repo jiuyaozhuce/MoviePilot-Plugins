@@ -141,7 +141,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.4.2"
+    plugin_version = "3.4.3"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -292,6 +292,25 @@ class PlaybackBestVersion(_PluginBase):
             }
         ]
 
+    def _latest_run(self) -> Dict[str, Any]:
+        """取最新一轮执行结果。
+
+        定时任务与 Webhook 可能跑在插件被重复初始化后的另一份实例上，
+        详情页拿到的实例 `_last_run` 会停在它自己的初始化时刻；
+        持久化的 last_run 才是全局最新的事实，因此两者取 time 较晚的。
+        """
+        memory = self._last_run or {}
+        try:
+            stored = self.get_data("last_run") or {}
+        except Exception as err:
+            logger.debug(f"{self.LOG_TAG}读取 last_run 失败：{err}")
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        if str(stored.get("time") or "") > str(memory.get("time") or ""):
+            return stored
+        return memory
+
     def get_page(self) -> Optional[List[dict]]:
         """插件详情页：执行摘要 + 逐订阅卡片 + 折叠的未匹配清单。
 
@@ -299,7 +318,7 @@ class PlaybackBestVersion(_PluginBase):
         把标题和方块条挤成碎行（实测 390px 下表格列宽只剩 52~119px，行高 192px）。
         改成 flex 卡片后，宽屏一行放下标题/徽章/方块条，窄屏自动堆叠，永不横向滚动。
         """
-        last = self._last_run or {}
+        last = self._latest_run()
         records = self._sorted_records(last.get("records") or [])
         matched = [record for record in records if record.get("server")]
         unmatched = [record for record in records if not record.get("server")]
@@ -377,6 +396,18 @@ class PlaybackBestVersion(_PluginBase):
                 items.append(str(last["message"]))
             if last.get("records"):
                 items.append(f"写入 {last.get('changed') or 0} 个跳过标记")
+                timelines = [
+                    record.get("timeline") for record in (last.get("records") or [])
+                    if isinstance(record.get("timeline"), dict)
+                ]
+                if timelines:
+                    done = sum(
+                        str(t.get("codes") or "").count(TIMELINE_UPGRADED) for t in timelines
+                    )
+                    pending = sum(
+                        str(t.get("codes") or "").count(TIMELINE_DOWNLOADED) for t in timelines
+                    )
+                    items.append(f"已洗版 {done} 集，待洗 {pending} 集")
             if self._dry_run:
                 items.append("试运行，未写库")
         spans = "".join(
