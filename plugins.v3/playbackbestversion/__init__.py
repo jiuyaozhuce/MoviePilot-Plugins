@@ -953,6 +953,247 @@ def _uninstall_dedupe_patch() -> None:
             _DEDUPE_STATE.update(installed=False, original=None)
 
 
+# ---- 洗版免费优先（v3.10.0）----
+# 需求：同一档画质/音轨的候选里，先挑免费（不计下载量）的；实在没有免费的，才下付费的。
+#
+# 为什么不在规则阶梯里给每档插一层 `& FREE`：
+#   阶梯（rule_string 里的 `>`）产出的 pri_order 不只是排序值，它同时是洗版门槛 ——
+#   入库完成时被写回 subscribe.current_priority / episode_priority，之后所有候选都用
+#   `pri_order > 已有值` 判「算不算升级」，而 priority == 100 是宿主定义的「洗版完成」
+#   （app/application/subscription/priority.py）。给每档都插一层免费档，等于把付费档整体
+#   下移一位：付费的顶档永远到不了 100 → 订阅永远判不了完成、每轮都继续搜；同画质后来
+#   变成免费时（PT 站限时免费很常见）又会因为 1 分之差把已经下过的同档资源再下一遍。
+# 所以改成在排序出口补一层：档位仍是最强排序键，同档位内免费优先，其余维持宿主原序
+# （做种数、站点、发布时间等）。
+FREE_TARGET_MODULE = "app.application.torrent.download"
+FREE_TARGET_CLASS = "TorrentHelper"
+FREE_TARGET_METHOD = "sort_torrents"
+_FREE_STATE: Dict[str, Any] = {
+    "enabled": False,
+    "installed": False,
+    "original": None,
+    # 本次进程内排序被调用次数 / 免费资源被提到同档付费资源前面的次数
+    "calls": 0,
+    "promoted": 0,
+}
+_FREE_LOCK = threading.Lock()
+
+
+def _free_context_title(context: Any) -> str:
+    """取候选所属作品的标题（宿主排序的第一主键，用来切「同一作品」的连续段）。"""
+    media = getattr(context, "media_info", None)
+    title = getattr(media, "title", None) if media is not None else None
+    if title:
+        return str(title)
+    meta = getattr(context, "meta_info", None)
+    name = getattr(meta, "name", None) if meta is not None else None
+    return str(name or "")
+
+
+def _free_context_priority(context: Any) -> int:
+    """候选的档位（宿主规则阶梯产出的 pri_order，0 表示这一批没跑规则）。"""
+    torrent = getattr(context, "torrent_info", None)
+    try:
+        return int(getattr(torrent, "pri_order", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_free_context(context: Any) -> bool:
+    """下载倍率为 0 才算免费；0.5 是半价、仍然计下载量，按付费处理。"""
+    torrent = getattr(context, "torrent_info", None)
+    factor = getattr(torrent, "downloadvolumefactor", None)
+    if factor is None:
+        return False
+    try:
+        return abs(float(factor)) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _prefer_free_order(contexts: List[Any]) -> List[Any]:
+    """同档位内免费优先，档位本身仍是最强排序键。
+
+    宿主排序的第一主键是作品标题（定宽补齐），同一作品必然是连续的一段；
+    这里仍按标题显式分组（不依赖连续性），输出时保持「各标题首次出现的先后」，
+    因此不会把不同作品交叉打乱，也不会改变作品之间的相对顺序。
+    组内按（档位倒序, 免费优先）稳定排序：宿主原有的其余顺序（做种数、站点等）保留。
+
+    只在组内确实存在非零档位时才重排 —— 没跑规则时 pri_order 全是 0，
+    一味把免费往前挪会把 720p 免费顶到 2160p 付费前面。
+    """
+    if not contexts:
+        return contexts
+    groups: Dict[str, List[Any]] = {}
+    order: List[str] = []
+    for item in contexts:
+        title = _free_context_title(item)
+        if title not in groups:
+            groups[title] = []
+            order.append(title)
+        groups[title].append(item)
+
+    ordered: List[Any] = []
+    promoted = 0
+    for title in order:
+        block = groups[title]
+        if any(_free_context_priority(item) > 0 for item in block):
+            block = sorted(
+                block,
+                key=lambda item: (-_free_context_priority(item), 0 if _is_free_context(item) else 1),
+            )
+            free_by_tier: Dict[int, int] = {}
+            paid_by_tier: Dict[int, int] = {}
+            for item in block:
+                tier = _free_context_priority(item)
+                bucket = free_by_tier if _is_free_context(item) else paid_by_tier
+                bucket[tier] = bucket.get(tier, 0) + 1
+            promoted += sum(count * paid_by_tier.get(tier, 0) for tier, count in free_by_tier.items())
+        ordered.extend(block)
+    if promoted:
+        _FREE_STATE["promoted"] = int(_FREE_STATE.get("promoted") or 0) + promoted
+        logger.debug(f"[PlaybackBestVersion] 排序时把 {promoted} 个免费候选提到了同档付费资源前面")
+    return ordered
+
+
+def _install_free_patch() -> bool:
+    """安装「同档位免费优先」排序补丁（幂等）。"""
+    with _FREE_LOCK:
+        if _FREE_STATE.get("installed"):
+            return True
+        try:
+            module = __import__(FREE_TARGET_MODULE, fromlist=[FREE_TARGET_CLASS])
+            owner = getattr(module, FREE_TARGET_CLASS)
+        except Exception as err:
+            logger.error(f"[PlaybackBestVersion] 找不到宿主种子排序模块，免费优先未启用：{err}")
+            return False
+
+        descriptor = inspect.getattr_static(owner, FREE_TARGET_METHOD, None)
+        original = getattr(owner, FREE_TARGET_METHOD, None)
+        if not callable(original):
+            logger.error("[PlaybackBestVersion] 宿主种子排序方法不存在，免费优先未启用")
+            return False
+        if getattr(original, "_pbs_free", False):
+            # 热重载后旧 wrapper 的闭包仍指向旧模块的 _FREE_STATE，新开关它读不到，
+            # 所以这里退回真正的宿主函数，再用当前模块重新包一层。
+            original = getattr(original, "_pbs_free_original", original)
+        is_static = isinstance(descriptor, staticmethod)
+
+        def wrapper(torrent_list, *args, **kwargs):
+            ordered = original(torrent_list, *args, **kwargs)
+            if not _FREE_STATE.get("enabled") or not ordered:
+                return ordered
+            try:
+                _FREE_STATE["calls"] = int(_FREE_STATE.get("calls") or 0) + 1
+                return _prefer_free_order(list(ordered))
+            except Exception as err:
+                logger.debug(f"[PlaybackBestVersion] 免费优先排序异常（按宿主原序）：{err}")
+                return ordered
+
+        wrapper.__name__ = getattr(original, "__name__", FREE_TARGET_METHOD)
+        wrapper.__doc__ = getattr(original, "__doc__", None)
+        wrapper._pbs_free = True
+        wrapper._pbs_free_original = original
+        setattr(owner, FREE_TARGET_METHOD, staticmethod(wrapper) if is_static else wrapper)
+        _FREE_STATE.update(
+            installed=True,
+            original=staticmethod(original) if is_static else original,
+        )
+        logger.info("[PlaybackBestVersion] 已安装「同档位免费优先」排序补丁")
+        return True
+
+
+def _uninstall_free_patch() -> None:
+    """还原宿主排序入口（插件停用或关闭免费优先时调用）。"""
+    with _FREE_LOCK:
+        if not _FREE_STATE.get("installed"):
+            return
+        descriptor = _FREE_STATE.get("original")
+        try:
+            module = __import__(FREE_TARGET_MODULE, fromlist=[FREE_TARGET_CLASS])
+            owner = getattr(module, FREE_TARGET_CLASS)
+            if descriptor is not None:
+                setattr(owner, FREE_TARGET_METHOD, descriptor)
+                logger.info("[PlaybackBestVersion] 已卸载「同档位免费优先」排序补丁")
+        except Exception as err:
+            logger.warning(f"[PlaybackBestVersion] 卸载免费优先补丁失败：{err}")
+        finally:
+            _FREE_STATE.update(installed=False, original=None)
+
+
+def _free_fake_contexts(name: str = "示例剧集") -> List[Any]:
+    """构造一组假候选：同档付费（做种多）/ 同档免费（做种少）/ 低档免费（做种最多）。
+
+    做种数刻意这样排，是为了证明「免费优先」压得住做种数，但压不住档位。
+    """
+
+    class _Torrent:
+        def __init__(self, tag: str, priority: int, factor: Optional[float], seeders: int = 10):
+            self.title = tag
+            self.pri_order = priority
+            self.downloadvolumefactor = factor
+            self.seeders = seeders
+            self.site_name = "示例站"
+            self.site_order = 0
+            self.size = 0
+            self.description = ""
+
+    class _Named:
+        def __init__(self, title: str):
+            self.name = title
+            self.title = title
+            self.season_list = [1]
+            self.episode_list = [1]
+            self.season_episode = "S01E01"
+            self.title_year = title
+
+    class _Context:
+        def __init__(self, tag: str, priority: int, factor: Optional[float], seeders: int = 10):
+            self.torrent_info = _Torrent(tag, priority, factor, seeders)
+            self.meta_info = _Named(name)
+            self.media_info = _Named(name)
+
+    return [
+        _Context("2160p REMUX 付费(300做种)", 100, 1.0, 300),
+        _Context("1080p WEB 免费(500做种)", 89, 0.0, 500),
+        _Context("2160p REMUX 免费(20做种)", 100, 0.0, 20),
+    ]
+
+
+def _free_describe(contexts: List[Any]) -> List[Dict[str, Any]]:
+    """把排序结果转成可读行（顺序 / 资源 / 档位 / 是否免费）。"""
+    return [
+        {
+            "顺序": position + 1,
+            "资源": str(getattr(getattr(item, "torrent_info", None), "title", "") or ""),
+            "档位": _free_context_priority(item),
+            "免费": _is_free_context(item),
+        }
+        for position, item in enumerate(contexts)
+    ]
+
+
+def _free_order_sample() -> List[Dict[str, Any]]:
+    """用假候选跑一遍插件侧排序（不碰真实数据，也不计入统计）。"""
+    before = int(_FREE_STATE.get("promoted") or 0)
+    try:
+        return _free_describe(_prefer_free_order(_free_fake_contexts()))
+    finally:
+        _FREE_STATE["promoted"] = before
+
+
+def _free_real_sort_sample() -> Dict[str, Any]:
+    """在宿主进程内用假候选走一遍真实排序入口，确认补丁装的是当前代码且真的生效。"""
+    try:
+        module = __import__(FREE_TARGET_MODULE, fromlist=[FREE_TARGET_CLASS])
+        helper = getattr(module, FREE_TARGET_CLASS)()
+        ordered = helper.sort_torrents(list(_free_fake_contexts()))
+        patched = bool(getattr(getattr(module, FREE_TARGET_CLASS).sort_torrents, "_pbs_free", False))
+    except Exception as err:
+        return {"ok": False, "error": str(err)}
+    return {"ok": True, "patched": patched, "order": _free_describe(ordered)}
+
+
 def _wash_notice_sample() -> Dict[str, Any]:
     """详情页/接口用的示例，验证标注效果（不发送通知）。"""
 
@@ -1098,11 +1339,12 @@ class PlaybackBestVersion(_PluginBase):
     # 插件描述
     plugin_desc = "按媒体服务器的播放进度决定订阅是否继续洗版：已看过的剧集/电影不再重复洗版；" \
                   "并把「这次是洗版」作为模板变量 is_wash / wash_text 送进下载通知与入库通知，" \
-                  "可在通知模板里自行排版（不写模板则自动加【洗版】标记），同时拦截同一资源的重复下载记账与重复通知。"
+                  "可在通知模板里自行排版（不写模板则自动加【洗版】标记）；" \
+                  "洗版时同档位优先挑免费资源（实在没有免费的才下付费的），同时拦截同一资源的重复下载记账与重复通知。"
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.9.0"
+    plugin_version = "3.10.0"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -1189,6 +1431,8 @@ class PlaybackBestVersion(_PluginBase):
         # 重复下载去重：是否启用、判定窗口（小时）
         self._dedupe_download = True
         self._dedupe_window = DEDUPE_DEFAULT_WINDOW
+        # 洗版免费优先：同档位候选里先挑免费的
+        self._prefer_free = True
 
     def init_plugin(self, config: dict = None):
         """初始化插件：读取配置、按需立即运行一次，并启动定时调度。
@@ -1254,6 +1498,14 @@ class PlaybackBestVersion(_PluginBase):
         else:
             _uninstall_dedupe_patch()
 
+        # 洗版免费优先：默认开启（同档位内免费优先，跨档位仍按画质/音轨）
+        self._prefer_free = bool(config.get("prefer_free", True))
+        _FREE_STATE["enabled"] = bool(self._enabled and self._prefer_free)
+        if self._enabled and self._prefer_free:
+            _install_free_patch()
+        else:
+            _uninstall_free_patch()
+
         # 恢复上次执行结果，让详情页在重启后仍有内容
         self._last_run = self.get_data("last_run") or {}
 
@@ -1303,6 +1555,13 @@ class PlaybackBestVersion(_PluginBase):
                 "description": "按当前配置扫描一遍订阅与播放进度，返回本轮执行摘要",
             },
             {
+                "path": "/freepick",
+                "endpoint": self.api_freepick,
+                "methods": ["GET"],
+                "summary": "查看洗版免费优先状态",
+                "description": "返回排序补丁是否已安装、本次进程内的统计，以及一段示例排序结果",
+            },
+            {
                 "path": "/washmark",
                 "endpoint": self.api_washmark,
                 "methods": ["GET"],
@@ -1317,6 +1576,20 @@ class PlaybackBestVersion(_PluginBase):
                 "description": "返回去重补丁是否已安装、判定窗口，以及本次进程内已拦截的重复下载次数",
             },
         ]
+
+    def api_freepick(self) -> Dict[str, Any]:
+        """插件 API：洗版「同档位免费优先」状态与示例。"""
+        return {
+            "enabled": bool(self._prefer_free),
+            "patched": bool(_FREE_STATE.get("installed")),
+            "active": bool(_FREE_STATE.get("enabled")),
+            "calls": int(_FREE_STATE.get("calls") or 0),
+            "promoted": int(_FREE_STATE.get("promoted") or 0),
+            "order": "档位（4K REMUX > 4K > 1080P…）优先 → 同档位免费优先 → 宿主原有顺序（做种数等）",
+            "free_rule": "downloadvolumefactor == 0 才算免费；0.5（半价）按付费处理",
+            "sample": _free_order_sample(),
+            "real_sort": _free_real_sort_sample(),
+        }
 
     def api_dedupe(self) -> Dict[str, Any]:
         """插件 API：重复下载去重补丁状态。"""
@@ -1412,7 +1685,8 @@ class PlaybackBestVersion(_PluginBase):
                             {
                                 "component": "div",
                                 "props": {"style": "max-width: 960px; margin: 0 auto"},
-                                "html": self._summary_html(last) + self._notice_html() + self._dedupe_html(),
+                                "html": self._summary_html(last) + self._free_html()
+                                + self._notice_html() + self._dedupe_html(),
                             }
                         ],
                     }
@@ -1565,6 +1839,37 @@ class PlaybackBestVersion(_PluginBase):
 
         return _row(dot, text, detail) + _row(org_dot, org_text, org_detail)
 
+    def _free_html(self) -> str:
+        """摘要上方的洗版免费优先状态条。"""
+        patched = bool(_FREE_STATE.get("installed"))
+        active = bool(_FREE_STATE.get("enabled"))
+        if patched and active:
+            dot, text = "#43A047", "洗版免费优先：已生效"
+        elif active:
+            dot, text = "#FB8C00", "洗版免费优先：已启用但补丁未装（看日志）"
+        else:
+            dot, text = "#757575", "洗版免费优先：未启用"
+        promoted = int(_FREE_STATE.get("promoted") or 0)
+        calls = int(_FREE_STATE.get("calls") or 0)
+        if not self._prefer_free:
+            detail = "同档位仍按宿主原顺序挑（可能选中计费资源）"
+        else:
+            detail = "档位优先 → 同档位免费优先 → 原有顺序"
+            if calls:
+                detail += " · 已排序 %d 次" % calls
+            if promoted:
+                detail += " · 提升免费 %d 次" % promoted
+        return (
+            '<div style="display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;'
+            'padding:6px 12px;border-radius:8px;font-size:13px;line-height:1.6;margin-top:6px;'
+            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.8)">'
+            f'<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:{dot};display:inline-block"></span>'
+            f'{escape(text)}</span>'
+            f'<span style="white-space:nowrap;opacity:.75">{escape(detail)}</span></div>'
+        )
+
     def _dedupe_html(self) -> str:
         """摘要下方的重复下载去重状态条。"""
         patched = bool(_DEDUPE_STATE.get("installed"))
@@ -1606,7 +1911,9 @@ class PlaybackBestVersion(_PluginBase):
                 logger.error(f"{self.LOG_TAG}停止调度器失败：{err}")
         self._scheduler = None
         _uninstall_notice_patch()
+        _uninstall_organize_patch()
         _uninstall_dedupe_patch()
+        _uninstall_free_patch()
 
     def get_form(self) -> List[dict]:
         """插件配置页面（Vuetify JSON 配置），返回 (表单, 默认值)。"""
@@ -2050,6 +2357,44 @@ class PlaybackBestVersion(_PluginBase):
                                             "placeholder": f"默认 {DEDUPE_DEFAULT_WINDOW}；超过窗口的同一种子视为删了重下",
                                         },
                                     }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "title": "洗版免费优先",
+                                            "text": "宿主的规则阶梯只表达画质/音轨档位，同档位里挑谁下载完全看种子排序"
+                                                    "（做种数、站点等），免费与否不参与 —— 所以经常挑了要计下载量的那个。"
+                                                    "开启后：档位仍是最强排序键（4K REMUX 不会输给免费的 1080P），"
+                                                    "同一档位内免费的排前面，实在没有免费的才退回去下付费的。"
+                                                    "只对跑过规则阶梯的搜索结果生效（即洗版搜索），首次下载的搜索结果不受影响。"
+                                                    "判定依据是站点给的下载倍率，0 才算免费，0.5（半价）仍按付费处理；"
+                                                    "站点没给倍率的种子按付费处理。",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "prefer_free", "label": "同档位免费优先"}}
                                 ],
                             },
                         ],
@@ -3270,6 +3615,7 @@ class PlaybackBestVersion(_PluginBase):
             "organize_wash_hours": self._organize_window,
             "dedupe_download": self._dedupe_download,
             "dedupe_window_hours": self._dedupe_window,
+            "prefer_free": self._prefer_free,
         }
 
     @staticmethod
