@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| 播放进度洗版 (PlaybackBestVersion) | 3.6.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版；洗版触发的下载通知加【洗版】标记 |
+| 播放进度洗版 (PlaybackBestVersion) | 3.7.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版；下载通知加【洗版】标记；拦截同一种子的重复下载与重复通知 |
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
 | 豆瓣书影音档案 (DouBanWatching) | 1.9.20 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
@@ -70,6 +70,17 @@ id=HDAUDIO  name=高清音轨  include=TrueHD|DTS[- .]?HD|DTS[- .]?X|LPCM|Atmos|
 - 详情页摘要条下方显示标注状态（已生效 / 已启用但补丁未装 / 未启用），插件接口 `GET /api/v1/plugin/PlaybackBestVersion/washmark?apikey=…` 返回补丁状态与示例。
 
 实现方式仍是运行期包一层宿主 `DownloadProcessingOwner._build_download_notification`：通知模板渲染时拿不到「这次是不是洗版」，而它的调用方（下载历史记录方法）局部变量里有 `context`，用 `sys._getframe` 往上取 `context.subscription_download` 即可。插件停用或关掉标注会立刻还原宿主方法，不写任何数据、不阻断下载。
+
+## 重复下载去重（v3.7.0 新增）
+
+宿主的洗版门槛只在**入库完成**时写回，从「开始下载」到「入库」之间再跑一轮洗版搜索时，同一批集会被重新命中同一个种子；而 Transmission / qBittorrent 对重复种子不报错、只返回已有任务，宿主于是又记一条下载历史、再发一条通知（下载器里其实只有一份）。
+
+插件包住宿主结算入口 `DownloadHistoryOwner._settle_download_success`：同 `download_hash` 在窗口期（默认 6 小时，可配 1~72）内已记录过、且那次记录的集范围覆盖本次要下的集，就把结算参数改成宿主的 `already_exists=True`——**不重复通知、不重复记文件明细**，并触发宿主自带的重复资源退避。
+
+- 真升级到更高档（不同种子、不同 hash）正常放行；
+- 同一个整包换集补下（集数没被覆盖）正常放行；
+- 窗口外的同一种子（手动删了重下）正常放行；
+- 状态见详情页摘要下方状态条与 `GET /api/v1/plugin/PlaybackBestVersion/dedupe?apikey=…`。
 
 ## Webhook 即时触发（v3.3.0 新增）
 

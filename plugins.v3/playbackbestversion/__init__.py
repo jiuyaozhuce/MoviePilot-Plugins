@@ -299,6 +299,158 @@ def _uninstall_notice_patch() -> None:
             _NOTICE_STATE.update(installed=False, original=None)
 
 
+# ---- 重复下载去重（同一个种子被宿主重复记账、重复发通知）----
+# 宿主的洗版门槛（episode_priority / current_priority）只在「入库完成」时才写回，
+# 从「开始下载」到「入库」之间如果再跑一轮洗版搜索，同一批集会再次命中同一个种子。
+# 而 Transmission 遇到重复种子时并不报错，只是把已存在的任务对象返回，
+# 宿主据此认为「添加成功」→ 又记一条下载历史、再发一条通知（下载器里其实只有一份）。
+# 这里在结算入口拦一层：同 hash 的资源在窗口期内已经被记录、且覆盖了本次要的集，
+# 就直接按宿主的「任务已存在」口径结算 —— 不重复通知、不重复记文件，并让宿主
+# 自带的重复资源退避生效（后续几轮不再挑这个资源）。
+DEDUPE_TARGET_MODULE = "app.chain.download.history"
+DEDUPE_TARGET_CLASS = "DownloadHistoryOwner"
+DEDUPE_TARGET_METHOD = "_settle_download_success"
+# 判定窗口（小时）：窗口外的同 hash 记录视为「用户自己删了重新下」，不拦
+DEDUPE_DEFAULT_WINDOW = 6
+_EPISODE_TEXT_RE = re.compile(r"E?(\d+)(?:\s*-\s*E?(\d+))?")
+_DEDUPE_STATE: Dict[str, Any] = {
+    "enabled": False,
+    "window_hours": DEDUPE_DEFAULT_WINDOW,
+    "installed": False,
+    "original": None,
+    "blocked": 0,
+}
+_DEDUPE_LOCK = threading.Lock()
+
+
+def _parse_episode_text(text: Any) -> set:
+    """把下载历史里的集范围文本解析成集号集合（"E23-E24" / "E35" / "E1,E3-E5"）。"""
+    if not text or not isinstance(text, str):
+        return set()
+    numbers = set()
+    for match in _EPISODE_TEXT_RE.finditer(text):
+        begin = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else begin
+        if end < begin:
+            begin, end = end, begin
+        numbers.update(range(begin, end + 1))
+    return numbers
+
+
+def _recent_download_episodes(download_hash: str, window_hours: int) -> Optional[List[Optional[str]]]:
+    """查窗口期内同 hash 的下载历史的集范围文本；没有记录返回 None。"""
+    if not download_hash:
+        return None
+    cutoff = (datetime.datetime.now() - datetime.timedelta(hours=max(1, window_hours))) \
+        .strftime("%Y-%m-%d %H:%M:%S")
+    from sqlalchemy import select
+
+    from app.db.models.downloadhistory import DownloadHistory
+    from app.db.session import SessionFactory
+
+    session = SessionFactory()
+    try:
+        rows = session.execute(
+            select(DownloadHistory.episodes).where(
+                DownloadHistory.download_hash == download_hash,
+                DownloadHistory.date >= cutoff,
+            ).order_by(DownloadHistory.id.desc())
+        ).scalars().all()
+    finally:
+        session.close()
+    return list(rows) if rows else None
+
+
+def _is_duplicate_download(download_hash: Any, episodes: Any, window_hours: int) -> bool:
+    """同一个种子在窗口期内已经记过、且覆盖了本次要的集 → 判定为重复下载。"""
+    if not isinstance(download_hash, str) or not download_hash:
+        return False
+    rows = _recent_download_episodes(download_hash, window_hours)
+    if not rows:
+        return False
+    requested = set()
+    for episode in episodes or []:
+        try:
+            requested.add(int(episode))
+        except (TypeError, ValueError):
+            continue
+    for row_text in rows:
+        covered = _parse_episode_text(row_text)
+        if not requested:
+            # 电影或整包：同一个种子在窗口内记过就是重复
+            if not covered:
+                return True
+            continue
+        if covered and requested.issubset(covered):
+            return True
+    return False
+
+
+def _install_dedupe_patch() -> bool:
+    """安装重复下载去重补丁（幂等）。"""
+    with _DEDUPE_LOCK:
+        if _DEDUPE_STATE.get("installed"):
+            return True
+        try:
+            module = __import__(DEDUPE_TARGET_MODULE, fromlist=[DEDUPE_TARGET_CLASS])
+            owner = getattr(module, DEDUPE_TARGET_CLASS)
+        except Exception as err:
+            logger.error(f"[PlaybackBestVersion] 找不到宿主下载结算模块，重复下载去重未启用：{err}")
+            return False
+
+        original = getattr(owner, DEDUPE_TARGET_METHOD, None)
+        if not callable(original):
+            logger.error("[PlaybackBestVersion] 宿主下载结算方法不存在，重复下载去重未启用")
+            return False
+        if getattr(original, "_pbs_dedupe", False):
+            _DEDUPE_STATE.update(installed=True, original=getattr(original, "_pbs_dedupe_original", original))
+            logger.info("[PlaybackBestVersion] 重复下载去重补丁已存在，跳过重复安装")
+            return True
+
+        def wrapper(self, *args, **kwargs):
+            try:
+                if _DEDUPE_STATE.get("enabled") and not kwargs.get("already_exists"):
+                    window = int(_DEDUPE_STATE.get("window_hours") or DEDUPE_DEFAULT_WINDOW)
+                    if _is_duplicate_download(kwargs.get("download_hash"), kwargs.get("episodes"), window):
+                        kwargs["already_exists"] = True
+                        _DEDUPE_STATE["blocked"] = int(_DEDUPE_STATE.get("blocked") or 0) + 1
+                        torrent = kwargs.get("torrent")
+                        title = getattr(torrent, "title", "") or kwargs.get("download_hash")
+                        logger.info(
+                            f"[PlaybackBestVersion] 拦截重复下载（{window} 小时内同一种子已记录）：{title}"
+                        )
+            except Exception as err:
+                logger.debug(f"[PlaybackBestVersion] 重复下载判定异常（忽略）：{err}")
+            return original(self, *args, **kwargs)
+
+        wrapper.__name__ = getattr(original, "__name__", DEDUPE_TARGET_METHOD)
+        wrapper.__doc__ = getattr(original, "__doc__", None)
+        wrapper._pbs_dedupe = True
+        wrapper._pbs_dedupe_original = original
+        setattr(owner, DEDUPE_TARGET_METHOD, wrapper)
+        _DEDUPE_STATE.update(installed=True, original=original)
+        logger.info("[PlaybackBestVersion] 已安装重复下载去重补丁")
+        return True
+
+
+def _uninstall_dedupe_patch() -> None:
+    """还原宿主结算入口（插件停用或关闭去重时调用）。"""
+    with _DEDUPE_LOCK:
+        if not _DEDUPE_STATE.get("installed"):
+            return
+        original = _DEDUPE_STATE.get("original")
+        try:
+            module = __import__(DEDUPE_TARGET_MODULE, fromlist=[DEDUPE_TARGET_CLASS])
+            owner = getattr(module, DEDUPE_TARGET_CLASS)
+            if callable(original):
+                setattr(owner, DEDUPE_TARGET_METHOD, original)
+                logger.info("[PlaybackBestVersion] 已卸载重复下载去重补丁")
+        except Exception as err:
+            logger.warning(f"[PlaybackBestVersion] 卸载重复下载去重补丁失败：{err}")
+        finally:
+            _DEDUPE_STATE.update(installed=False, original=None)
+
+
 def _wash_notice_sample() -> Dict[str, Any]:
     """详情页/接口用的示例，验证标注效果（不发送通知）。"""
 
@@ -326,11 +478,11 @@ class PlaybackBestVersion(_PluginBase):
     plugin_name = "播放进度洗版"
     # 插件描述
     plugin_desc = "按媒体服务器的播放进度决定订阅是否继续洗版：已看过的剧集/电影不再重复洗版；" \
-                  "并在洗版触发的下载通知上加【洗版】标记。"
+                  "并在洗版触发的下载通知上加【洗版】标记，同时拦截同一资源的重复下载记账与重复通知。"
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.6.0"
+    plugin_version = "3.7.0"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -410,6 +562,9 @@ class PlaybackBestVersion(_PluginBase):
         self._mark_wash = True
         self._mark_prefix = NOTICE_PREFIX
         self._mark_detail = True
+        # 重复下载去重：是否启用、判定窗口（小时）
+        self._dedupe_download = True
+        self._dedupe_window = DEDUPE_DEFAULT_WINDOW
 
     def init_plugin(self, config: dict = None):
         """初始化插件：读取配置、按需立即运行一次，并启动定时调度。
@@ -447,6 +602,17 @@ class PlaybackBestVersion(_PluginBase):
             _install_notice_patch()
         else:
             _uninstall_notice_patch()
+
+        # 重复下载去重：默认开启，窗口默认 6 小时
+        self._dedupe_download = bool(config.get("dedupe_download", True))
+        self._dedupe_window = min(72, max(1, self._as_int(
+            config.get("dedupe_window_hours"), DEDUPE_DEFAULT_WINDOW)))
+        _DEDUPE_STATE["enabled"] = bool(self._enabled and self._dedupe_download)
+        _DEDUPE_STATE["window_hours"] = self._dedupe_window
+        if self._enabled and self._dedupe_download:
+            _install_dedupe_patch()
+        else:
+            _uninstall_dedupe_patch()
 
         # 恢复上次执行结果，让详情页在重启后仍有内容
         self._last_run = self.get_data("last_run") or {}
@@ -503,7 +669,24 @@ class PlaybackBestVersion(_PluginBase):
                 "summary": "查看下载通知洗版标注状态",
                 "description": "返回标注补丁是否已安装，以及一条示例标注效果（不发通知）",
             },
+            {
+                "path": "/dedupe",
+                "endpoint": self.api_dedupe,
+                "methods": ["GET"],
+                "summary": "查看重复下载去重状态",
+                "description": "返回去重补丁是否已安装、判定窗口，以及本次进程内已拦截的重复下载次数",
+            },
         ]
+
+    def api_dedupe(self) -> Dict[str, Any]:
+        """插件 API：重复下载去重补丁状态。"""
+        return {
+            "enabled": bool(self._dedupe_download),
+            "patched": bool(_DEDUPE_STATE.get("installed")),
+            "window_hours": int(_DEDUPE_STATE.get("window_hours") or DEDUPE_DEFAULT_WINDOW),
+            "blocked": int(_DEDUPE_STATE.get("blocked") or 0),
+            "flow": "同 hash 且集数已被覆盖 → 按宿主的「任务已存在」口径结算（不重复通知、不重复记文件）",
+        }
 
     def api_washmark(self) -> Dict[str, Any]:
         """插件 API：洗版标注补丁状态与示例。"""
@@ -557,7 +740,7 @@ class PlaybackBestVersion(_PluginBase):
                             {
                                 "component": "div",
                                 "props": {"style": "max-width: 960px; margin: 0 auto"},
-                                "html": self._summary_html(last) + self._notice_html(),
+                                "html": self._summary_html(last) + self._notice_html() + self._dedupe_html(),
                             }
                         ],
                     }
@@ -669,8 +852,33 @@ class PlaybackBestVersion(_PluginBase):
             f'<span style="white-space:nowrap;opacity:.75">前缀 {prefix} · {detail}</span></div>'
         )
 
+    def _dedupe_html(self) -> str:
+        """摘要下方的重复下载去重状态条。"""
+        patched = bool(_DEDUPE_STATE.get("installed"))
+        window = int(_DEDUPE_STATE.get("window_hours") or DEDUPE_DEFAULT_WINDOW)
+        blocked = int(_DEDUPE_STATE.get("blocked") or 0)
+        if patched and self._dedupe_download:
+            dot, text = "#43A047", "重复下载去重：已生效"
+        elif self._dedupe_download:
+            dot, text = "#FB8C00", "重复下载去重：已启用但补丁未装（看日志）"
+        else:
+            dot, text = "#757575", "重复下载去重：未启用"
+        detail = f"窗口 {window} 小时"
+        if blocked:
+            detail += f" · 本次进程已拦 {blocked} 次"
+        return (
+            '<div style="display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;'
+            'padding:6px 12px;border-radius:8px;font-size:13px;line-height:1.6;margin-top:6px;'
+            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.8)">'
+            f'<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:{dot};display:inline-block"></span>'
+            f'{escape(text)}</span>'
+            f'<span style="white-space:nowrap;opacity:.75">{escape(detail)}</span></div>'
+        )
+
     def stop_service(self):
-        """停用插件时关闭定时调度器、取消 Webhook 去抖任务，并还原下载通知补丁。"""
+        """停用插件时关闭定时调度器、取消 Webhook 去抖任务，并还原宿主方法补丁。"""
         with self._webhook_timer_lock:
             if self._webhook_timer:
                 try:
@@ -685,6 +893,7 @@ class PlaybackBestVersion(_PluginBase):
                 logger.error(f"{self.LOG_TAG}停止调度器失败：{err}")
         self._scheduler = None
         _uninstall_notice_patch()
+        _uninstall_dedupe_patch()
 
     def get_form(self) -> List[dict]:
         """插件配置页面（Vuetify JSON 配置），返回 (表单, 默认值)。"""
@@ -1003,6 +1212,56 @@ class PlaybackBestVersion(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {"component": "VSwitch", "props": {"model": "mark_detail", "label": "正文注明升级集数"}}
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "title": "重复下载去重",
+                                            "text": "宿主的洗版门槛只在入库完成时写回，从「开始下载」到「入库」之间如果再跑一轮"
+                                                    "洗版，同一批集会再次命中同一个种子；而下载器对重复种子并不报错，只会返回已有任务，"
+                                                    "宿主于是又记一条下载历史、再发一条通知。开启后，同一种子（hash 相同）在窗口期内"
+                                                    "已记录过、且覆盖了本次要的集，就按宿主的「任务已存在」口径结算：不重复通知、"
+                                                    "不重复记文件，并触发宿主自带的重复资源退避。真正升级到更高档的不同种子不受影响。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "dedupe_download", "label": "拦截重复下载"}}
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "dedupe_window_hours",
+                                            "label": "判定窗口（小时）",
+                                            "placeholder": f"默认 {DEDUPE_DEFAULT_WINDOW}；超过窗口的同一种子视为删了重下",
+                                        },
+                                    }
                                 ],
                             },
                         ],
@@ -2218,6 +2477,8 @@ class PlaybackBestVersion(_PluginBase):
             "mark_wash": self._mark_wash,
             "mark_prefix": self._mark_prefix,
             "mark_detail": self._mark_detail,
+            "dedupe_download": self._dedupe_download,
+            "dedupe_window_hours": self._dedupe_window,
         }
 
     @staticmethod
