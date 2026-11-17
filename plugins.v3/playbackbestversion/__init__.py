@@ -377,12 +377,21 @@ def _install_render_patch() -> bool:
             logger.error("[PlaybackBestVersion] 宿主模板渲染方法不存在，模板变量注入未启用")
             return False
         if getattr(original, "_pbs_notice_render", False):
-            _NOTICE_STATE.update(
-                render_installed=True,
-                render_original=getattr(original, "_pbs_notice_render_original", original),
-            )
-            logger.info("[PlaybackBestVersion] 模板变量注入补丁已存在，跳过重复安装")
-            return True
+            # 插件热重载后，旧 wrapper 的闭包里引用的是旧模块的 _NOTICE_LOCAL；
+            # 新模块再往里写变量它也读不到 → 这里先还原，再用当前模块重新包装。
+            base = getattr(original, "_pbs_notice_render_original", None)
+            try:
+                current = inspect.getattr_static(owner, NOTICE_RENDER_METHOD)
+            except Exception:
+                current = None
+            if not callable(base):
+                _NOTICE_STATE.update(render_installed=True, render_original=original)
+                logger.info("[PlaybackBestVersion] 模板变量注入补丁已存在，跳过重复安装")
+                return True
+            setattr(owner, NOTICE_RENDER_METHOD,
+                    staticmethod(base) if isinstance(current, staticmethod) else base)
+            original = base
+            logger.info("[PlaybackBestVersion] 用当前插件代码重装模板变量注入补丁")
 
         # 记住原始描述符（静态方法要按 staticmethod 还原，直接赋值会变成实例方法）
         try:
@@ -463,12 +472,17 @@ def _install_notice_patch() -> bool:
             logger.error("[PlaybackBestVersion] 宿主下载通知方法不存在，洗版标注未启用")
             return False
         if getattr(original, "_pbs_washmark", False):
-            _NOTICE_STATE.update(
-                installed=True, original=getattr(original, "_pbs_washmark_original", original)
-            )
-            logger.info("[PlaybackBestVersion] 洗版标注补丁已存在，跳过重复安装")
-            _install_render_patch()
-            return True
+            # 同上：热重载后旧闭包引用旧模块状态，必须还原后重装才吃得到新配置
+            base = getattr(original, "_pbs_washmark_original", None)
+            if callable(base):
+                setattr(owner, NOTICE_TARGET_METHOD, base)
+                original = base
+                logger.info("[PlaybackBestVersion] 用当前插件代码重装下载通知标注补丁")
+            else:
+                _NOTICE_STATE.update(installed=True, original=original)
+                logger.info("[PlaybackBestVersion] 洗版标注补丁已存在，跳过重复安装")
+                _install_render_patch()
+                return True
 
         def wrapper(self, *args, **kwargs):
             # 先判一次洗版（事实来源是调用方栈里的 context.subscription_download），
@@ -748,10 +762,18 @@ def _install_organize_patch() -> bool:
             logger.error("[PlaybackBestVersion] 宿主入库通知方法不存在，入库标注未启用")
             return False
         if getattr(original, "_pbs_orgmark", False):
-            _ORG_STATE.update(installed=True, original=getattr(original, "_pbs_orgmark_original", original))
-            logger.info("[PlaybackBestVersion] 入库标注补丁已存在，跳过重复安装")
-            _install_render_patch()
-            return True
+            # 关键：热重载后旧 wrapper 读的是旧模块的 _ORG_STATE / _NOTICE_LOCAL，
+            # 新模块写的变量它看不到（表现为入库通知不再标注）。先还原再重装。
+            base = getattr(original, "_pbs_orgmark_original", None)
+            if callable(base):
+                setattr(owner, ORG_TARGET_METHOD, base)
+                original = base
+                logger.info("[PlaybackBestVersion] 用当前插件代码重装入库通知标注补丁")
+            else:
+                _ORG_STATE.update(installed=True, original=original)
+                logger.info("[PlaybackBestVersion] 入库标注补丁已存在，跳过重复安装")
+                _install_render_patch()
+                return True
 
         setattr(owner, ORG_TARGET_METHOD, _create_organize_patch(owner, original))
         _ORG_STATE.update(installed=True, original=original)
@@ -988,6 +1010,52 @@ class _ProbeInfo:
         self.episodes = list(episodes)
 
 
+def _render_organize_preview(submission: Dict[str, Any]) -> Dict[str, Any]:
+    """用宿主的渲染入口跑一次真实渲染（不发通知），验证变量注入 + 模板排版。"""
+    from app.application.messaging.message import MessageTemplateHelper
+    from app.schemas.message import Message
+    from app.schemas.types import ContentType, MessageType
+
+    message = Message(mtype=MessageType.Organize, ctype=ContentType.OrganizeSuccess)
+    values = _wash_template_vars(submission)
+    prev_vars = getattr(_NOTICE_LOCAL, "vars", None)
+    prev_direct = getattr(_NOTICE_LOCAL, "direct", None)
+    try:
+        _NOTICE_LOCAL.vars = values or None
+        _NOTICE_LOCAL.direct = (submission, ORG_TEMPLATE_KEY)
+        rendered = MessageTemplateHelper.render(
+            message,
+            title_year="谷雨 (2026)",
+            season_episode="S01 E19-E22",
+            type="电视剧",
+            resource_term="2160p DV",
+            file_count=4,
+            total_size="12.3 GB",
+        )
+    finally:
+        _NOTICE_LOCAL.vars = prev_vars
+        _NOTICE_LOCAL.direct = prev_direct
+    return {
+        "title": getattr(rendered, "title", "") or "",
+        "text": getattr(rendered, "text", "") or "",
+    }
+
+
+def _organize_patch_is_fresh() -> bool:
+    """补丁 wrapper 是否由「当前这版插件代码」安装。
+
+    插件热重载会重建模块，而类上挂着的旧 wrapper 闭包里引用的仍是旧模块的
+    _ORG_STATE / _NOTICE_LOCAL —— 旧代码读不到新模块写的变量，表现为通知不再标注。
+    这里用 wrapper 的 __globals__ 是否等于本模块命名空间来判定。
+    """
+    try:
+        module = __import__(ORG_TARGET_MODULE, fromlist=[ORG_TARGET_CLASS])
+        wrapper = getattr(getattr(module, ORG_TARGET_CLASS), ORG_TARGET_METHOD)
+        return getattr(wrapper, "__globals__", None) is globals()
+    except Exception:
+        return False
+
+
 def _probe_organize_wash(media_id: str, season: Optional[int], episodes: List[int]) -> Dict[str, Any]:
     """用给定的媒体/季/集现场跑一遍入库洗版判定，返回可读结论（不发送通知）。"""
     meta = _ProbeMeta(media_id, season, episodes)
@@ -1002,7 +1070,7 @@ def _probe_organize_wash(media_id: str, season: Optional[int], episodes: List[in
         submission = _find_organize_wash(meta, info)
     except Exception as err:
         return {"ok": False, "error": str(err), "records": len(records)}
-    return {
+    result: Dict[str, Any] = {
         "ok": True,
         "enabled": bool(_ORG_STATE.get("enabled")),
         "window_hours": window,
@@ -1011,6 +1079,12 @@ def _probe_organize_wash(media_id: str, season: Optional[int], episodes: List[in
         "match": submission or {},
         "sample": _wash_organize_sample(),
     }
+    if submission:
+        try:
+            result["render"] = _render_organize_preview(submission)
+        except Exception as err:
+            result["render_error"] = str(err)
+    return result
 
 
 class PlaybackBestVersion(_PluginBase):
@@ -1282,6 +1356,7 @@ class PlaybackBestVersion(_PluginBase):
                 "enabled": bool(self._mark_organize),
                 "patched": bool(_ORG_STATE.get("installed")),
                 "active": bool(_ORG_STATE.get("enabled")),
+                "fresh_code": _organize_patch_is_fresh(),
                 "window_hours": int(_ORG_STATE.get("window_hours") or ORG_DEFAULT_WINDOW),
                 "template_key": ORG_TEMPLATE_KEY,
                 "template_driven": _template_uses_wash(ORG_TEMPLATE_KEY),
