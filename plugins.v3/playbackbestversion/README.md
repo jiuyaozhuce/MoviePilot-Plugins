@@ -51,6 +51,9 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 | 立即运行一次 | 关 | 保存配置后约 3 秒执行一轮，跑完自动复位 |
 | 接收 Webhook 触发检查 | 开 | 收到 Emby / Jellyfin 观看状态变更事件时即时触发一轮检查 |
 | 去抖延迟（秒） | 20 | 窗口内多次事件合并为一次检查；0 表示立即 |
+| 启用洗版标注 | 开 | 洗版（升级）触发的下载通知加标题前缀（v3.6.0 并入原 DownloadWashMark） |
+| 标题前缀 | 【洗版】 | 已带该前缀则不重复添加 |
+| 正文注明升级集数 | 开 | 正文首行写 `洗版：升级 E03-E26` / `洗版：全集覆盖` / `洗版：覆盖已有版本` |
 
 ## Webhook 即时触发
 
@@ -89,6 +92,7 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 
 - 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
 - v3.3.0 起由 `jiuyaozhuce` 接管维护并增加 Webhook 即时触发；作者与项目地址改指本仓库，图标改为仓库根目录的 `playbackbestversion.svg`
+- v3.6.0：并入原独立插件「下载通知洗版标注 (DownloadWashMark)」。洗版（升级）触发的下载通知加标题前缀【洗版】，正文首行写明升级了哪些集；配置页新增「启用洗版标注 / 标题前缀 / 正文注明升级集数」，详情页摘要下方显示标注状态，接口新增 `/washmark`。补丁只在 `submission_type=upgrade` 时动手，停用插件或关掉标注即刻还原宿主方法，不写任何数据。原插件删库，配置沿用默认值无需迁移
 - v3.5.0：方块条新增橙色「洗过版·未到顶」；依据下载历史 note.subscription_download 的 submission_type=upgrade 判定，与「已下载未洗」「已洗到顶」区分，摘要同步给出三段统计
 - v3.4.3：修复看板停留在旧数据（页面读到重复初始化出的旧实例内存快照），改为与持久化的 last_run 取较新的一份
 - v3.4.2：折叠清单改为两行式（标题 / 类型·日期），长订阅名不再折行错位，列宽 240px

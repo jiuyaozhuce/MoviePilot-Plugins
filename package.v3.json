@@ -60,9 +60,9 @@
   },
   "PlaybackBestVersion": {
     "name": "播放进度洗版",
-    "description": "按媒体服务器（Emby / Jellyfin）的分集播放进度决定订阅是否继续洗版：进度达到阈值（或播过、或标记已看）的集写成洗版完成优先级，宿主不再为它搜索更高版本；电影命中则整部停止洗版。支持多服务器、多用户合并、Webhook 即时触发、试运行与通知。",
-    "labels": "订阅,洗版,媒体服务器,Emby,Jellyfin,Webhook",
-    "version": "3.5.0",
+    "description": "按媒体服务器（Emby / Jellyfin）的分集播放进度决定订阅是否继续洗版：进度达到阈值（或播过、或标记已看）的集写成洗版完成优先级，宿主不再为它搜索更高版本；电影命中则整部停止洗版；洗版触发的下载通知加【洗版】标记并注明升级了哪些集。支持多服务器、多用户合并、Webhook 即时触发、试运行与通知。",
+    "labels": "订阅,洗版,媒体服务器,Emby,Jellyfin,Webhook,通知标注",
+    "version": "3.6.0",
     "icon": "playbackbestversion.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -71,6 +71,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v3.6.0": "并入原「下载通知洗版标注 (DownloadWashMark)」插件：洗版（升级）触发的下载通知自动加标题前缀【洗版】，正文首行写明「洗版：升级 E03-E26 / 全集覆盖 / 覆盖已有版本」，首次订阅的下载不受影响；配置页新增「启用洗版标注 / 标题前缀 / 正文注明升级集数」三项，详情页摘要下方显示标注状态条，插件接口新增 /washmark 查看补丁状态与示例。原独立插件移除，配置项沿用默认值（【洗版】+ 注明集数），无需迁移。",
       "v3.5.0": "逐集状态条新增橙色方块「洗过版·未到顶」：读取下载历史里 note.subscription_download 的 submission_type=upgrade 记录，把确实洗过版、但优先级还没到 100 的集单独标出来，与「已下载未洗」「已洗到顶」区分；摘要条同步给出「已洗版 / 洗过未到顶 / 待洗」三段统计。",
       "v3.4.3": "修复看板显示旧数据：定时任务与 Webhook 可能跑在插件被重复初始化后的另一份实例上，而详情页拿到的是旧实例的内存快照（实测页面停在 14 小时前的执行结果）；改为与持久化的 last_run 比较时间取较新的一份。摘要条同时增加「已洗版 N 集，待洗 M 集」统计，便于区分「正在洗版」和「已洗到最高档（紫块）」。",
       "v3.4.2": "详情页折叠清单改为「标题一行 + 类型/日期一行」的两行式，列宽回到 240px：并排写时 20 字左右的订阅名会折行、把右侧日期顶到上一行，与相邻项错位；两行式高度统一，窄屏也不挤。",
@@ -85,23 +86,6 @@
       "v3.2.0": "取消「并入洗版管家」的合并提示，恢复为独立插件：按播放进度停止洗版。同时修复通知渠道不生效（配置里存的是宿主通知配置的 type，之前直接传给 post_message 会校验失败、通知被静默丢弃，现在先映射成通知渠道枚举再发送，未知渠道跳过并写日志）；读取播放进度失败（没有可统计的用户 / 找不到对应条目）不再静默跳过，原因会写进日志与详情页。",
       "v3.1.0": "新增合并迁移提示：本插件已并入「洗版管家」，升级后首次加载会发一条通知提醒迁移（只发一次）。本插件保持可用，但不再更新。",
       "v3.0.0": "首个版本：按 Emby / Jellyfin 的分集播放进度决定是否继续洗版——命中的集写入 episode_priority=100（宿主口径的「该集洗版完成」）并按目标集最小值重算 current_priority，电影命中写 current_priority=100 整部停止洗版；支持进度阈值 / 播过即算 / 标记已看三种判定、多服务器多用户合并、试运行与通知。"
-    }
-  },
-  "DownloadWashMark": {
-    "name": "下载通知洗版标注",
-    "description": "订阅洗版（升级）触发下载时，在下载通知标题前加【洗版】标记，并在正文首行注明这次升级了哪些集；首次订阅的下载不受影响。",
-    "labels": "通知,订阅,洗版",
-    "version": "1.0.1",
-    "icon": "downloadwashmark.svg",
-    "author": "jiuyaozhuce",
-    "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
-    "level": 1,
-    "release": false,
-    "system_version": ">=3.0.0",
-    "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
-    "history": {
-      "v1.0.1": "修复详情页报错：模板中的 CSS 百分比（border-radius:50%）与 Python % 格式化冲突，导致 get_page 抛 unsupported format character，详情页返回空对象；改为字符串拼接。表单与洗版标注逻辑不变。",
-      "v1.0.0": "初始版本：按宿主 Context.subscription_download 的 submission_type 判定洗版，给下载通知标题加【洗版】前缀、正文首行注明升级集数（部分集压成 E03-E26）或「全集覆盖」「覆盖已有版本」；运行期包装 DownloadProcessingOwner._build_download_notification，容器重建后插件加载即自动生效，不改宿主文件、不写数据。"
     }
   }
 }

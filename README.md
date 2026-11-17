@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| 播放进度洗版 (PlaybackBestVersion) | 3.5.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版，支持 Webhook 即时触发 |
+| 播放进度洗版 (PlaybackBestVersion) | 3.6.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版；洗版触发的下载通知加【洗版】标记 |
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
 | 豆瓣书影音档案 (DouBanWatching) | 1.9.20 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
@@ -28,11 +28,48 @@ MoviePilot → 设置 → 插件 → 插件仓库 → 新增：
 
 > **历史说明**：原自研插件「EmbyUnwatchedWash（未看洗版）」已移除，同类功能改由本仓库维护的 PlaybackBestVersion 承担（基于上游 [xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) v3.2.0，本仓库增加 Webhook 即时触发并接管维护）。若之前启用过旧插件，它写入订阅表的 `start_episode`、分集 `episode_priority=100` **不会随卸载回滚**，升级后请手动核对订阅状态。
 
+## 洗版规则组（现网配置）
+
+宿主 `BestVersionFilterRuleGroups` 指向下面两个规则组（`systemconfig.UserFilterRuleGroups`）。规则串内**必须用 `>` 分层、单个规则组内写完整个阶梯**；并列多个规则组是串行过滤，会把低档资源直接筛掉。首层 100 分，每降一层减 1；不命中任何层的资源被丢弃。
+
+电视剧（`media_type=电视剧`，最高到 2160p HDR 收工，已看集由 PlaybackBestVersion 写 100）：
+
+```
+4K & HDR > 4K > 1080P & HDR > 1080P
+```
+
+电影（`media_type=电影`，洗到 4K REMUX + 高清音轨）：
+
+```
+4K & REMUX & HDAUDIO > 4K & REMUX > 4K & DOLBY & HDAUDIO > 4K & DOLBY > 4K & HDR & HDAUDIO > 4K & HDR > 4K & HDAUDIO > 4K > 1080P & REMUX > 1080P & BLURAY & HDAUDIO > 1080P & BLURAY > 1080P
+```
+
+画质主序为 REMUX > 杜比视界 > HDR > SDR，音质只在同画质内加分。`HDAUDIO` 是本仓库补的自定义过滤规则（`CustomFilterRules`，内置的 `LOSSLESS` 只认音乐格式）：
+
+```
+id=HDAUDIO  name=高清音轨  include=TrueHD|DTS[- .]?HD|DTS[- .]?X|LPCM|Atmos|Dolby[ .+]?Atmos
+```
+
+电影侧 `current_priority` 由宿主在每次下载后按本轮最高档写入，洗版只接受**严格更高**的档位（`>` 判定），到 100 即停；720P 及以下不在阶梯内，不会被洗版流程下载。
+
+> 改完 `systemconfig` 必须让宿主重载配置：直接 psql 写入不会更新运行期缓存（会与规则 API 的乐观锁打架，报「规则组已被其他请求修改」），要么走 `/api/v1/rule/groups/{name}` PUT，要么重启容器。
+
 ---
 
 # PlaybackBestVersion（播放进度洗版）
 
 按媒体服务器（Emby / Jellyfin）的**分集播放进度**决定订阅是否继续洗版：进度达到阈值（默认 90%）、播过、或标记已看的集写成宿主口径的洗版完成（`episode_priority=100`），后续洗版不再为它搜更高版本；电影命中则整部停止洗版。支持多服务器、多用户合并、试运行与通知。
+
+## 下载通知洗版标注（v3.6.0 并入）
+
+原独立插件「下载通知洗版标注 (DownloadWashMark)」已合并进本插件，配置页第三段「下载通知洗版标注」：
+
+- **启用洗版标注**（默认开）／**标题前缀**（默认 `【洗版】`，已带则不重复加）／**正文注明升级集数**（默认开）
+- 只作用于 `subscription_download.submission_type == "upgrade"` 的下载通知，首次订阅的下载完全不改；
+- 正文首行按洗版形态写：分集洗版 → `洗版：升级 E03-E26`，全集洗版 → `洗版：全集覆盖`，电影 → `洗版：覆盖已有版本`；
+- 详情页摘要条下方显示标注状态（已生效 / 已启用但补丁未装 / 未启用），插件接口 `GET /api/v1/plugin/PlaybackBestVersion/washmark?apikey=…` 返回补丁状态与示例。
+
+实现方式仍是运行期包一层宿主 `DownloadProcessingOwner._build_download_notification`：通知模板渲染时拿不到「这次是不是洗版」，而它的调用方（下载历史记录方法）局部变量里有 `context`，用 `sys._getframe` 往上取 `context.subscription_download` 即可。插件停用或关掉标注会立刻还原宿主方法，不写任何数据、不阻断下载。
 
 ## Webhook 即时触发（v3.3.0 新增）
 

@@ -33,6 +33,7 @@
       run() 按媒体服务器事实决定，因此重复投递无副作用。
 """
 import datetime
+import inspect
 import re
 import threading
 from html import escape
@@ -129,6 +130,191 @@ WEBHOOK_ITEM_TYPES = ("TV", "SHOW", "MOV")
 # 去抖延迟默认值（秒）
 WEBHOOK_DEFAULT_DELAY = 20
 
+# ---- 下载通知洗版标注（原 DownloadWashMark 插件，v3.6.0 并入本插件）----
+# 宿主发出的「洗版（升级）」下载通知和首次订阅的下载通知长得一模一样，看不出在洗版。
+# 宿主的 _build_download_notification 渲染模板时拿不到 Context，
+# 但它的调用方（DownloadHistoryOwner 的记录方法）局部变量里有 context、
+# context.subscription_download 才是「这次是不是洗版」的事实来源，
+# 所以这里在运行期包一层：只加标题前缀和正文首行，不改任何判定与数据。
+NOTICE_PREFIX = "【洗版】"
+NOTICE_TARGET_MODULE = "app.chain.download.processing"
+NOTICE_TARGET_CLASS = "DownloadProcessingOwner"
+NOTICE_TARGET_METHOD = "_build_download_notification"
+# 运行期状态：由 init_plugin 按配置写入，补丁函数共享（多实例时以最后一次配置为准）
+_NOTICE_STATE: Dict[str, Any] = {
+    "prefix": NOTICE_PREFIX,
+    "detail": True,
+    "installed": False,
+    "original": None,
+}
+_NOTICE_LOCK = threading.Lock()
+
+
+def _wash_episode_text(values: Any) -> str:
+    """把集号压成 E03、E03-E05、E03-E05、E09 这种紧凑写法。"""
+    numbers: List[int] = []
+    for value in values or []:
+        try:
+            numbers.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not numbers:
+        return ""
+    numbers = sorted(set(numbers))
+    spans: List[Tuple[int, int]] = []
+    start = prev = numbers[0]
+    for number in numbers[1:]:
+        if number == prev + 1:
+            prev = number
+            continue
+        spans.append((start, prev))
+        start = prev = number
+    spans.append((start, prev))
+    parts: List[str] = []
+    for begin, end in spans:
+        if begin == end:
+            parts.append("E%02d" % begin)
+        else:
+            parts.append("E%02d-E%02d" % (begin, end))
+    return "、".join(parts)
+
+
+def _wash_detail_line(submission: Dict[str, Any]) -> str:
+    """生成正文首行的洗版说明。"""
+    episodes = _wash_episode_text(submission.get("upgrade_episodes"))
+    if submission.get("best_version_full"):
+        return "洗版：全集覆盖" + ("（%s）" % episodes if episodes else "")
+    if episodes:
+        return "洗版：升级 %s" % episodes
+    # 电影，或宿主没记录具体集数
+    return "洗版：覆盖已有版本"
+
+
+def _decorate_download_message(message: Any, submission: Any) -> Any:
+    """给洗版下载的通知加标记；非洗版或异常时原样返回。"""
+    if message is None or not isinstance(submission, dict):
+        return message
+    if submission.get("submission_type") != "upgrade":
+        return message
+
+    prefix = _NOTICE_STATE.get("prefix") or NOTICE_PREFIX
+    title = getattr(message, "title", None) or ""
+    if title and not title.lstrip().startswith(prefix):
+        try:
+            message.title = "%s%s" % (prefix, title)
+        except Exception as err:  # 通知对象不可写时只记录，不阻断发送
+            logger.debug(f"[PlaybackBestVersion] 通知标题标注失败（忽略）：{err}")
+
+    if _NOTICE_STATE.get("detail", True):
+        line = _wash_detail_line(submission)
+        if line:
+            text = getattr(message, "text", None) or ""
+            try:
+                message.text = ("%s\n%s" % (line, text)) if text else line
+            except Exception as err:
+                logger.debug(f"[PlaybackBestVersion] 通知正文标注失败（忽略）：{err}")
+    return message
+
+
+def _find_download_context(depth: int = 8) -> Any:
+    """从调用栈里找到带 subscription_download 的 Context。
+
+    _build_download_notification 本身拿不到 context，它的调用方
+    （DownloadHistoryOwner 的记录方法）局部变量里就有。
+    """
+    frame = inspect.currentframe()
+    try:
+        frame = frame.f_back if frame else None
+        for _ in range(depth):
+            if frame is None:
+                return None
+            context = frame.f_locals.get("context")
+            if context is not None and hasattr(context, "subscription_download"):
+                return context
+            frame = frame.f_back
+    finally:
+        del frame
+    return None
+
+
+def _install_notice_patch() -> bool:
+    """安装下载通知标注补丁（幂等）。"""
+    with _NOTICE_LOCK:
+        if _NOTICE_STATE.get("installed"):
+            return True
+        try:
+            module = __import__(NOTICE_TARGET_MODULE, fromlist=[NOTICE_TARGET_CLASS])
+            owner = getattr(module, NOTICE_TARGET_CLASS)
+        except Exception as err:
+            logger.error(f"[PlaybackBestVersion] 找不到宿主下载链模块，洗版标注未启用：{err}")
+            return False
+
+        original = getattr(owner, NOTICE_TARGET_METHOD, None)
+        if not callable(original):
+            logger.error("[PlaybackBestVersion] 宿主下载通知方法不存在，洗版标注未启用")
+            return False
+        if getattr(original, "_pbs_washmark", False):
+            _NOTICE_STATE.update(
+                installed=True, original=getattr(original, "_pbs_washmark_original", original)
+            )
+            logger.info("[PlaybackBestVersion] 洗版标注补丁已存在，跳过重复安装")
+            return True
+
+        def wrapper(self, *args, **kwargs):
+            message = original(self, *args, **kwargs)
+            try:
+                context = _find_download_context()
+                message = _decorate_download_message(
+                    message, getattr(context, "subscription_download", None)
+                )
+            except Exception as err:
+                logger.debug(f"[PlaybackBestVersion] 洗版标注流程异常（忽略）：{err}")
+            return message
+
+        wrapper.__name__ = getattr(original, "__name__", NOTICE_TARGET_METHOD)
+        wrapper.__doc__ = getattr(original, "__doc__", None)
+        wrapper._pbs_washmark = True
+        wrapper._pbs_washmark_original = original
+        setattr(owner, NOTICE_TARGET_METHOD, wrapper)
+        _NOTICE_STATE.update(installed=True, original=original)
+        logger.info("[PlaybackBestVersion] 已安装下载通知洗版标注补丁")
+        return True
+
+
+def _uninstall_notice_patch() -> None:
+    """还原宿主方法（插件停用或关闭标注时调用）。"""
+    with _NOTICE_LOCK:
+        if not _NOTICE_STATE.get("installed"):
+            return
+        original = _NOTICE_STATE.get("original")
+        try:
+            module = __import__(NOTICE_TARGET_MODULE, fromlist=[NOTICE_TARGET_CLASS])
+            owner = getattr(module, NOTICE_TARGET_CLASS)
+            if callable(original):
+                setattr(owner, NOTICE_TARGET_METHOD, original)
+                logger.info("[PlaybackBestVersion] 已卸载下载通知洗版标注补丁")
+        except Exception as err:
+            logger.warning(f"[PlaybackBestVersion] 卸载洗版标注补丁失败：{err}")
+        finally:
+            _NOTICE_STATE.update(installed=False, original=None)
+
+
+def _wash_notice_sample() -> Dict[str, Any]:
+    """详情页/接口用的示例，验证标注效果（不发送通知）。"""
+
+    class _Sample:
+        title = "示例剧集 S01 E03-E26 开始下载"
+        text = "站点：示例站\n质量：2160p DV"
+
+    sample = _Sample()
+    marked = _decorate_download_message(sample, {
+        "submission_type": "upgrade",
+        "best_version_full": False,
+        "upgrade_episodes": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                             17, 18, 19, 20, 21, 22, 23, 24, 25, 26],
+    })
+    return {"title": marked.title, "text": marked.text}
+
 
 class PlaybackBestVersion(_PluginBase):
     """播放进度洗版插件。
@@ -139,11 +325,12 @@ class PlaybackBestVersion(_PluginBase):
     # 插件名称
     plugin_name = "播放进度洗版"
     # 插件描述
-    plugin_desc = "按媒体服务器的播放进度决定订阅是否继续洗版：已看过的剧集/电影不再重复洗版。"
+    plugin_desc = "按媒体服务器的播放进度决定订阅是否继续洗版：已看过的剧集/电影不再重复洗版；" \
+                  "并在洗版触发的下载通知上加【洗版】标记。"
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.5.0"
+    plugin_version = "3.6.0"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -219,6 +406,10 @@ class PlaybackBestVersion(_PluginBase):
         self._activity_cache: Dict[str, Dict[str, float]] = {}
         # 洗版下载历史缓存（每轮只查一次）：{订阅 ID: 洗过版的集号集合}，None 表示尚未加载
         self._upgrade_cache: Optional[Dict[str, set]] = None
+        # 下载通知洗版标注：是否启用、标题前缀、是否在正文注明升级集数
+        self._mark_wash = True
+        self._mark_prefix = NOTICE_PREFIX
+        self._mark_detail = True
 
     def init_plugin(self, config: dict = None):
         """初始化插件：读取配置、按需立即运行一次，并启动定时调度。
@@ -245,6 +436,17 @@ class PlaybackBestVersion(_PluginBase):
         self._dry_run = bool(config.get("dry_run"))
         self._webhook_trigger = bool(config.get("webhook_trigger", True))
         self._webhook_delay = max(0, self._as_int(config.get("webhook_delay"), WEBHOOK_DEFAULT_DELAY))
+        # 下载通知洗版标注：默认开启，保持与原 DownloadWashMark 插件一致的观感
+        self._mark_wash = bool(config.get("mark_wash", True))
+        prefix = config.get("mark_prefix")
+        self._mark_prefix = (prefix.strip() if isinstance(prefix, str) and prefix.strip() else NOTICE_PREFIX)
+        self._mark_detail = bool(config.get("mark_detail", True))
+        _NOTICE_STATE["prefix"] = self._mark_prefix
+        _NOTICE_STATE["detail"] = self._mark_detail
+        if self._enabled and self._mark_wash:
+            _install_notice_patch()
+        else:
+            _uninstall_notice_patch()
 
         # 恢复上次执行结果，让详情页在重启后仍有内容
         self._last_run = self.get_data("last_run") or {}
@@ -285,7 +487,7 @@ class PlaybackBestVersion(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """提供「立即执行一次」的插件接口，便于在详情页手动验证口径。"""
+        """提供「立即执行一次」与「洗版标注状态」两个插件接口。"""
         return [
             {
                 "path": "/run",
@@ -293,8 +495,25 @@ class PlaybackBestVersion(_PluginBase):
                 "methods": ["GET"],
                 "summary": "立即执行一次检查",
                 "description": "按当前配置扫描一遍订阅与播放进度，返回本轮执行摘要",
-            }
+            },
+            {
+                "path": "/washmark",
+                "endpoint": self.api_washmark,
+                "methods": ["GET"],
+                "summary": "查看下载通知洗版标注状态",
+                "description": "返回标注补丁是否已安装，以及一条示例标注效果（不发通知）",
+            },
         ]
+
+    def api_washmark(self) -> Dict[str, Any]:
+        """插件 API：洗版标注补丁状态与示例。"""
+        return {
+            "enabled": bool(self._mark_wash),
+            "patched": bool(_NOTICE_STATE.get("installed")),
+            "title_prefix": _NOTICE_STATE.get("prefix") or NOTICE_PREFIX,
+            "show_detail": bool(_NOTICE_STATE.get("detail", True)),
+            "sample": _wash_notice_sample(),
+        }
 
     def _latest_run(self) -> Dict[str, Any]:
         """取最新一轮执行结果。
@@ -338,7 +557,7 @@ class PlaybackBestVersion(_PluginBase):
                             {
                                 "component": "div",
                                 "props": {"style": "max-width: 960px; margin: 0 auto"},
-                                "html": self._summary_html(last),
+                                "html": self._summary_html(last) + self._notice_html(),
                             }
                         ],
                     }
@@ -428,8 +647,30 @@ class PlaybackBestVersion(_PluginBase):
             f'color:rgba(var(--v-theme-on-surface,0,0,0),.85)">' + spans + "</div>"
         )
 
+    def _notice_html(self) -> str:
+        """摘要下方的洗版标注状态条：一眼看出下载通知标注是否生效。"""
+        patched = bool(_NOTICE_STATE.get("installed"))
+        if patched and self._mark_wash:
+            dot, text = "#43A047", "下载通知洗版标注：已生效"
+        elif self._mark_wash:
+            dot, text = "#FB8C00", "下载通知洗版标注：已启用但补丁未装（看日志）"
+        else:
+            dot, text = "#757575", "下载通知洗版标注：未启用"
+        detail = "注明集数" if _NOTICE_STATE.get("detail", True) else "只加前缀"
+        prefix = escape(str(_NOTICE_STATE.get("prefix") or NOTICE_PREFIX))
+        return (
+            '<div style="display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;'
+            'padding:6px 12px;border-radius:8px;font-size:13px;line-height:1.6;margin-top:6px;'
+            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);'
+            'color:rgba(var(--v-theme-on-surface,0,0,0),.8)">'
+            f'<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:{dot};display:inline-block"></span>'
+            f'{escape(text)}</span>'
+            f'<span style="white-space:nowrap;opacity:.75">前缀 {prefix} · {detail}</span></div>'
+        )
+
     def stop_service(self):
-        """停用插件时关闭定时调度器，并取消尚未触发的 Webhook 去抖任务。"""
+        """停用插件时关闭定时调度器、取消 Webhook 去抖任务，并还原下载通知补丁。"""
         with self._webhook_timer_lock:
             if self._webhook_timer:
                 try:
@@ -443,6 +684,7 @@ class PlaybackBestVersion(_PluginBase):
             except Exception as err:
                 logger.error(f"{self.LOG_TAG}停止调度器失败：{err}")
         self._scheduler = None
+        _uninstall_notice_patch()
 
     def get_form(self) -> List[dict]:
         """插件配置页面（Vuetify JSON 配置），返回 (表单, 默认值)。"""
@@ -706,6 +948,61 @@ class PlaybackBestVersion(_PluginBase):
                                             "placeholder": "默认 20；0 表示立即执行",
                                         },
                                     }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "title": "下载通知洗版标注",
+                                            "text": "只给「洗版（升级）」触发的下载通知加标记：标题前加前缀，"
+                                                    "正文首行写明升级了哪些集（全集洗版 / 电影分别有不同的写法）。"
+                                                    "首次订阅的下载不受影响，也不需要重启宿主，保存即生效。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "mark_wash", "label": "启用洗版标注"}}
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "mark_prefix",
+                                            "label": "标题前缀",
+                                            "placeholder": NOTICE_PREFIX,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "mark_detail", "label": "正文注明升级集数"}}
                                 ],
                             },
                         ],
@@ -1918,6 +2215,9 @@ class PlaybackBestVersion(_PluginBase):
             "dry_run": self._dry_run,
             "webhook_trigger": self._webhook_trigger,
             "webhook_delay": self._webhook_delay,
+            "mark_wash": self._mark_wash,
+            "mark_prefix": self._mark_prefix,
+            "mark_detail": self._mark_detail,
         }
 
     @staticmethod
