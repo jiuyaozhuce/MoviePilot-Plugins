@@ -36,6 +36,7 @@ import datetime
 import inspect
 import re
 import threading
+import time
 from html import escape
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
@@ -140,14 +141,44 @@ NOTICE_PREFIX = "【洗版】"
 NOTICE_TARGET_MODULE = "app.chain.download.processing"
 NOTICE_TARGET_CLASS = "DownloadProcessingOwner"
 NOTICE_TARGET_METHOD = "_build_download_notification"
+# 模板渲染入口：宿主的下载通知是「先建 Message，再拿模板渲染」，模板能用哪些变量
+# 完全由这一次 render 调用的 kwargs 决定（TemplateContextBuilder.build 会把 kwargs
+# 原样并入上下文）。宿主自己只送 meta/mediainfo/torrentinfo/download_episodes/
+# username/current_time 六个，注释里写着「不额外拼接订阅下载来源」——
+# 所以模板天然拿不到「这次是不是洗版」。这里在渲染前一并把这个结论送进去，
+# 模板就写成 {% if is_wash %}...{% endif %} 了。
+NOTICE_RENDER_MODULE = "app.application.messaging.message"
+NOTICE_RENDER_CLASS = "MessageTemplateHelper"
+NOTICE_RENDER_METHOD = "render"
+# 标注方式：
+#   auto     —— 模板里用了 is_wash / wash_text 就交给模板排版，否则插件直接改标题正文（默认）
+#   direct   —— 只用插件直接改标题正文（v3.7.0 行为）
+#   template —— 只注入模板变量，标题正文完全由模板决定
+NOTICE_MODE_AUTO = "auto"
+NOTICE_MODE_DIRECT = "direct"
+NOTICE_MODE_TEMPLATE = "template"
+NOTICE_MODES = (NOTICE_MODE_AUTO, NOTICE_MODE_DIRECT, NOTICE_MODE_TEMPLATE)
+# 模板里出现这些变量名即视为「模板已接管排版」
+NOTICE_TEMPLATE_TOKENS = ("is_wash", "wash_text", "wash_prefix", "wash_episodes")
 # 运行期状态：由 init_plugin 按配置写入，补丁函数共享（多实例时以最后一次配置为准）
 _NOTICE_STATE: Dict[str, Any] = {
     "prefix": NOTICE_PREFIX,
     "detail": True,
+    "mode": NOTICE_MODE_AUTO,
     "installed": False,
     "original": None,
+    "render_installed": False,
+    "render_original": None,
+    "render_descriptor": None,
 }
 _NOTICE_LOCK = threading.Lock()
+# 渲染入口补丁单独一把锁：两个补丁互相调用，共用一把不可重入锁会死锁
+_NOTICE_RENDER_LOCK = threading.Lock()
+# 本次渲染要喂给模板的洗版变量；用 thread-local 隔离，避免并发通知串味
+_NOTICE_LOCAL = threading.local()
+# 「模板是否已接管」的判定缓存（模板改动最多滞后几十秒生效）
+_NOTICE_TEMPLATE_CACHE: Dict[str, Any] = {"at": 0.0, "used": False}
+_NOTICE_TEMPLATE_TTL = 30
 
 
 def _wash_episode_text(values: Any) -> str:
@@ -188,6 +219,53 @@ def _wash_detail_line(submission: Dict[str, Any]) -> str:
         return "洗版：升级 %s" % episodes
     # 电影，或宿主没记录具体集数
     return "洗版：覆盖已有版本"
+
+
+def _wash_template_vars(submission: Any) -> Dict[str, Any]:
+    """把订阅下载上下文整理成可以喂给通知模板的变量。
+
+    只在「这次是洗版（upgrade）」时返回内容；首次订阅返回空字典，
+    模板里的 {% if is_wash %} 自然走不到，通知与原来一模一样。
+    """
+    if not isinstance(submission, dict) or submission.get("submission_type") != "upgrade":
+        return {}
+    episodes = _wash_episode_text(submission.get("upgrade_episodes"))
+    values: Dict[str, Any] = {
+        "is_wash": True,
+        "wash_prefix": _NOTICE_STATE.get("prefix") or NOTICE_PREFIX,
+        "wash_episodes": episodes,
+        "wash_full": bool(submission.get("best_version_full")),
+    }
+    if _NOTICE_STATE.get("detail", True):
+        values["wash_text"] = _wash_detail_line(submission)
+    return values
+
+
+def _template_uses_wash() -> bool:
+    """当前下载通知模板有没有用到洗版变量。
+
+    用到就代表排版已经交给模板了，插件不该再直接改标题正文，否则会出现
+    「【洗版】🚿 洗版 xxx」这种双重标注。读取失败一律按「没用到」处理，
+    退回到插件直接改写，保证标注不会因为读配置出错而彻底消失。
+    """
+    now = time.time()
+    if now - float(_NOTICE_TEMPLATE_CACHE.get("at") or 0) < _NOTICE_TEMPLATE_TTL:
+        return bool(_NOTICE_TEMPLATE_CACHE.get("used"))
+    used = False
+    try:
+        from app.application.configuration import get_configured_system_config
+        from app.schemas.types import SystemConfigKey
+
+        templates = get_configured_system_config().get(SystemConfigKey.NotificationTemplates) or {}
+        raw = ""
+        if isinstance(templates, dict):
+            raw = str(templates.get("downloadAdded") or "")
+        used = any(token in raw for token in NOTICE_TEMPLATE_TOKENS)
+    except Exception as err:
+        logger.debug(f"[PlaybackBestVersion] 读取通知模板失败（按未接管处理）：{err}")
+        used = False
+    _NOTICE_TEMPLATE_CACHE.update(at=now, used=used)
+    return used
 
 
 def _decorate_download_message(message: Any, submission: Any) -> Any:
@@ -237,6 +315,84 @@ def _find_download_context(depth: int = 8) -> Any:
     return None
 
 
+def _install_render_patch() -> bool:
+    """把洗版变量补进通知模板的渲染上下文（幂等）。
+
+    宿主建下载通知时会调 MessageTemplateHelper.render(message, meta=..., ...)，
+    变量清单在那次调用里就定死了。这里包一层 render，把 _NOTICE_LOCAL.vars 里的
+    几个键并进 kwargs —— TemplateContextBuilder.build 会 context.update(kwargs)，
+    于是模板里 {% if is_wash %} 就能用了。只加变量，不改模板、不改消息本身。
+    """
+    with _NOTICE_RENDER_LOCK:
+        if _NOTICE_STATE.get("render_installed"):
+            return True
+        try:
+            module = __import__(NOTICE_RENDER_MODULE, fromlist=[NOTICE_RENDER_CLASS])
+            owner = getattr(module, NOTICE_RENDER_CLASS)
+        except Exception as err:
+            logger.error(f"[PlaybackBestVersion] 找不到宿主通知模板渲染器，模板变量注入未启用：{err}")
+            return False
+
+        original = getattr(owner, NOTICE_RENDER_METHOD, None)
+        if not callable(original):
+            logger.error("[PlaybackBestVersion] 宿主模板渲染方法不存在，模板变量注入未启用")
+            return False
+        if getattr(original, "_pbs_notice_render", False):
+            _NOTICE_STATE.update(
+                render_installed=True,
+                render_original=getattr(original, "_pbs_notice_render_original", original),
+            )
+            logger.info("[PlaybackBestVersion] 模板变量注入补丁已存在，跳过重复安装")
+            return True
+
+        # 记住原始描述符（静态方法要按 staticmethod 还原，直接赋值会变成实例方法）
+        try:
+            descriptor = inspect.getattr_static(owner, NOTICE_RENDER_METHOD)
+        except Exception:
+            descriptor = None
+        is_static = isinstance(descriptor, staticmethod)
+
+        def wrapper(message, *args, **kwargs):
+            values = getattr(_NOTICE_LOCAL, "vars", None)
+            if values:
+                kwargs = dict(kwargs)
+                for key, value in values.items():
+                    kwargs.setdefault(key, value)
+            return original(message, *args, **kwargs)
+
+        wrapper.__name__ = getattr(original, "__name__", NOTICE_RENDER_METHOD)
+        wrapper.__doc__ = getattr(original, "__doc__", None)
+        wrapper._pbs_notice_render = True
+        wrapper._pbs_notice_render_original = original
+        setattr(owner, NOTICE_RENDER_METHOD, staticmethod(wrapper) if is_static else wrapper)
+        _NOTICE_STATE.update(
+            render_installed=True, render_original=original, render_descriptor=descriptor
+        )
+        logger.info("[PlaybackBestVersion] 已安装洗版模板变量注入补丁")
+        return True
+
+
+def _uninstall_render_patch() -> None:
+    """还原模板渲染入口。"""
+    with _NOTICE_RENDER_LOCK:
+        if not _NOTICE_STATE.get("render_installed"):
+            return
+        original = _NOTICE_STATE.get("render_original")
+        descriptor = _NOTICE_STATE.get("render_descriptor")
+        try:
+            module = __import__(NOTICE_RENDER_MODULE, fromlist=[NOTICE_RENDER_CLASS])
+            owner = getattr(module, NOTICE_RENDER_CLASS)
+            if descriptor is not None:
+                setattr(owner, NOTICE_RENDER_METHOD, descriptor)
+            elif callable(original):
+                setattr(owner, NOTICE_RENDER_METHOD, original)
+            logger.info("[PlaybackBestVersion] 已卸载洗版模板变量注入补丁")
+        except Exception as err:
+            logger.warning(f"[PlaybackBestVersion] 卸载模板变量注入补丁失败：{err}")
+        finally:
+            _NOTICE_STATE.update(render_installed=False, render_original=None, render_descriptor=None)
+
+
 def _install_notice_patch() -> bool:
     """安装下载通知标注补丁（幂等）。"""
     with _NOTICE_LOCK:
@@ -258,18 +414,43 @@ def _install_notice_patch() -> bool:
                 installed=True, original=getattr(original, "_pbs_washmark_original", original)
             )
             logger.info("[PlaybackBestVersion] 洗版标注补丁已存在，跳过重复安装")
+            _install_render_patch()
             return True
 
         def wrapper(self, *args, **kwargs):
-            message = original(self, *args, **kwargs)
+            # 先判一次洗版（事实来源是调用方栈里的 context.subscription_download），
+            # 有结论就把它作为模板变量喂给渲染入口，再调原本的构建逻辑。
+            context = None
             try:
                 context = _find_download_context()
-                message = _decorate_download_message(
-                    message, getattr(context, "subscription_download", None)
-                )
+            except Exception as err:
+                logger.debug(f"[PlaybackBestVersion] 取订阅下载上下文失败（忽略）：{err}")
+            submission = getattr(context, "subscription_download", None)
+            values: Dict[str, Any] = {}
+            try:
+                values = _wash_template_vars(submission)
+            except Exception as err:
+                logger.debug(f"[PlaybackBestVersion] 生成洗版模板变量失败（忽略）：{err}")
+
+            try:
+                _NOTICE_LOCAL.vars = values or None
+                message = original(self, *args, **kwargs)
+            finally:
+                _NOTICE_LOCAL.vars = None
+
+            # 模板已经接管排版时不再二次改写；其余情况沿用直接改写标题/正文。
+            try:
+                if not values:
+                    return message
+                mode = _NOTICE_STATE.get("mode") or NOTICE_MODE_AUTO
+                if mode == NOTICE_MODE_TEMPLATE:
+                    return message
+                if mode == NOTICE_MODE_AUTO and _template_uses_wash():
+                    return message
+                return _decorate_download_message(message, submission)
             except Exception as err:
                 logger.debug(f"[PlaybackBestVersion] 洗版标注流程异常（忽略）：{err}")
-            return message
+                return message
 
         wrapper.__name__ = getattr(original, "__name__", NOTICE_TARGET_METHOD)
         wrapper.__doc__ = getattr(original, "__doc__", None)
@@ -278,7 +459,9 @@ def _install_notice_patch() -> bool:
         setattr(owner, NOTICE_TARGET_METHOD, wrapper)
         _NOTICE_STATE.update(installed=True, original=original)
         logger.info("[PlaybackBestVersion] 已安装下载通知洗版标注补丁")
-        return True
+    # 模板变量补丁独立安装：即使它失败，直接改写标题正文仍然有效
+    _install_render_patch()
+    return True
 
 
 def _uninstall_notice_patch() -> None:
@@ -297,6 +480,7 @@ def _uninstall_notice_patch() -> None:
             logger.warning(f"[PlaybackBestVersion] 卸载洗版标注补丁失败：{err}")
         finally:
             _NOTICE_STATE.update(installed=False, original=None)
+    _uninstall_render_patch()
 
 
 # ---- 重复下载去重（同一个种子被宿主重复记账、重复发通知）----
@@ -478,11 +662,12 @@ class PlaybackBestVersion(_PluginBase):
     plugin_name = "播放进度洗版"
     # 插件描述
     plugin_desc = "按媒体服务器的播放进度决定订阅是否继续洗版：已看过的剧集/电影不再重复洗版；" \
-                  "并在洗版触发的下载通知上加【洗版】标记，同时拦截同一资源的重复下载记账与重复通知。"
+                  "并把「这次是洗版」作为模板变量 is_wash / wash_text 送进下载通知，" \
+                  "可在通知模板里自行排版（不写模板则自动加【洗版】标记），同时拦截同一资源的重复下载记账与重复通知。"
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.7.0"
+    plugin_version = "3.8.0"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -558,10 +743,11 @@ class PlaybackBestVersion(_PluginBase):
         self._activity_cache: Dict[str, Dict[str, float]] = {}
         # 洗版下载历史缓存（每轮只查一次）：{订阅 ID: 洗过版的集号集合}，None 表示尚未加载
         self._upgrade_cache: Optional[Dict[str, set]] = None
-        # 下载通知洗版标注：是否启用、标题前缀、是否在正文注明升级集数
+        # 下载通知洗版标注：是否启用、标题前缀、是否在正文注明升级集数、排版方式
         self._mark_wash = True
         self._mark_prefix = NOTICE_PREFIX
         self._mark_detail = True
+        self._mark_mode = NOTICE_MODE_AUTO
         # 重复下载去重：是否启用、判定窗口（小时）
         self._dedupe_download = True
         self._dedupe_window = DEDUPE_DEFAULT_WINDOW
@@ -596,8 +782,13 @@ class PlaybackBestVersion(_PluginBase):
         prefix = config.get("mark_prefix")
         self._mark_prefix = (prefix.strip() if isinstance(prefix, str) and prefix.strip() else NOTICE_PREFIX)
         self._mark_detail = bool(config.get("mark_detail", True))
+        mode = config.get("mark_mode")
+        self._mark_mode = mode if mode in NOTICE_MODES else NOTICE_MODE_AUTO
         _NOTICE_STATE["prefix"] = self._mark_prefix
         _NOTICE_STATE["detail"] = self._mark_detail
+        _NOTICE_STATE["mode"] = self._mark_mode
+        # 改过模板/前缀后立刻重新判定一次「模板是否接管排版」
+        _NOTICE_TEMPLATE_CACHE["at"] = 0.0
         if self._enabled and self._mark_wash:
             _install_notice_patch()
         else:
@@ -689,12 +880,22 @@ class PlaybackBestVersion(_PluginBase):
         }
 
     def api_washmark(self) -> Dict[str, Any]:
-        """插件 API：洗版标注补丁状态与示例。"""
+        """插件 API：洗版标注补丁状态、模板变量与示例。"""
         return {
             "enabled": bool(self._mark_wash),
             "patched": bool(_NOTICE_STATE.get("installed")),
+            "render_patched": bool(_NOTICE_STATE.get("render_installed")),
+            "mode": _NOTICE_STATE.get("mode") or NOTICE_MODE_AUTO,
+            "template_driven": _template_uses_wash(),
             "title_prefix": _NOTICE_STATE.get("prefix") or NOTICE_PREFIX,
             "show_detail": bool(_NOTICE_STATE.get("detail", True)),
+            "template_vars": {
+                "is_wash": "是否洗版（首次订阅不注入，模板里取不到即假）",
+                "wash_prefix": "标题前缀，取自插件配置",
+                "wash_episodes": "升级的集号，如 E03-E06、E09",
+                "wash_full": "是否全集洗版",
+                "wash_text": "正文首行说明，如 洗版：升级 E03-E06",
+            },
             "sample": _wash_notice_sample(),
         }
 
@@ -831,7 +1032,7 @@ class PlaybackBestVersion(_PluginBase):
         )
 
     def _notice_html(self) -> str:
-        """摘要下方的洗版标注状态条：一眼看出下载通知标注是否生效。"""
+        """摘要下方的洗版标注状态条：一眼看出下载通知标注是否生效、由谁排版。"""
         patched = bool(_NOTICE_STATE.get("installed"))
         if patched and self._mark_wash:
             dot, text = "#43A047", "下载通知洗版标注：已生效"
@@ -839,8 +1040,23 @@ class PlaybackBestVersion(_PluginBase):
             dot, text = "#FB8C00", "下载通知洗版标注：已启用但补丁未装（看日志）"
         else:
             dot, text = "#757575", "下载通知洗版标注：未启用"
-        detail = "注明集数" if _NOTICE_STATE.get("detail", True) else "只加前缀"
-        prefix = escape(str(_NOTICE_STATE.get("prefix") or NOTICE_PREFIX))
+
+        mode = _NOTICE_STATE.get("mode") or NOTICE_MODE_AUTO
+        template_driven = _template_uses_wash() if patched else False
+        if not self._mark_wash:
+            detail = "标注已关闭，通知与宿主原生一致"
+        elif mode == NOTICE_MODE_TEMPLATE:
+            detail = "只注入模板变量，标题正文由模板决定"
+            if not template_driven:
+                detail += "（模板里还没写 is_wash，标注不会出现）"
+        elif mode == NOTICE_MODE_AUTO and template_driven:
+            detail = "模板已接管排版（检测到 is_wash）"
+        else:
+            detail = "插件直接改写标题正文"
+            if _NOTICE_STATE.get("detail", True):
+                detail += " · 注明集数"
+            detail += " · 前缀 %s" % escape(str(_NOTICE_STATE.get("prefix") or NOTICE_PREFIX))
+
         return (
             '<div style="display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;'
             'padding:6px 12px;border-radius:8px;font-size:13px;line-height:1.6;margin-top:6px;'
@@ -849,7 +1065,7 @@ class PlaybackBestVersion(_PluginBase):
             f'<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">'
             f'<span style="width:8px;height:8px;border-radius:50%;background:{dot};display:inline-block"></span>'
             f'{escape(text)}</span>'
-            f'<span style="white-space:nowrap;opacity:.75">前缀 {prefix} · {detail}</span></div>'
+            f'<span style="white-space:nowrap;opacity:.75">{detail}</span></div>'
         )
 
     def _dedupe_html(self) -> str:
@@ -1214,6 +1430,50 @@ class PlaybackBestVersion(_PluginBase):
                                     {"component": "VSwitch", "props": {"model": "mark_detail", "label": "正文注明升级集数"}}
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "mark_mode",
+                                            "label": "标注方式",
+                                            "items": [
+                                                {"title": "自动（模板有 is_wash 就用模板）", "value": NOTICE_MODE_AUTO},
+                                                {"title": "插件直接改写标题正文", "value": NOTICE_MODE_DIRECT},
+                                                {"title": "只注入模板变量", "value": NOTICE_MODE_TEMPLATE},
+                                            ],
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "title": "模板变量（想让通知长什么样自己定就用它）",
+                                            "text": "宿主的下载通知模板本身拿不到「这次是不是洗版」，这个结论由插件补进去。"
+                                                    "洗版时模板里可用 is_wash（布尔）、wash_prefix（标题前缀）、"
+                                                    "wash_episodes（如 E03-E06、E09）、wash_full（是否全集）、"
+                                                    "wash_text（如 洗版：升级 E03-E06）；首次订阅不注入这些变量。"
+                                                    "模板里写了 is_wash 或 wash_text，就视为「模板接管排版」，插件不再改标题正文；"
+                                                    "没写则自动按上面的前缀与集数标注。示例："
+                                                    "'title': '{% if is_wash %}{{ wash_prefix }}{% endif %}{{ title_year }}…'。",
+                                        },
+                                    }
+                                ],
+                            }
                         ],
                     },
                     {
@@ -2477,6 +2737,7 @@ class PlaybackBestVersion(_PluginBase):
             "mark_wash": self._mark_wash,
             "mark_prefix": self._mark_prefix,
             "mark_detail": self._mark_detail,
+            "mark_mode": self._mark_mode,
             "dedupe_download": self._dedupe_download,
             "dedupe_window_hours": self._dedupe_window,
         }

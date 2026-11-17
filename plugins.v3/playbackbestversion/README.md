@@ -54,8 +54,50 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 | 启用洗版标注 | 开 | 洗版（升级）触发的下载通知加标题前缀（v3.6.0 并入原 DownloadWashMark） |
 | 标题前缀 | 【洗版】 | 已带该前缀则不重复添加 |
 | 正文注明升级集数 | 开 | 正文首行写 `洗版：升级 E03-E26` / `洗版：全集覆盖` / `洗版：覆盖已有版本` |
+| 标注方式 | 自动 | `自动`：模板里写了 `is_wash` / `wash_text` 就交给模板排版，否则插件直接改写；`插件直接改写`；`只注入模板变量` |
 | 拦截重复下载 | 开 | 同一种子在窗口期内已记录过时，按宿主「任务已存在」口径结算（见下节） |
 | 判定窗口（小时） | 6 | 超过窗口的同一种子当成「删了重下」，不拦截；取值 1~72 |
+
+## 通知模板变量（v3.8.0）
+
+宿主构建下载通知时（`DownloadProcessingOwner._build_download_notification`），只往模板里送 `meta` / `mediainfo` / `torrentinfo` / `download_episodes` / `username` / `current_time` 这几项，源码注释写着「不额外拼接订阅下载来源」——**所以模板本身无法判断这次是洗版还是首次订阅**，改了也做不出标注。
+
+插件在通知模板的渲染入口 `MessageTemplateHelper.render` 上包一层，把答案补成模板变量：
+
+| 变量 | 类型 | 含义 |
+| --- | --- | --- |
+| `is_wash` | 布尔 | 本次是不是洗版（`submission_type=upgrade`）。首次订阅不注入，模板里取不到即假 |
+| `wash_prefix` | 文本 | 标题前缀，取自插件配置，默认 `【洗版】` |
+| `wash_episodes` | 文本 | 升级的集号，如 `E03-E06、E09`；电影为空 |
+| `wash_full` | 布尔 | 是否全集洗版（`best_version_full`） |
+| `wash_text` | 文本 | 正文首行说明，如 `洗版：升级 E03-E06` / `洗版：全集覆盖` / `洗版：覆盖已有版本` |
+
+模板里这么写（`NotificationTemplates.downloadAdded`）：
+
+```jinja2
+'title': '{% if is_wash %}{{ wash_prefix }}{% endif %}{{ title_year }}… 开始下载',
+'text':  '{% if wash_text %}{{ wash_text }}\n{% endif %}{% if site_name %}站点：{{ site_name }}{% endif %}…'
+```
+
+渲染结果：
+
+```
+首次订阅  谷雨 (2026) S01 E03-E06 开始下载
+          站点：馒头 ⏎ 质量：2160p DV
+
+电视剧洗版 【洗版】谷雨 (2026) S01 E03-E06 开始下载
+          洗版：升级 E03-E06、E09 ⏎ 站点：馒头 ⏎ 质量：2160p DV
+
+电影洗版   【洗版】某电影 (2026) 开始下载
+          洗版：覆盖已有版本 ⏎ 站点：馒头
+```
+
+判定规则：
+
+- 模板里出现 `is_wash` / `wash_text` / `wash_prefix` / `wash_episodes` 任一 → 视为**模板接管排版**，插件不再动标题正文（避免「【洗版】🚿 洗版 xxx」这种双重标注）；判定结果缓存 30 秒
+- 模板没写这些变量 → 自动回落到插件直接加前缀与集数，**保证不写模板也一定有标注**
+- 「标注方式」选 `只注入模板变量` 时插件只给变量，模板没写就什么都不会加；选 `插件直接改写` 时忽略模板、永远由插件加
+
 
 ## 重复下载去重
 
@@ -114,6 +156,7 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 
 - 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
 - v3.3.0 起由 `jiuyaozhuce` 接管维护并增加 Webhook 即时触发；作者与项目地址改指本仓库，图标改为仓库根目录的 `playbackbestversion.svg`
+- v3.8.0：新增「通知模板变量」——把订阅下载上下文转成 `is_wash` / `wash_prefix` / `wash_episodes` / `wash_full` / `wash_text` 注入下载通知的模板渲染上下文（包宿主的 `MessageTemplateHelper.render`，只加变量、不改模板），模板里写 `{% if is_wash %}` 即可自行排版；配置页新增「标注方式」（自动 / 插件直接改写 / 只注入变量），自动模式下模板接管就不再二次改写、模板没写则回落直接加前缀；详情页状态条显示当前由谁排版，`/washmark` 增加 `mode` / `render_patched` / `template_driven` 与变量说明
 - v3.7.0：新增「重复下载去重」——包住宿主下载结算入口 `_settle_download_success`，同一种子（hash 相同）在窗口期（默认 6 小时）已记录过且覆盖本次要的集时，按宿主「任务已存在」口径结算，不重复发通知、不重复记文件明细，并触发宿主自带的重复资源退避；真正升级到更高档的不同种子不受影响。配置页新增「拦截重复下载 / 判定窗口」，详情页摘要下方加去重状态条，接口新增 `/dedupe`
 - v3.6.0：并入原独立插件「下载通知洗版标注 (DownloadWashMark)」。洗版（升级）触发的下载通知加标题前缀【洗版】，正文首行写明升级了哪些集；配置页新增「启用洗版标注 / 标题前缀 / 正文注明升级集数」，详情页摘要下方显示标注状态，接口新增 `/washmark`。补丁只在 `submission_type=upgrade` 时动手，停用插件或关掉标注即刻还原宿主方法，不写任何数据。原插件删库，配置沿用默认值无需迁移
 - v3.5.0：方块条新增橙色「洗过版·未到顶」；依据下载历史 note.subscription_download 的 submission_type=upgrade 判定，与「已下载未洗」「已洗到顶」区分，摘要同步给出三段统计

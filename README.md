@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| 播放进度洗版 (PlaybackBestVersion) | 3.7.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版；下载通知加【洗版】标记；拦截同一种子的重复下载与重复通知 |
+| 播放进度洗版 (PlaybackBestVersion) | 3.8.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版；洗版信息作为模板变量 `is_wash` 等注入下载通知（也可自动加【洗版】标记）；拦截同一种子的重复下载与重复通知 |
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
 | 豆瓣书影音档案 (DouBanWatching) | 1.9.20 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
@@ -60,16 +60,30 @@ id=HDAUDIO  name=高清音轨  include=TrueHD|DTS[- .]?HD|DTS[- .]?X|LPCM|Atmos|
 
 按媒体服务器（Emby / Jellyfin）的**分集播放进度**决定订阅是否继续洗版：进度达到阈值（默认 90%）、播过、或标记已看的集写成宿主口径的洗版完成（`episode_priority=100`），后续洗版不再为它搜更高版本；电影命中则整部停止洗版。支持多服务器、多用户合并、试运行与通知。
 
-## 下载通知洗版标注（v3.6.0 并入）
+## 下载通知洗版标注（v3.6.0 并入 / v3.8.0 支持模板变量）
 
 原独立插件「下载通知洗版标注 (DownloadWashMark)」已合并进本插件，配置页第三段「下载通知洗版标注」：
 
-- **启用洗版标注**（默认开）／**标题前缀**（默认 `【洗版】`，已带则不重复加）／**正文注明升级集数**（默认开）
+- **启用洗版标注**（默认开）／**标题前缀**（默认 `【洗版】`，已带则不重复加）／**正文注明升级集数**（默认开）／**标注方式**（自动 / 插件直接改写 / 只注入模板变量）
 - 只作用于 `subscription_download.submission_type == "upgrade"` 的下载通知，首次订阅的下载完全不改；
 - 正文首行按洗版形态写：分集洗版 → `洗版：升级 E03-E26`，全集洗版 → `洗版：全集覆盖`，电影 → `洗版：覆盖已有版本`；
-- 详情页摘要条下方显示标注状态（已生效 / 已启用但补丁未装 / 未启用），插件接口 `GET /api/v1/plugin/PlaybackBestVersion/washmark?apikey=…` 返回补丁状态与示例。
+- 详情页摘要条下方显示标注状态（已生效 / 已启用但补丁未装 / 未启用）与当前由谁排版，插件接口 `GET /api/v1/plugin/PlaybackBestVersion/washmark?apikey=…` 返回补丁状态、模式与示例。
 
-实现方式仍是运行期包一层宿主 `DownloadProcessingOwner._build_download_notification`：通知模板渲染时拿不到「这次是不是洗版」，而它的调用方（下载历史记录方法）局部变量里有 `context`，用 `sys._getframe` 往上取 `context.subscription_download` 即可。插件停用或关掉标注会立刻还原宿主方法，不写任何数据、不阻断下载。
+**为什么不能只改通知模板**：宿主构建下载通知时（`DownloadProcessingOwner._build_download_notification`）只往模板送 `meta` / `mediainfo` / `torrentinfo` / `download_episodes` / `username` / `current_time`，源码注释明写「不额外拼接订阅下载来源」——模板拿不到「这次是不是洗版」，改模板做不出标注。
+
+**v3.8.0 的做法**：再包一层宿主的 `MessageTemplateHelper.render`，把结论作为额外变量喂进渲染上下文（`TemplateContextBuilder.build` 会 `context.update(kwargs)`），模板里就能写 `{% if is_wash %}`：
+
+| 变量 | 含义 |
+| --- | --- |
+| `is_wash` | 是否洗版；首次订阅不注入，模板取不到即假 |
+| `wash_prefix` | 标题前缀（取自插件配置） |
+| `wash_episodes` | 升级的集号，如 `E03-E06、E09` |
+| `wash_full` | 是否全集洗版 |
+| `wash_text` | 正文首行说明，如 `洗版：升级 E03-E06` |
+
+模板里出现上述任一变量 → 视为模板接管排版，插件不再二次改写（避免双重标注）；没出现 → 自动回落到插件直接加前缀，保证不写模板也一定有标注。
+
+两处补丁都只做运行期方法替换，不写库、不改宿主文件：`_build_download_notification` 用来从调用栈取 `context.subscription_download`，`MessageTemplateHelper.render` 用来补模板变量。插件停用或关掉标注会立刻还原宿主方法，不阻断下载。
 
 ## 重复下载去重（v3.7.0 新增）
 
