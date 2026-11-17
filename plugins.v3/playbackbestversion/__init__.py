@@ -13,6 +13,12 @@
     这样「已经看完的内容」不会被反复升级替换：省带宽、省磁盘，也不会把用户已经看过的
     剧集重洗成另一个版本。
 
+    另外把「这次是洗版」标到通知里（不改宿主的判定与数据）：
+    - 下载通知：宿主调用栈里就有 context.subscription_download，直接取结论；
+    - 入库通知：整理完成时只有元数据与整理结果，于是用「媒体 + 季 + 集号 + 时间窗」
+      回查 downloadhistory.note 里的 subscription_download（upgrade），命中才标注；
+    - 两条链路都可以只注入模板变量（is_wash / wash_text …），让模板自己排版。
+
 工作方式：
     1. 定时（默认 30 分钟）、手动，或媒体服务器 Webhook 即时触发一次；
     2. 从订阅库取「订阅中（state=R）+ 已开启洗版」的订阅；
@@ -160,6 +166,34 @@ NOTICE_MODE_TEMPLATE = "template"
 NOTICE_MODES = (NOTICE_MODE_AUTO, NOTICE_MODE_DIRECT, NOTICE_MODE_TEMPLATE)
 # 模板里出现这些变量名即视为「模板已接管排版」
 NOTICE_TEMPLATE_TOKENS = ("is_wash", "wash_text", "wash_prefix", "wash_episodes")
+
+# ---- 入库通知洗版标注（v3.9.0）----
+# 下载通知能标「洗版」，是因为调用栈里就有这次订阅下载的上下文；
+# 入库（整理完成）通知是另一条链路：TransferChain 结算后调
+# TransferHistoryOwner.send_transfer_message(meta, mediainfo, transferinfo, ...)，
+# 那里只剩元数据和整理结果，拿不到「这次入库的是不是洗版」。
+# 但宿主自己把结论写在下载历史里：downloadhistory.note 的
+# note["subscription_download"] = {subscription_id, submission_type: upgrade|initial,
+#                                  best_version_full, initial_episodes, upgrade_episodes}。
+# 所以入库时反过来用「媒体身份 + 季 + 集号 + 时间窗」回查这张表：
+# 命中一条窗口期内的 upgrade 记录，且集号有交集，就认为本次入库是洗版成果。
+# 完全不改宿主代码，也不需要宿主传 context。
+ORG_TARGET_MODULE = "app.chain.transfer.history"
+ORG_TARGET_CLASS = "TransferHistoryOwner"
+ORG_TARGET_METHOD = "send_transfer_message"
+# 入库通知在宿主 NotificationTemplates 里的键
+ORG_TEMPLATE_KEY = "organizeSuccess"
+# 默认关联窗口（小时）：洗版下载到入库通常几十分钟内完成，48 小时足够且不易误判
+ORG_DEFAULT_WINDOW = 48
+_ORG_STATE: Dict[str, Any] = {
+    "enabled": False,
+    "window_hours": ORG_DEFAULT_WINDOW,
+    "installed": False,
+    "original": None,
+    # 本次进程内已标注的入库通知条数（详情页/接口展示用）
+    "marked": 0,
+}
+_ORG_LOCK = threading.Lock()
 # 运行期状态：由 init_plugin 按配置写入，补丁函数共享（多实例时以最后一次配置为准）
 _NOTICE_STATE: Dict[str, Any] = {
     "prefix": NOTICE_PREFIX,
@@ -176,8 +210,9 @@ _NOTICE_LOCK = threading.Lock()
 _NOTICE_RENDER_LOCK = threading.Lock()
 # 本次渲染要喂给模板的洗版变量；用 thread-local 隔离，避免并发通知串味
 _NOTICE_LOCAL = threading.local()
-# 「模板是否已接管」的判定缓存（模板改动最多滞后几十秒生效）
-_NOTICE_TEMPLATE_CACHE: Dict[str, Any] = {"at": 0.0, "used": False}
+# 「模板是否已接管」的判定缓存，按模板键分开（模板改动最多滞后几十秒生效）
+# 结构：{"downloadAdded": {"at": 时间戳, "used": bool}, "organizeSuccess": {...}}
+_NOTICE_TEMPLATE_CACHE: Dict[str, Any] = {}
 _NOTICE_TEMPLATE_TTL = 30
 
 
@@ -241,16 +276,20 @@ def _wash_template_vars(submission: Any) -> Dict[str, Any]:
     return values
 
 
-def _template_uses_wash() -> bool:
-    """当前下载通知模板有没有用到洗版变量。
+def _template_uses_wash(template_key: str = "downloadAdded") -> bool:
+    """指定通知模板有没有用到洗版变量。
 
     用到就代表排版已经交给模板了，插件不该再直接改标题正文，否则会出现
     「【洗版】🚿 洗版 xxx」这种双重标注。读取失败一律按「没用到」处理，
     退回到插件直接改写，保证标注不会因为读配置出错而彻底消失。
+
+    下载通知与入库通知是两个模板（downloadAdded / organizeSuccess），
+    必须分开判定：只给下载模板加了 is_wash 时，入库通知仍应由插件直接改写。
     """
     now = time.time()
-    if now - float(_NOTICE_TEMPLATE_CACHE.get("at") or 0) < _NOTICE_TEMPLATE_TTL:
-        return bool(_NOTICE_TEMPLATE_CACHE.get("used"))
+    cached = _NOTICE_TEMPLATE_CACHE.get(template_key)
+    if isinstance(cached, dict) and now - float(cached.get("at") or 0) < _NOTICE_TEMPLATE_TTL:
+        return bool(cached.get("used"))
     used = False
     try:
         from app.application.configuration import get_configured_system_config
@@ -259,12 +298,12 @@ def _template_uses_wash() -> bool:
         templates = get_configured_system_config().get(SystemConfigKey.NotificationTemplates) or {}
         raw = ""
         if isinstance(templates, dict):
-            raw = str(templates.get("downloadAdded") or "")
+            raw = str(templates.get(template_key) or "")
         used = any(token in raw for token in NOTICE_TEMPLATE_TOKENS)
     except Exception as err:
         logger.debug(f"[PlaybackBestVersion] 读取通知模板失败（按未接管处理）：{err}")
         used = False
-    _NOTICE_TEMPLATE_CACHE.update(at=now, used=used)
+    _NOTICE_TEMPLATE_CACHE[template_key] = {"at": now, "used": used}
     return used
 
 
@@ -358,7 +397,21 @@ def _install_render_patch() -> bool:
                 kwargs = dict(kwargs)
                 for key, value in values.items():
                     kwargs.setdefault(key, value)
-            return original(message, *args, **kwargs)
+            result = original(message, *args, **kwargs)
+            # 入库通知的「直写兜底」：send_transfer_message 自己不返回 Message，
+            # 拿不到对象去改标题正文，只能在渲染完成后再补一笔。
+            # 下载通知仍然走 _install_notice_patch 里原有的改写逻辑，这里只管入库。
+            direct = getattr(_NOTICE_LOCAL, "direct", None)
+            if direct and result is not None:
+                try:
+                    submission, template_key = direct
+                    mode = _NOTICE_STATE.get("mode") or NOTICE_MODE_AUTO
+                    if mode != NOTICE_MODE_TEMPLATE and not (
+                            mode == NOTICE_MODE_AUTO and _template_uses_wash(template_key)):
+                        _decorate_download_message(result, submission)
+                except Exception as err:
+                    logger.debug(f"[PlaybackBestVersion] 入库通知直写标注失败（忽略）：{err}")
+            return result
 
         wrapper.__name__ = getattr(original, "__name__", NOTICE_RENDER_METHOD)
         wrapper.__doc__ = getattr(original, "__doc__", None)
@@ -434,9 +487,12 @@ def _install_notice_patch() -> bool:
 
             try:
                 _NOTICE_LOCAL.vars = values or None
+                # 下载通知不设 direct：直写仍由本函数末尾按模板判定完成
+                _NOTICE_LOCAL.direct = None
                 message = original(self, *args, **kwargs)
             finally:
                 _NOTICE_LOCAL.vars = None
+                _NOTICE_LOCAL.direct = None
 
             # 模板已经接管排版时不再二次改写；其余情况沿用直接改写标题/正文。
             try:
@@ -481,6 +537,246 @@ def _uninstall_notice_patch() -> None:
         finally:
             _NOTICE_STATE.update(installed=False, original=None)
     _uninstall_render_patch()
+
+
+# ---- 入库通知洗版标注：从宿主下载历史回查「这次入库像不像洗版」----
+
+# 判定结果的短缓存：(媒体来源, 媒体ID, 窗口小时) -> (时间戳, 记录列表)
+_ORG_LOOKUP_CACHE: Dict[Tuple[str, str, int], Tuple[float, List[Dict[str, Any]]]] = {}
+_ORG_LOOKUP_TTL = 60
+
+
+def _media_identity(mediainfo: Any, meta: Any) -> Tuple[Optional[str], Optional[str]]:
+    """取媒体身份（media_source / media_id），媒体信息优先、元数据兜底。"""
+    for obj in (mediainfo, meta):
+        if obj is None:
+            continue
+        source = getattr(obj, "media_source", None)
+        ident = getattr(obj, "media_id", None)
+        if source and ident:
+            return str(getattr(source, "value", source)), str(ident)
+    return None, None
+
+
+def _wash_upgrade_downloads(media_source: str, media_id: str, window_hours: int) -> List[Dict[str, Any]]:
+    """窗口期内该媒体的「洗版」下载记录。
+
+    只认宿主自己写下的证据：downloadhistory.note 里的 subscription_download，
+    且 submission_type == "upgrade"（首次订阅是 "initial"）。
+    命中结果按 (媒体, 窗口) 缓存 60 秒：批量入库会连着发很多条通知，
+    而洗版下载记录在入库之前就已经落库，短缓存不会漏掉新记录。
+    """
+    if not media_source or not media_id:
+        return []
+    cache_key = (str(media_source), str(media_id), int(window_hours))
+    cached = _ORG_LOOKUP_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < _ORG_LOOKUP_TTL:
+        return cached[1]
+
+    from sqlalchemy import select
+
+    from app.db.models.downloadhistory import DownloadHistory
+    from app.db.session import SessionFactory
+
+    cutoff = (datetime.datetime.now() - datetime.timedelta(hours=max(1, window_hours))) \
+        .strftime("%Y-%m-%d %H:%M:%S")
+    session = SessionFactory()
+    try:
+        rows = session.execute(
+            select(
+                DownloadHistory.seasons,
+                DownloadHistory.episodes,
+                DownloadHistory.note,
+            ).where(
+                DownloadHistory.media_source == media_source,
+                DownloadHistory.media_id == str(media_id),
+                DownloadHistory.date >= cutoff,
+            ).order_by(DownloadHistory.id.desc())
+        ).all()
+    finally:
+        session.close()
+
+    records: List[Dict[str, Any]] = []
+    for seasons, episodes, note in rows:
+        submission = note.get("subscription_download") if isinstance(note, dict) else None
+        if not isinstance(submission, dict) or submission.get("submission_type") != "upgrade":
+            continue
+        records.append({
+            "seasons": seasons or "",
+            "episodes": episodes or "",
+            "upgrade_episodes": list(submission.get("upgrade_episodes") or []),
+            "best_version_full": bool(submission.get("best_version_full")),
+        })
+    _ORG_LOOKUP_CACHE[cache_key] = (time.time(), records)
+    if len(_ORG_LOOKUP_CACHE) > 200:
+        _ORG_LOOKUP_CACHE.clear()
+        _ORG_LOOKUP_CACHE[cache_key] = (time.time(), records)
+    return records
+
+
+def _episode_number_set(values: Any) -> set:
+    """把集号序列（可能是字符串）转成整数集合。"""
+    numbers = set()
+    for value in values or []:
+        try:
+            numbers.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return numbers
+
+
+def _find_organize_wash(meta: Any, mediainfo: Any) -> Optional[Dict[str, Any]]:
+    """判断本次入库是不是洗版成果，是则返回可直接喂给模板的 submission。
+
+    判定口径：同一媒体（media_source + media_id）在窗口期内有一条 upgrade 下载记录，
+    且本次入库的季/集与它升级过的集有交集（电影不判季集，命中即算）。
+    拿不到媒体身份、类型是音乐、或没有命中时返回 None（保持宿主原生通知）。
+    """
+    if not _ORG_STATE.get("enabled"):
+        return None
+    media_type = getattr(mediainfo, "type", None) or getattr(meta, "type", None)
+    # 只处理影视：音乐没有季集概念，误判成本高于收益
+    if media_type not in (MediaType.TV, MediaType.MOVIE):
+        return None
+    media_source, media_id = _media_identity(mediainfo, meta)
+    if not media_source or not media_id:
+        return None
+
+    is_movie = media_type != MediaType.TV
+    season = None
+    wanted: set = set()
+    if not is_movie:
+        # 季：优先 begin_season，其次解析 season 文本（"S01"）
+        try:
+            season = int(getattr(meta, "begin_season", None) or 0) or None
+        except (TypeError, ValueError):
+            season = None
+        if season is None:
+            match = re.search(r"S(\d+)", str(getattr(meta, "season", "") or ""))
+            if match:
+                season = int(match.group(1))
+        wanted = _episode_number_set(getattr(meta, "episode_list", None))
+    window = int(_ORG_STATE.get("window_hours") or ORG_DEFAULT_WINDOW)
+    records = _wash_upgrade_downloads(media_source, media_id, window)
+    if not records:
+        return None
+
+    for record in records:
+        hit: set = set()
+        if not is_movie:
+            seasons = str(record.get("seasons") or "")
+            if season and seasons and ("S%02d" % season) not in seasons:
+                continue
+            upgraded = _episode_number_set(record.get("upgrade_episodes")) \
+                or _parse_episode_text(record.get("episodes"))
+            if not upgraded:
+                continue
+            if wanted:
+                hit = upgraded & wanted
+                if not hit:
+                    continue
+            else:
+                hit = upgraded
+        return {
+            "submission_type": "upgrade",
+            "best_version_full": bool(record.get("best_version_full")),
+            "upgrade_episodes": sorted(hit),
+        }
+    return None
+
+
+def _create_organize_patch(owner: Any, original: Any) -> Any:
+    """构造 send_transfer_message 的包装函数：判定 → 注入模板变量 → 交给渲染补丁。"""
+
+    def wrapper(self, *args, **kwargs):
+        meta = kwargs.get("meta")
+        mediainfo = kwargs.get("mediainfo")
+        if meta is None and len(args) > 0:
+            meta = args[0]
+        if mediainfo is None and len(args) > 1:
+            mediainfo = args[1]
+
+        submission = None
+        try:
+            submission = _find_organize_wash(meta, mediainfo)
+        except Exception as err:
+            logger.debug(f"[PlaybackBestVersion] 入库洗版判定异常（忽略）：{err}")
+            submission = None
+        if not submission:
+            return original(self, *args, **kwargs)
+
+        try:
+            values = _wash_template_vars(submission)
+        except Exception as err:
+            logger.debug(f"[PlaybackBestVersion] 生成入库洗版变量失败（忽略）：{err}")
+            values = {}
+
+        try:
+            _NOTICE_LOCAL.vars = values or None
+            _NOTICE_LOCAL.direct = (submission, ORG_TEMPLATE_KEY) if values else None
+            _ORG_STATE["marked"] = int(_ORG_STATE.get("marked") or 0) + 1
+            title = getattr(mediainfo, "title", None) or getattr(meta, "title", None) or ""
+            logger.info(
+                "[PlaybackBestVersion] 入库通知标注洗版：%s（%s）" % (title, _wash_detail_line(submission))
+            )
+            return original(self, *args, **kwargs)
+        finally:
+            _NOTICE_LOCAL.vars = None
+            _NOTICE_LOCAL.direct = None
+
+    wrapper.__name__ = getattr(original, "__name__", ORG_TARGET_METHOD)
+    wrapper.__doc__ = getattr(original, "__doc__", None)
+    wrapper._pbs_orgmark = True
+    wrapper._pbs_orgmark_original = original
+    return wrapper
+
+
+def _install_organize_patch() -> bool:
+    """安装入库通知洗版标注补丁（幂等）。"""
+    with _ORG_LOCK:
+        if _ORG_STATE.get("installed"):
+            return True
+        try:
+            module = __import__(ORG_TARGET_MODULE, fromlist=[ORG_TARGET_CLASS])
+            owner = getattr(module, ORG_TARGET_CLASS)
+        except Exception as err:
+            logger.error(f"[PlaybackBestVersion] 找不到宿主整理通知模块，入库标注未启用：{err}")
+            return False
+
+        original = getattr(owner, ORG_TARGET_METHOD, None)
+        if not callable(original):
+            logger.error("[PlaybackBestVersion] 宿主入库通知方法不存在，入库标注未启用")
+            return False
+        if getattr(original, "_pbs_orgmark", False):
+            _ORG_STATE.update(installed=True, original=getattr(original, "_pbs_orgmark_original", original))
+            logger.info("[PlaybackBestVersion] 入库标注补丁已存在，跳过重复安装")
+            _install_render_patch()
+            return True
+
+        setattr(owner, ORG_TARGET_METHOD, _create_organize_patch(owner, original))
+        _ORG_STATE.update(installed=True, original=original)
+        logger.info("[PlaybackBestVersion] 已安装入库通知洗版标注补丁")
+    # 入库通知的变量注入与直写兜底都依赖渲染入口补丁
+    _install_render_patch()
+    return True
+
+
+def _uninstall_organize_patch() -> None:
+    """还原宿主入库通知方法（不碰渲染补丁，下载通知可能还在用）。"""
+    with _ORG_LOCK:
+        if not _ORG_STATE.get("installed"):
+            return
+        original = _ORG_STATE.get("original")
+        try:
+            module = __import__(ORG_TARGET_MODULE, fromlist=[ORG_TARGET_CLASS])
+            owner = getattr(module, ORG_TARGET_CLASS)
+            if callable(original):
+                setattr(owner, ORG_TARGET_METHOD, original)
+                logger.info("[PlaybackBestVersion] 已卸载入库通知洗版标注补丁")
+        except Exception as err:
+            logger.warning(f"[PlaybackBestVersion] 卸载入库标注补丁失败：{err}")
+        finally:
+            _ORG_STATE.update(installed=False, original=None)
 
 
 # ---- 重复下载去重（同一个种子被宿主重复记账、重复发通知）----
@@ -652,6 +948,71 @@ def _wash_notice_sample() -> Dict[str, Any]:
     return {"title": marked.title, "text": marked.text}
 
 
+def _wash_organize_sample() -> Dict[str, Any]:
+    """入库通知的标注示例（只演示直写效果，不发送通知）。"""
+
+    class _Sample:
+        title = "示例剧集 S01 E03-E06 已入库"
+        text = "类型：电视剧，质量：2160p DV，共 4 个文件，大小：12.3 GB"
+
+    sample = _Sample()
+    marked = _decorate_download_message(sample, {
+        "submission_type": "upgrade",
+        "best_version_full": False,
+        "upgrade_episodes": [3, 4, 5, 6],
+    })
+    return {"title": marked.title, "text": marked.text}
+
+
+class _ProbeMeta:
+    """探针用的假元数据（只实现判定需要的几个字段）。"""
+
+    def __init__(self, media_id: str, season: Optional[int], episodes: List[int]):
+        self.media_source = "themoviedb"
+        self.media_id = str(media_id)
+        self.begin_season = season
+        self.episode_list = list(episodes)
+        self.type = MediaType.TV
+        self.title = "probe"
+
+
+class _ProbeInfo:
+    """探针用的假媒体信息。"""
+
+    def __init__(self, media_id: str, season: Optional[int], episodes: List[int]):
+        self.media_source = "themoviedb"
+        self.media_id = str(media_id)
+        self.type = MediaType.TV
+        self.title = "probe"
+        self.season = season
+        self.episodes = list(episodes)
+
+
+def _probe_organize_wash(media_id: str, season: Optional[int], episodes: List[int]) -> Dict[str, Any]:
+    """用给定的媒体/季/集现场跑一遍入库洗版判定，返回可读结论（不发送通知）。"""
+    meta = _ProbeMeta(media_id, season, episodes)
+    info = _ProbeInfo(media_id, season, episodes)
+    window = int(_ORG_STATE.get("window_hours") or ORG_DEFAULT_WINDOW)
+    try:
+        records = _wash_upgrade_downloads("themoviedb", str(media_id), window)
+    except Exception as err:
+        return {"ok": False, "error": str(err)}
+    submission = None
+    try:
+        submission = _find_organize_wash(meta, info)
+    except Exception as err:
+        return {"ok": False, "error": str(err), "records": len(records)}
+    return {
+        "ok": True,
+        "enabled": bool(_ORG_STATE.get("enabled")),
+        "window_hours": window,
+        "download_records": len(records),
+        "is_wash": bool(submission),
+        "match": submission or {},
+        "sample": _wash_organize_sample(),
+    }
+
+
 class PlaybackBestVersion(_PluginBase):
     """播放进度洗版插件。
 
@@ -662,12 +1023,12 @@ class PlaybackBestVersion(_PluginBase):
     plugin_name = "播放进度洗版"
     # 插件描述
     plugin_desc = "按媒体服务器的播放进度决定订阅是否继续洗版：已看过的剧集/电影不再重复洗版；" \
-                  "并把「这次是洗版」作为模板变量 is_wash / wash_text 送进下载通知，" \
+                  "并把「这次是洗版」作为模板变量 is_wash / wash_text 送进下载通知与入库通知，" \
                   "可在通知模板里自行排版（不写模板则自动加【洗版】标记），同时拦截同一资源的重复下载记账与重复通知。"
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.8.0"
+    plugin_version = "3.9.0"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -748,6 +1109,9 @@ class PlaybackBestVersion(_PluginBase):
         self._mark_prefix = NOTICE_PREFIX
         self._mark_detail = True
         self._mark_mode = NOTICE_MODE_AUTO
+        # 入库通知也标洗版：是否启用、关联窗口（小时，从洗版下载记录反查）
+        self._mark_organize = True
+        self._organize_window = ORG_DEFAULT_WINDOW
         # 重复下载去重：是否启用、判定窗口（小时）
         self._dedupe_download = True
         self._dedupe_window = DEDUPE_DEFAULT_WINDOW
@@ -788,11 +1152,22 @@ class PlaybackBestVersion(_PluginBase):
         _NOTICE_STATE["detail"] = self._mark_detail
         _NOTICE_STATE["mode"] = self._mark_mode
         # 改过模板/前缀后立刻重新判定一次「模板是否接管排版」
-        _NOTICE_TEMPLATE_CACHE["at"] = 0.0
+        _NOTICE_TEMPLATE_CACHE.clear()
         if self._enabled and self._mark_wash:
             _install_notice_patch()
         else:
             _uninstall_notice_patch()
+
+        # 入库通知洗版标注：跟随标注总开关（mark_wash），另有独立开关与关联窗口
+        self._mark_organize = bool(config.get("mark_organize", True))
+        self._organize_window = min(168, max(1, self._as_int(
+            config.get("organize_wash_hours"), ORG_DEFAULT_WINDOW)))
+        _ORG_STATE["enabled"] = bool(self._enabled and self._mark_wash and self._mark_organize)
+        _ORG_STATE["window_hours"] = self._organize_window
+        if _ORG_STATE["enabled"]:
+            _install_organize_patch()
+        else:
+            _uninstall_organize_patch()
 
         # 重复下载去重：默认开启，窗口默认 6 小时
         self._dedupe_download = bool(config.get("dedupe_download", True))
@@ -879,14 +1254,20 @@ class PlaybackBestVersion(_PluginBase):
             "flow": "同 hash 且集数已被覆盖 → 按宿主的「任务已存在」口径结算（不重复通知、不重复记文件）",
         }
 
-    def api_washmark(self) -> Dict[str, Any]:
-        """插件 API：洗版标注补丁状态、模板变量与示例。"""
-        return {
+    def api_washmark(self, probe_media: Optional[str] = None,
+                     probe_season: Optional[int] = None,
+                     probe_episode: Optional[int] = None) -> Dict[str, Any]:
+        """插件 API：洗版标注补丁状态、模板变量与示例。
+
+        带上 probe_media（TMDB ID）时，现场用一条假的入库上下文跑一遍判定，
+        可以验证「入库通知洗版标注」的关联规则，不发送任何通知、不写库。
+        """
+        data: Dict[str, Any] = {
             "enabled": bool(self._mark_wash),
             "patched": bool(_NOTICE_STATE.get("installed")),
             "render_patched": bool(_NOTICE_STATE.get("render_installed")),
             "mode": _NOTICE_STATE.get("mode") or NOTICE_MODE_AUTO,
-            "template_driven": _template_uses_wash(),
+            "template_driven": _template_uses_wash("downloadAdded"),
             "title_prefix": _NOTICE_STATE.get("prefix") or NOTICE_PREFIX,
             "show_detail": bool(_NOTICE_STATE.get("detail", True)),
             "template_vars": {
@@ -897,7 +1278,22 @@ class PlaybackBestVersion(_PluginBase):
                 "wash_text": "正文首行说明，如 洗版：升级 E03-E06",
             },
             "sample": _wash_notice_sample(),
+            "organize": {
+                "enabled": bool(self._mark_organize),
+                "patched": bool(_ORG_STATE.get("installed")),
+                "active": bool(_ORG_STATE.get("enabled")),
+                "window_hours": int(_ORG_STATE.get("window_hours") or ORG_DEFAULT_WINDOW),
+                "template_key": ORG_TEMPLATE_KEY,
+                "template_driven": _template_uses_wash(ORG_TEMPLATE_KEY),
+                "marked": int(_ORG_STATE.get("marked") or 0),
+                "sample": _wash_organize_sample(),
+            },
         }
+        if probe_media:
+            episodes = [int(probe_episode)] if probe_episode is not None else []
+            data["organize_probe"] = _probe_organize_wash(
+                str(probe_media), probe_season, episodes)
+        return data
 
     def _latest_run(self) -> Dict[str, Any]:
         """取最新一轮执行结果。
@@ -1032,7 +1428,7 @@ class PlaybackBestVersion(_PluginBase):
         )
 
     def _notice_html(self) -> str:
-        """摘要下方的洗版标注状态条：一眼看出下载通知标注是否生效、由谁排版。"""
+        """摘要下方的洗版标注状态条：一眼看出下载/入库通知标注是否生效、由谁排版。"""
         patched = bool(_NOTICE_STATE.get("installed"))
         if patched and self._mark_wash:
             dot, text = "#43A047", "下载通知洗版标注：已生效"
@@ -1042,7 +1438,7 @@ class PlaybackBestVersion(_PluginBase):
             dot, text = "#757575", "下载通知洗版标注：未启用"
 
         mode = _NOTICE_STATE.get("mode") or NOTICE_MODE_AUTO
-        template_driven = _template_uses_wash() if patched else False
+        template_driven = _template_uses_wash("downloadAdded") if patched else False
         if not self._mark_wash:
             detail = "标注已关闭，通知与宿主原生一致"
         elif mode == NOTICE_MODE_TEMPLATE:
@@ -1057,16 +1453,42 @@ class PlaybackBestVersion(_PluginBase):
                 detail += " · 注明集数"
             detail += " · 前缀 %s" % escape(str(_NOTICE_STATE.get("prefix") or NOTICE_PREFIX))
 
-        return (
-            '<div style="display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;'
-            'padding:6px 12px;border-radius:8px;font-size:13px;line-height:1.6;margin-top:6px;'
-            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);'
-            'color:rgba(var(--v-theme-on-surface,0,0,0),.8)">'
-            f'<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">'
-            f'<span style="width:8px;height:8px;border-radius:50%;background:{dot};display:inline-block"></span>'
-            f'{escape(text)}</span>'
-            f'<span style="white-space:nowrap;opacity:.75">{detail}</span></div>'
-        )
+        # 入库通知单独一行：它是另一条链路（整理完成），判定与模板键都不一样
+        org_patched = bool(_ORG_STATE.get("installed"))
+        org_active = bool(_ORG_STATE.get("enabled"))
+        if org_patched and org_active:
+            org_dot, org_text = "#43A047", "入库通知洗版标注：已生效"
+        elif org_active:
+            org_dot, org_text = "#FB8C00", "入库通知洗版标注：已启用但补丁未装（看日志）"
+        elif self._mark_wash and not self._mark_organize:
+            org_dot, org_text = "#757575", "入库通知洗版标注：已关闭"
+        else:
+            org_dot, org_text = "#757575", "入库通知洗版标注：未启用"
+        if not self._mark_wash:
+            org_detail = "随「启用洗版标注」总开关关闭"
+        elif not self._mark_organize:
+            org_detail = "只标下载通知"
+        else:
+            window = int(_ORG_STATE.get("window_hours") or ORG_DEFAULT_WINDOW)
+            org_detail = "按下载历史反查洗版（%d 小时窗口）" % window
+            if org_patched and _template_uses_wash(ORG_TEMPLATE_KEY):
+                org_detail += " · 模板已接管（organizeSuccess）"
+            elif org_patched:
+                org_detail += " · 插件直接改写标题正文"
+
+        def _row(dot_color: str, label: str, note: str) -> str:
+            return (
+                '<div style="display:flex;flex-wrap:wrap;gap:2px 12px;align-items:center;'
+                'padding:6px 12px;border-radius:8px;font-size:13px;line-height:1.6;margin-top:6px;'
+                'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);'
+                'color:rgba(var(--v-theme-on-surface,0,0,0),.8)">'
+                f'<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">'
+                f'<span style="width:8px;height:8px;border-radius:50%;background:{dot_color};'
+                f'display:inline-block"></span>{escape(label)}</span>'
+                f'<span style="white-space:nowrap;opacity:.75">{note}</span></div>'
+            )
+
+        return _row(dot, text, detail) + _row(org_dot, org_text, org_detail)
 
     def _dedupe_html(self) -> str:
         """摘要下方的重复下载去重状态条。"""
@@ -1389,10 +1811,13 @@ class PlaybackBestVersion(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "title": "下载通知洗版标注",
-                                            "text": "只给「洗版（升级）」触发的下载通知加标记：标题前加前缀，"
+                                            "title": "下载 / 入库通知洗版标注",
+                                            "text": "只给「洗版（升级）」触发的通知加标记：标题前加前缀，"
                                                     "正文首行写明升级了哪些集（全集洗版 / 电影分别有不同的写法）。"
-                                                    "首次订阅的下载不受影响，也不需要重启宿主，保存即生效。",
+                                                    "下载通知的结论来自宿主的订阅下载上下文；入库通知（整理完成）"
+                                                    "则按「媒体 + 季 + 集号 + 时间窗」回查下载历史里的洗版记录，"
+                                                    "命中才标注。首次订阅的下载与入库都不受影响，"
+                                                    "也不需要重启宿主，保存即生效。",
                                         },
                                     }
                                 ],
@@ -1455,6 +1880,32 @@ class PlaybackBestVersion(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "mark_organize", "label": "入库通知也标注"}}
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "organize_wash_hours",
+                                            "label": "入库关联窗口（小时）",
+                                            "placeholder": f"默认 {ORG_DEFAULT_WINDOW}；按下载历史反查洗版的时间范围",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -1468,7 +1919,9 @@ class PlaybackBestVersion(_PluginBase):
                                                     "wash_episodes（如 E03-E06、E09）、wash_full（是否全集）、"
                                                     "wash_text（如 洗版：升级 E03-E06）；首次订阅不注入这些变量。"
                                                     "模板里写了 is_wash 或 wash_text，就视为「模板接管排版」，插件不再改标题正文；"
-                                                    "没写则自动按上面的前缀与集数标注。示例："
+                                                    "没写则自动按上面的前缀与集数标注。下载通知（downloadAdded）与"
+                                                    "入库通知（organizeSuccess）是两个模板，各自独立判定：只改了下载模板时，"
+                                                    "入库通知仍由插件直接加标记。示例："
                                                     "'title': '{% if is_wash %}{{ wash_prefix }}{% endif %}{{ title_year }}…'。",
                                         },
                                     }
@@ -2738,6 +3191,8 @@ class PlaybackBestVersion(_PluginBase):
             "mark_prefix": self._mark_prefix,
             "mark_detail": self._mark_detail,
             "mark_mode": self._mark_mode,
+            "mark_organize": self._mark_organize,
+            "organize_wash_hours": self._organize_window,
             "dedupe_download": self._dedupe_download,
             "dedupe_window_hours": self._dedupe_window,
         }

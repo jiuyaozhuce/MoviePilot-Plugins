@@ -60,9 +60,9 @@
   },
   "PlaybackBestVersion": {
     "name": "播放进度洗版",
-    "description": "按媒体服务器（Emby / Jellyfin）的分集播放进度决定订阅是否继续洗版：进度达到阈值（或播过、或标记已看）的集写成洗版完成优先级，宿主不再为它搜索更高版本；电影命中则整部停止洗版。把「这次是洗版」作为模板变量 is_wash / wash_prefix / wash_episodes / wash_full / wash_text 送进下载通知，可在通知模板里自行排版（模板不写这些变量则自动加【洗版】前缀并注明集数）；同时拦截同一资源的重复下载记账与重复通知。支持多服务器、多用户合并、Webhook 即时触发、试运行与通知。",
-    "labels": "订阅,洗版,媒体服务器,Emby,Jellyfin,Webhook,通知标注,模板变量",
-    "version": "3.8.0",
+    "description": "按媒体服务器（Emby / Jellyfin）的分集播放进度决定订阅是否继续洗版：进度达到阈值（或播过、或标记已看）的集写成洗版完成优先级，宿主不再为它搜索更高版本；电影命中则整部停止洗版。把「这次是洗版」作为模板变量 is_wash / wash_prefix / wash_episodes / wash_full / wash_text 送进下载通知与入库通知，可在通知模板里自行排版（模板不写这些变量则自动加【洗版】前缀并注明集数）；入库通知按「媒体 + 季 + 集号 + 时间窗」回查下载历史里的洗版记录判定；同时拦截同一资源的重复下载记账与重复通知。支持多服务器、多用户合并、Webhook 即时触发、试运行与通知。",
+    "labels": "订阅,洗版,媒体服务器,Emby,Jellyfin,Webhook,通知标注,入库标注,模板变量",
+    "version": "3.9.0",
     "icon": "playbackbestversion.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -71,6 +71,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v3.9.0": "新增「入库通知洗版标注」：入库（整理完成）通知走的是另一条链路 —— TransferHistoryOwner.send_transfer_message 只拿得到元数据与整理结果，没有订阅下载上下文。改为在运行期包装该方法，按「媒体身份 + 季 + 集号 + 时间窗（默认 48 小时，可配）」回查宿主下载历史 downloadhistory.note 里的 subscription_download，命中 submission_type=upgrade 且集号有交集才标注，完全不改宿主代码。标注同样支持模板变量（is_wash / wash_prefix / wash_episodes / wash_full / wash_text）；下载与入库两个模板（downloadAdded / organizeSuccess）各自独立判定是否接管排版，只改了下载模板时入库通知仍由插件直接加标记。配置页新增「入库通知也标注 / 入库关联窗口（小时）」，详情页多一行入库标注状态条，接口 /washmark 增加 organize 段，并支持 probe_media / probe_season / probe_episode 现场跑一遍判定（不发通知）。",
       "v3.8.0": "新增「通知模板变量」：运行期把订阅下载上下文转成 is_wash（是否洗版）、wash_prefix（标题前缀）、wash_episodes（如 E03-E06、E09）、wash_full（是否全集）、wash_text（正文首行说明）五个变量注入下载通知的模板渲染上下文，模板里写 {% if is_wash %} 即可自行排版；首次订阅不注入，模板天然走不到。配置页新增「标注方式」（自动 / 插件直接改写 / 只注入变量），默认自动：模板里出现 is_wash 或 wash_text 就视为模板接管、插件不再二次改写，否则回落到直接加前缀与集数，保证任何情况下都有标注。详情页状态条同步显示当前由谁排版，接口 /washmark 增加 mode、render_patched、template_driven 与变量说明。",
       "v3.7.0": "新增「重复下载去重」：包住宿主下载结算入口 _settle_download_success，同一种子（hash 相同）在窗口期（默认 6 小时，可配）已记录过且覆盖本次要的集时，按宿主「任务已存在」口径结算 —— 不重复发通知、不重复记文件明细，并触发宿主自带的重复资源退避；真正升级到更高档的不同种子不受影响。配置页新增「拦截重复下载 / 判定窗口」，详情页摘要下方加去重状态条，接口新增 /dedupe。起因：洗版门槛只在入库时写回，下载器对重复种子不报错只返回已有任务，宿主会重复记账并重复通知（实测谷雨 E23-E26、走马上任 E35 各重复一次）。",
       "v3.6.0": "并入原「下载通知洗版标注 (DownloadWashMark)」插件：洗版（升级）触发的下载通知自动加标题前缀【洗版】，正文首行写明「洗版：升级 E03-E26 / 全集覆盖 / 覆盖已有版本」，首次订阅的下载不受影响；配置页新增「启用洗版标注 / 标题前缀 / 正文注明升级集数」三项，详情页摘要下方显示标注状态条，插件接口新增 /washmark 查看补丁状态与示例。原独立插件移除，配置项沿用默认值（【洗版】+ 注明集数），无需迁移。",

@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| 播放进度洗版 (PlaybackBestVersion) | 3.8.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版；洗版信息作为模板变量 `is_wash` 等注入下载通知（也可自动加【洗版】标记）；拦截同一种子的重复下载与重复通知 |
+| 播放进度洗版 (PlaybackBestVersion) | 3.9.0 | 按 Emby / Jellyfin 分集播放进度决定订阅是否继续洗版；洗版信息作为模板变量 `is_wash` 等注入下载通知与入库通知（也可自动加【洗版】标记）；拦截同一种子的重复下载与重复通知 |
 | 憨憨登录保活提醒 (HHClubKeepAlive) | 1.2.1 | 读取憨憨「用户访问记录」，按 30 天（封存 400 天）保活线推送剩余天数提醒 |
 | 豆瓣书影音档案 (DouBanWatching) | 1.9.20 | 将剧集在看、看完状态同步到豆瓣书影音档案，含仪表盘海报墙 |
 
@@ -84,6 +84,30 @@ id=HDAUDIO  name=高清音轨  include=TrueHD|DTS[- .]?HD|DTS[- .]?X|LPCM|Atmos|
 模板里出现上述任一变量 → 视为模板接管排版，插件不再二次改写（避免双重标注）；没出现 → 自动回落到插件直接加前缀，保证不写模板也一定有标注。
 
 两处补丁都只做运行期方法替换，不写库、不改宿主文件：`_build_download_notification` 用来从调用栈取 `context.subscription_download`，`MessageTemplateHelper.render` 用来补模板变量。插件停用或关掉标注会立刻还原宿主方法，不阻断下载。
+
+## 入库通知洗版标注（v3.9.0 新增）
+
+入库（整理完成）通知是另一条链路：`TransferChain` 结算后调 `TransferHistoryOwner.send_transfer_message(meta, mediainfo, transferinfo, …)`，那里只剩元数据与整理结果，**拿不到** `context.subscription_download`，所以下载通知的那套判定在这里用不了。
+
+做法是改从宿主自己写下的事实反查：`downloadhistory.note` 里的 `subscription_download` 就带着每次订阅下载的结论（`submission_type` 是 `upgrade` 还是 `initial`、升级了哪些集）。插件在运行期包装 `send_transfer_message`，按下面的口径判断本次入库：
+
+1. **媒体身份**：`media_source` + `media_id`（媒体信息优先、元数据兜底，与宿主 `resolve_media_identity` 同源）；
+2. **季 / 集**：`begin_season` + `episode_list`（季缺失时回退解析 `S01` 文本）；
+3. **时间窗**：默认 48 小时（可配 1~168），洗版下载到入库通常几十分钟；
+4. **命中条件**：窗口期内存在同媒体的 `upgrade` 记录，且该记录升级过的集与本次入库集**有交集**；电影不判季集，命中即算。
+
+命中后才注入 `is_wash` / `wash_prefix` / `wash_episodes` / `wash_full` / `wash_text`，与下载通知共用同一套模板变量；首次订阅的入库通知完全不动。
+
+- 配置页「入库通知也标注」（默认开，跟随「启用洗版标注」总开关）与「入库关联窗口（小时）」（默认 48）；
+- 下载与入库是**两个模板**（`downloadAdded` / `organizeSuccess`），各自独立判定是否接管排版：只改了下载模板时，入库通知仍由插件直接加标记；
+- 详情页摘要下方多一行入库标注状态条，接口 `/washmark` 增加 `organize` 段；带 `probe_media`（TMDB ID）、`probe_season`、`probe_episode` 可现场跑一遍判定（不发通知、不写库）：
+
+```bash
+curl -s "http://<host>/api/v1/plugin/PlaybackBestVersion/washmark?probe_media=279155&probe_season=1&probe_episode=19&apikey=<token>"
+# → organize_probe: {"download_records": 9, "is_wash": true, "match": {"upgrade_episodes": [19], …}}
+```
+
+判定失败、媒体身份缺失、类型是音乐、或没有窗口内的 `upgrade` 记录时一律返回「不是洗版」，通知保持宿主原生样子 —— **只可能少标，不会把首次订阅误标成洗版**。
 
 ## 重复下载去重（v3.7.0 新增）
 

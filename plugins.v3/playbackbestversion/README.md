@@ -55,6 +55,8 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 | 标题前缀 | 【洗版】 | 已带该前缀则不重复添加 |
 | 正文注明升级集数 | 开 | 正文首行写 `洗版：升级 E03-E26` / `洗版：全集覆盖` / `洗版：覆盖已有版本` |
 | 标注方式 | 自动 | `自动`：模板里写了 `is_wash` / `wash_text` 就交给模板排版，否则插件直接改写；`插件直接改写`；`只注入模板变量` |
+| 入库通知也标注 | 开 | 整理完成（入库）通知同样标洗版；跟随「启用洗版标注」总开关（v3.9.0 新增） |
+| 入库关联窗口（小时） | 48 | 入库时按媒体 + 季 + 集号回查下载历史里多久以内的 `upgrade` 记录；取值 1~168 |
 | 拦截重复下载 | 开 | 同一种子在窗口期内已记录过时，按宿主「任务已存在」口径结算（见下节） |
 | 判定窗口（小时） | 6 | 超过窗口的同一种子当成「删了重下」，不拦截；取值 1~72 |
 
@@ -97,6 +99,47 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 - 模板里出现 `is_wash` / `wash_text` / `wash_prefix` / `wash_episodes` 任一 → 视为**模板接管排版**，插件不再动标题正文（避免「【洗版】🚿 洗版 xxx」这种双重标注）；判定结果缓存 30 秒
 - 模板没写这些变量 → 自动回落到插件直接加前缀与集数，**保证不写模板也一定有标注**
 - 「标注方式」选 `只注入模板变量` 时插件只给变量，模板没写就什么都不会加；选 `插件直接改写` 时忽略模板、永远由插件加
+
+
+## 入库通知洗版标注（v3.9.0）
+
+下载标注靠调用栈里的 `context.subscription_download`；入库（整理完成）通知没有这个东西 —— `TransferChain` 结算后调 `TransferHistoryOwner.send_transfer_message(meta, mediainfo, transferinfo, …)`，只剩元数据与整理结果。
+
+所以改从宿主自己写下的事实反查（`downloadhistory.note`）：
+
+```json
+{"subscription_download": {"subscription_id": 280, "submission_type": "upgrade",
+                           "best_version_full": false, "upgrade_episodes": [19, 20, 21, 22]}}
+```
+
+插件包装 `send_transfer_message`，按「媒体身份（`media_source` + `media_id`）+ 季（`begin_season`，缺失时解析 `S01`）+ 集号（`episode_list`）+ 时间窗（默认 48 小时）」查这张表：
+
+- 命中一条 `upgrade` 记录，且升级过的集与本次入库集**有交集** → 本次入库是洗版成果，注入 `is_wash` 等变量；
+- 电影不判季集，窗口内有 `upgrade` 记录即算；
+- 没有命中 / 媒体身份缺失 / 音乐 → 什么都不做，通知保持宿主原生样子。
+
+入库模板（`NotificationTemplates.organizeSuccess`）写法与下载一致：
+
+```jinja2
+'title': '{% if is_wash %}{{ wash_prefix }}{% endif %}{{ title_year }}… 已入库',
+'text':  '{% if wash_text %}{{ wash_text }}\n{% endif %}类型：{{ type }}…'
+```
+
+渲染结果：
+
+```
+首次订阅  谷雨 (2026) S01 E19-E22 已入库
+          类型：电视剧，质量：2160p DV，共 4 个文件，大小：12.3 GB
+
+洗版入库  【洗版】谷雨 (2026) S01 E19-E22 已入库
+          洗版：升级 E19-E22 ⏎ 类型：电视剧，质量：2160p DV，共 4 个文件，大小：12.3 GB
+```
+
+要点：
+
+- 下载与入库是**两个模板**，`_template_uses_wash()` 按模板分别判定 —— 只给 `downloadAdded` 写了 `is_wash` 时，入库通知仍由插件直接改写，不会因为「模板没接管」而漏标；
+- `send_transfer_message` 不返回 `Message`，直写兜底放在渲染入口之后（`MessageTemplateHelper.render` 返回后补一笔），仍然只加标题前缀与正文首行，不改其它字段；
+- 现场验证：`GET /api/v1/plugin/PlaybackBestVersion/washmark?probe_media=279155&probe_season=1&probe_episode=19&apikey=…` → `organize_probe.is_wash = true`；把 `probe_episode` 换成没洗过的集号则为 `false`（实测谷雨 S01：E19 命中、E05 不命中）。
 
 
 ## 重复下载去重
@@ -156,6 +199,7 @@ MoviePilot V3 插件：按媒体服务器（Emby / Jellyfin）上的**分集播�
 
 - 上游：[xlmc/MoviePilot-Plugins](https://github.com/xlmc/MoviePilot-Plugins) 的 `PlaybackBestVersion` v3.2.0（再上游为 justzerock / jxxghp 官方插件仓库）
 - v3.3.0 起由 `jiuyaozhuce` 接管维护并增加 Webhook 即时触发；作者与项目地址改指本仓库，图标改为仓库根目录的 `playbackbestversion.svg`
+- v3.9.0：新增「入库通知洗版标注」——入库（整理完成）通知没有订阅下载上下文，改为包装 `TransferHistoryOwner.send_transfer_message`，按「媒体身份 + 季 + 集号 + 时间窗（默认 48 小时，可配 1~168）」回查 `downloadhistory.note` 里的 `subscription_download`，命中 `upgrade` 且集号有交集才注入 `is_wash` 等变量（电影命中即算，音乐跳过）；下载与入库两个模板各自独立判定是否接管排版，`send_transfer_message` 不返回 Message 所以直写兜底放在渲染入口之后。配置页新增「入库通知也标注 / 入库关联窗口（小时）」，详情页加一行入库标注状态条，`/washmark` 增加 `organize` 段与 `probe_media` / `probe_season` / `probe_episode` 现场判定探针
 - v3.8.0：新增「通知模板变量」——把订阅下载上下文转成 `is_wash` / `wash_prefix` / `wash_episodes` / `wash_full` / `wash_text` 注入下载通知的模板渲染上下文（包宿主的 `MessageTemplateHelper.render`，只加变量、不改模板），模板里写 `{% if is_wash %}` 即可自行排版；配置页新增「标注方式」（自动 / 插件直接改写 / 只注入变量），自动模式下模板接管就不再二次改写、模板没写则回落直接加前缀；详情页状态条显示当前由谁排版，`/washmark` 增加 `mode` / `render_patched` / `template_driven` 与变量说明
 - v3.7.0：新增「重复下载去重」——包住宿主下载结算入口 `_settle_download_success`，同一种子（hash 相同）在窗口期（默认 6 小时）已记录过且覆盖本次要的集时，按宿主「任务已存在」口径结算，不重复发通知、不重复记文件明细，并触发宿主自带的重复资源退避；真正升级到更高档的不同种子不受影响。配置页新增「拦截重复下载 / 判定窗口」，详情页摘要下方加去重状态条，接口新增 `/dedupe`
 - v3.6.0：并入原独立插件「下载通知洗版标注 (DownloadWashMark)」。洗版（升级）触发的下载通知加标题前缀【洗版】，正文首行写明升级了哪些集；配置页新增「启用洗版标注 / 标题前缀 / 正文注明升级集数」，详情页摘要下方显示标注状态，接口新增 `/washmark`。补丁只在 `submission_type=upgrade` 时动手，停用插件或关掉标注即刻还原宿主方法，不写任何数据。原插件删库，配置沿用默认值无需迁移
