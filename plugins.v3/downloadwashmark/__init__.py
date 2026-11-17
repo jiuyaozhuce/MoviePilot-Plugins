@@ -228,7 +228,7 @@ class DownloadWashMark(_PluginBase):
     # 插件图标
     plugin_icon = "downloadwashmark.svg"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -393,32 +393,39 @@ class DownloadWashMark(_PluginBase):
             state_text, state_color = "已启用，但补丁未安装（看日志）", "#FB8C00"
         else:
             state_text, state_color = "未启用", "#757575"
-        body = (
-            '<div style="max-width:760px;margin:0 auto;font-size:13px;line-height:1.7">'
-            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'
-            '<span style="width:8px;height:8px;border-radius:50%;background:%s;'
-            'display:inline-block"></span>'
-            '<span style="font-size:15px;font-weight:600">%s</span></div>'
-            '<div style="padding:12px 14px;border-radius:10px;'
-            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);margin-bottom:12px">'
-            '<div>标题前缀：<b>%s</b>　正文注明集数：<b>%s</b></div>'
-            '<div style="opacity:.7;margin-top:4px">只标注「洗版升级」的下载通知，'
-            '首次订阅的下载不受影响。</div></div>'
-            '<div style="padding:12px 14px;border-radius:10px;'
-            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12)">'
-            '<div style="opacity:.7;margin-bottom:6px">标注示例</div>'
-            '<div style="font-size:15px;font-weight:600">%s</div>'
-            '<pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;'
-            'font-family:inherit;font-size:13px">%s</pre></div>'
-            "</div>"
-        ) % (
+        detail_text = "是" if _STATE.get("detail", True) else "否"
+        prefix_text = escape(self._current_prefix())
+        sample_title = escape(str(sample.get("title") or ""))
+        sample_text = escape(str(sample.get("text") or ""))
+        body = "".join([
+            '<div style="max-width:760px;margin:0 auto;font-size:13px;line-height:1.7">',
+            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">',
+            '<span style="width:8px;height:8px;border-radius:50%;background:',
             state_color,
+            ';display:inline-block"></span>',
+            '<span style="font-size:15px;font-weight:600">',
             state_text,
-            escape(self._current_prefix()),
-            "是" if _STATE.get("detail", True) else "否",
-            escape(str(sample.get("title") or "")),
-            escape(str(sample.get("text") or "")),
-        )
+            "</span></div>",
+            '<div style="padding:12px 14px;border-radius:10px;',
+            "border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12);margin-bottom:12px\">",
+            "<div>标题前缀：<b>",
+            prefix_text,
+            "</b>　正文注明集数：<b>",
+            detail_text,
+            "</b></div>",
+            '<div style="opacity:.7;margin-top:4px">只标注「洗版升级」的下载通知，'
+            "首次订阅的下载不受影响。</div></div>",
+            '<div style="padding:12px 14px;border-radius:10px;',
+            'border:1px solid rgba(var(--v-theme-on-surface,0,0,0),.12)">',
+            '<div style="opacity:.7;margin-bottom:6px">标注示例</div>',
+            '<div style="font-size:15px;font-weight:600">',
+            sample_title,
+            "</div>",
+            '<pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;',
+            'font-family:inherit;font-size:13px">',
+            sample_text,
+            "</pre></div></div>",
+        ])
         return [
             {
                 "component": "VRow",

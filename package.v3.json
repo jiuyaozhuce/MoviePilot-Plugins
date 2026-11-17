@@ -89,7 +89,7 @@
     "name": "下载通知洗版标注",
     "description": "订阅洗版（升级）触发下载时，在下载通知标题前加【洗版】标记，并在正文首行注明这次升级了哪些集；首次订阅的下载不受影响。",
     "labels": "通知,订阅,洗版",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "downloadwashmark.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -98,6 +98,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v1.0.1": "修复详情页报错：模板中的 CSS 百分比（border-radius:50%）与 Python % 格式化冲突，导致 get_page 抛 unsupported format character，详情页返回空对象；改为字符串拼接。表单与洗版标注逻辑不变。",
       "v1.0.0": "初始版本：按宿主 Context.subscription_download 的 submission_type 判定洗版，给下载通知标题加【洗版】前缀、正文首行注明升级集数（部分集压成 E03-E26）或「全集覆盖」「覆盖已有版本」；运行期包装 DownloadProcessingOwner._build_download_notification，容器重建后插件加载即自动生效，不改宿主文件、不写数据。"
     }
   }
