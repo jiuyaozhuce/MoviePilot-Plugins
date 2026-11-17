@@ -72,11 +72,13 @@ TIMELINE_MISSING = "0"     # 媒体库里没有、也没有下载记录
 TIMELINE_DOWNLOADED = "1"  # 已经有一份，但还没洗到最高版本
 TIMELINE_UPGRADED = "2"    # 已洗到最高版本（宿主口径：优先级 100）
 TIMELINE_WATCHED = "3"     # 已看过，宿主侧不会再为它洗版
+TIMELINE_PARTIAL = "4"     # 洗过版（下载历史里有 upgrade 记录），但当前仍未到最高档
 # 每个状态对应的方块配色与文字说明：填充色 / 边框色 / 悬停与图例文案
 TIMELINE_STYLES = {
     TIMELINE_MISSING: ("rgba(158,158,158,.3)", "rgba(158,158,158,.7)", "未下载"),
     TIMELINE_DOWNLOADED: ("#42A5F5", "#2E8BD6", "已下载"),
     TIMELINE_UPGRADED: ("#7E57C2", "#6A45AE", "已洗版"),
+    TIMELINE_PARTIAL: ("#FB8C00", "#D97800", "洗过版·未到顶"),
     TIMELINE_WATCHED: ("#43A047", "#358A39", "已观看"),
 }
 # 方块条最大宽度（px）：480 刚好容纳 30 集一行（12px + 3px 间距），再长就换行
@@ -141,7 +143,7 @@ class PlaybackBestVersion(_PluginBase):
     # 插件图标
     plugin_icon = "playbackbestversion.svg"
     # 插件版本
-    plugin_version = "3.4.3"
+    plugin_version = "3.5.0"
     # 插件作者
     plugin_author = "jiuyaozhuce"
     # 作者主页
@@ -215,6 +217,8 @@ class PlaybackBestVersion(_PluginBase):
         self._last_run: Dict[str, Any] = {}
         # 活动日志缓存（每轮检查只拉一次，键 = 服务器名），用于「最近观看时间」
         self._activity_cache: Dict[str, Dict[str, float]] = {}
+        # 洗版下载历史缓存（每轮只查一次）：{订阅 ID: 洗过版的集号集合}，None 表示尚未加载
+        self._upgrade_cache: Optional[Dict[str, set]] = None
 
     def init_plugin(self, config: dict = None):
         """初始化插件：读取配置、按需立即运行一次，并启动定时调度。
@@ -404,10 +408,13 @@ class PlaybackBestVersion(_PluginBase):
                     done = sum(
                         str(t.get("codes") or "").count(TIMELINE_UPGRADED) for t in timelines
                     )
+                    partial = sum(
+                        str(t.get("codes") or "").count(TIMELINE_PARTIAL) for t in timelines
+                    )
                     pending = sum(
                         str(t.get("codes") or "").count(TIMELINE_DOWNLOADED) for t in timelines
                     )
-                    items.append(f"已洗版 {done} 集，待洗 {pending} 集")
+                    items.append(f"已洗版 {done} 集，洗过未到顶 {partial} 集，待洗 {pending} 集")
             if self._dry_run:
                 items.append("试运行，未写库")
         spans = "".join(
@@ -826,6 +833,8 @@ class PlaybackBestVersion(_PluginBase):
         started = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 每轮重新拉活动日志，保证「最近观看」跟着实际播放走
         self._activity_cache = {}
+        # 洗版下载历史也每轮重查一次，新提交的洗版能立刻显示为橙色方块
+        self._upgrade_cache = None
         try:
             subscribes = self._get_best_version_subscribes()
             servers = self._get_servers()
@@ -1453,6 +1462,7 @@ class PlaybackBestVersion(_PluginBase):
         episodes = playback.get("episodes") or {}
         priorities = self._stored_priorities(subscribe)
         noted = self._note_episodes(subscribe)
+        upgraded = self._upgraded_episodes(subscribe)
         codes: List[str] = []
         for episode in target:
             progress = episodes.get(episode)
@@ -1464,9 +1474,62 @@ class PlaybackBestVersion(_PluginBase):
                 codes.append(TIMELINE_WATCHED)
             elif priority >= BEST_VERSION_DONE_PRIORITY:
                 codes.append(TIMELINE_UPGRADED)
+            elif episode in upgraded:
+                # 下载历史里确实为这一集洗过版，但当前优先级还没到最高档
+                codes.append(TIMELINE_PARTIAL)
             else:
                 codes.append(TIMELINE_DOWNLOADED)
         return {"start": target[0], "total": target[-1], "codes": "".join(codes)}
+
+    def _upgraded_episodes(self, subscribe) -> set:
+        """该订阅在下载历史里真正洗过版的集号（submission_type=upgrade）。"""
+        key = str(getattr(subscribe, "id", "") or "")
+        if not key:
+            return set()
+        if self._upgrade_cache is None:
+            self._upgrade_cache = self._load_upgrade_index()
+        return self._upgrade_cache.get(key, set())
+
+    def _load_upgrade_index(self) -> Dict[str, set]:
+        """读取下载历史里的洗版记录，返回 {订阅 ID: 洗过的集号集合}。
+
+        只认 note.subscription_download 里 submission_type=upgrade 的记录，
+        首次订阅下载（initial）不算洗版。查询失败时返回空表，不影响本轮检测。
+        """
+        index: Dict[str, set] = {}
+        try:
+            from sqlalchemy import select
+
+            from app.db.models.downloadhistory import DownloadHistory
+            from app.db.session import SessionFactory
+
+            session = SessionFactory()
+            try:
+                rows = session.execute(
+                    select(DownloadHistory.note).where(DownloadHistory.note.isnot(None))
+                ).scalars().all()
+            finally:
+                session.close()
+        except Exception as err:
+            logger.debug(f"{self.LOG_TAG}读取洗版下载历史失败：{err}")
+            return index
+
+        for note in rows:
+            if not isinstance(note, dict):
+                continue
+            info = note.get("subscription_download")
+            if not isinstance(info, dict) or info.get("submission_type") != "upgrade":
+                continue
+            subscribe_id = self._as_int(info.get("subscription_id"), 0)
+            if subscribe_id <= 0:
+                continue
+            bucket = index.setdefault(str(subscribe_id), set())
+            for episode in info.get("upgrade_episodes") or []:
+                try:
+                    bucket.add(int(episode))
+                except (TypeError, ValueError):
+                    continue
+        return index
 
     @staticmethod
     def _stored_priorities(subscribe) -> Dict[str, int]:
@@ -1539,7 +1602,8 @@ class PlaybackBestVersion(_PluginBase):
             '<span style="margin-right:10px;'
             'color:rgba(var(--v-theme-on-surface,0,0,0),.7)">每格代表一集</span>'
         ]
-        for code in (TIMELINE_MISSING, TIMELINE_DOWNLOADED, TIMELINE_UPGRADED, TIMELINE_WATCHED):
+        for code in (TIMELINE_MISSING, TIMELINE_DOWNLOADED, TIMELINE_PARTIAL,
+                     TIMELINE_UPGRADED, TIMELINE_WATCHED):
             fill, border, label = TIMELINE_STYLES[code]
             items.append(
                 '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:12px">'
@@ -1648,6 +1712,8 @@ class PlaybackBestVersion(_PluginBase):
     def _explain_html() -> str:
         """口径说明：默认折叠，不占版面。"""
         points = [
+            "橙色方块＝下载历史里确实为这一集洗过版（submission_type=upgrade），但当前优先级还没到最高档；"
+            "紫色＝已经到最高档（优先级 100）",
             "命中集写入订阅的分集洗版优先级 100（宿主口径：该集洗版完成），"
             "后续洗版搜索不再为它下载更高优先级的版本",
             "全集洗版（best_version_full）只在目标集全部看过时才写 100",

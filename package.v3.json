@@ -62,7 +62,7 @@
     "name": "播放进度洗版",
     "description": "按媒体服务器（Emby / Jellyfin）的分集播放进度决定订阅是否继续洗版：进度达到阈值（或播过、或标记已看）的集写成洗版完成优先级，宿主不再为它搜索更高版本；电影命中则整部停止洗版。支持多服务器、多用户合并、Webhook 即时触发、试运行与通知。",
     "labels": "订阅,洗版,媒体服务器,Emby,Jellyfin,Webhook",
-    "version": "3.4.3",
+    "version": "3.5.0",
     "icon": "playbackbestversion.svg",
     "author": "jiuyaozhuce",
     "project_url": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
@@ -71,6 +71,7 @@
     "system_version": ">=3.0.0",
     "repo": "https://github.com/jiuyaozhuce/MoviePilot-Plugins",
     "history": {
+      "v3.5.0": "逐集状态条新增橙色方块「洗过版·未到顶」：读取下载历史里 note.subscription_download 的 submission_type=upgrade 记录，把确实洗过版、但优先级还没到 100 的集单独标出来，与「已下载未洗」「已洗到顶」区分；摘要条同步给出「已洗版 / 洗过未到顶 / 待洗」三段统计。",
       "v3.4.3": "修复看板显示旧数据：定时任务与 Webhook 可能跑在插件被重复初始化后的另一份实例上，而详情页拿到的是旧实例的内存快照（实测页面停在 14 小时前的执行结果）；改为与持久化的 last_run 比较时间取较新的一份。摘要条同时增加「已洗版 N 集，待洗 M 集」统计，便于区分「正在洗版」和「已洗到最高档（紫块）」。",
       "v3.4.2": "详情页折叠清单改为「标题一行 + 类型/日期一行」的两行式，列宽回到 240px：并排写时 20 字左右的订阅名会折行、把右侧日期顶到上一行，与相邻项错位；两行式高度统一，窄屏也不挤。",
       "v3.4.1": "详情页折叠清单的列宽由 240px 放宽到 280px：20 字左右的订阅名（如「孔雀东南飞（2026） 第 1 季」）在原列宽下会折行，把右侧的订阅日期顶到下一行造成错位。其余与 v3.4.0 相同。",
